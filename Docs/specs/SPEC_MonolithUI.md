@@ -1057,3 +1057,76 @@ These are tracked drift / deferred work that did not block Phase L closure:
 Items 4 + 5 are the only Phase L deprecation markers; items 10 + 11 were added by the optional provider decouple (2026-04-27). The rest are drift the audit caught while sweeping the spec but predate the relevant phase.
 
 ---
+
+## Bulk-Row DataTable Authoring + Slot-Aware Describe (Phase 4 — 2026-05-11)
+
+Phase 4 of the Monolith MCP Ergonomics framework (`Docs/plans/2026-05-11-monolith-mcp-ergonomics.md`) wired `MonolithUI` into the cross-namespace `bulk_fill` / `describe` registry. The adapter (`Source/MonolithUI/Private/MonolithUIBulkFillAdapter.{h,cpp}`) is registered unconditionally from `FMonolithUIModule::StartupModule` per the **H5 stub-adapter invariant** — `monolith_discover("ui")` exposes the same surface in dev and release builds.
+
+### SINGLE-TRANSACTION INVARIANT — the 2026-04-25 crash fix
+
+The 40-row sequential CRASH that surfaced on 2026-04-25 from parallel JSON-RPC bursts against the input-action DataTable is closed by Phase 4: **ALL row-batch writes (input-action DT + vanilla DT) commit via ONE `FScopedTransaction` + ONE `Modify()` + N `AddRow` + ONE `MarkPackageDirty`.** A process-wide `FCriticalSection` (`GUIBulkFillCriticalSection` in `MonolithUIBulkFillAdapter.cpp`) serialises concurrent UI bulk_fill calls so parallel bursts can no longer race against the editor's DataTable mutation cradle. Strict-mode + any error → `Transaction->Cancel()` rolls back the whole batch.
+
+### M5 invariant — split happens INSIDE the adapter
+
+| Path | `WITH_COMMONUI` gate | fill_kind |
+|------|----------------------|-----------|
+| Vanilla UDataTable row-batch (any `FTableRowBase`) | none | `DataTableRows` |
+| UMG widget UPROPERTY writes (resolved via WBP `WidgetTree`) | none | `WidgetProperties` |
+| Slot-prop describe (parent-panel-class scoped) | none | (`describe.schema` only) |
+| CommonUI input-action DT (`FCommonInputActionDataBase` rows) | `#if WITH_COMMONUI` | `InputActionDataTable` |
+
+The `#else` branch on the gated path returns a clean stub error (`"CommonUI not available — WITH_COMMONUI=0 in this build"`) so the discover surface stays identical across build flavours.
+
+### Tree shapes
+
+`bulk_fill.apply` tree (CommonUI input-action DT — 40 rows in ONE call):
+
+```json
+{
+  "target_namespace": "ui",
+  "target_asset": "/Game/UI/Input/DT_InputActions40",
+  "tree": {
+    "fill_kind": "InputActionDataTable",
+    "rows": {
+      "Inventory_Open": {
+        "DefaultDisplayName": "Open Inventory",
+        "KeyboardInputTypeInfo": { "Key": "I" },
+        "GamepadInputTypeInfo":  { "Key": "Gamepad_FaceButton_Top" }
+      }
+    }
+  }
+}
+```
+
+`describe.schema` compound key (slot-prop describe scoped to PARENT panel class):
+
+| `target_asset` | Returns |
+|----------------|---------|
+| `""` | Top-level fill_kind catalogue |
+| `/Game/UI/DT_Foo` | UDataTable row-struct schema (per-field FProperty walk) |
+| `/Game/UI/WBP_Foo\|widget_name=MyButton` | Slot-prop tree for the resolved widget's PARENT panel class (default: `kind=slot`) |
+| `/Game/UI/WBP_Foo\|widget_name=MyButton\|kind=widget` | Widget UPROPERTY tree on the widget's UClass |
+
+### Slot-prop describe — solving the per-parent pain
+
+Slot props live on the slot CLASS, not the widget. A `UButton` parented to a `UCanvasPanel` has a `UCanvasPanelSlot` with `Anchors`/`Offsets`/`ZOrder`; the SAME button parented to a `UVerticalBox` has a `UVerticalBoxSlot` with `Padding`/`Size`/`HAlign`/`VAlign`. The adapter resolves the widget inside the WBP `WidgetTree`, follows `UWidget::Slot → UPanelSlot::Parent → UPanelWidget`, and emits a descriptor SCOPED to the parent's slot class. Inherited `UPanelSlot::Parent`/`Content` bookkeeping fields are filtered — only editor-surfaced slot props appear.
+
+Supported parent panels (UE 5.7 stock): `UCanvasPanelSlot`, `UVerticalBoxSlot`, `UHorizontalBoxSlot`, `UOverlaySlot`, `UUniformGridSlot`, `UStackBoxSlot`. Numeric `UIMin`/`UIMax`/`ClampMin`/`ClampMax` meta → `FSchemaDescriptor::RangeMin`/`RangeMax` (Q3 design contract). `FEnumProperty` fields enumerate all legal value strings in `EnumValues`.
+
+### Action surface
+
+`bulk_fill` + `describe` are framework-level namespaces (not counted in the per-module surface). The Phase 4 adapter does not add any new `ui::*` action — `monolith_discover("ui")` count is unchanged. The `monolith_discover("bulk_fill")` / `monolith_discover("describe")` rolls now includes `{namespace: "ui", available: true, stub: false}` in dev builds and `{namespace: "ui", available: true, stub_branch: "WITH_COMMONUI=0 disables InputActionDataTable only"}` in release builds.
+
+### Source layout
+
+| Path | Contents |
+|------|----------|
+| `Source/MonolithUI/Private/MonolithUIBulkFillAdapter.h` | `FMonolithUIBulkFillAdapter` static-API declaration |
+| `Source/MonolithUI/Private/MonolithUIBulkFillAdapter.cpp` | Adapter impl: `UIBulkFill`, `UIDescribe`, `Register`, `Unregister`. Process-wide `GUIBulkFillCriticalSection` lives at TU scope. |
+| `Source/MonolithUI/Private/MonolithUIModule.cpp` | `FMonolithUIBulkFillAdapter::Register()` from `StartupModule`, `Unregister()` from `ShutdownModule` (both unconditional per H5) |
+
+### Build.cs deps added by Phase 4
+
+None. `UMG` + `UMGEditor` + `Json` + `JsonUtilities` + `UnrealEd` + `MonolithCore` were already present.
+
+---

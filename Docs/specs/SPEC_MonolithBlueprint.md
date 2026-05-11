@@ -102,4 +102,13 @@
 | `spawn_blueprint_actor` | `blueprint`, `location`?, `rotation`?, `scale`?, `label`?, `folder`?, `properties`?, `tags`?, `sublevel`?, `mobility`?, `select`? | Spawn a Blueprint actor into the editor world with full transform, property reflection, tags, sublevel targeting, and mobility control. Uses `GEditor->AddActor` for proper editor integration (undo/redo). Default folder: `"Blueprints"` |
 | `batch_spawn_blueprint_actors` | `blueprint`, `count`, `pattern`?, `origin`?, `spacing`?, `columns`?, `direction`?, `rotation`?, `scale`?, `label_prefix`?, `folder`?, `properties`?, `tags`?, `sublevel`?, `mobility`?, `select`? | Spawn multiple Blueprint actors in a grid or linear pattern. Partial failure semantics — continues on per-actor failure, reports successes and failures separately. Single undo transaction. Max 1000 |
 
+**CDO Bulk Fill / Describe (Phase 1 of bulk_fill framework — 2)**
+| Action | Params | Description |
+|--------|--------|-------------|
+| `set_cdo_properties` | `asset_path`, `properties`, `dry_run`?, `strict`? | Bulk-fill multiple CDO properties from a JSON tree in a single transaction. `properties` is a nested JSON object whose keys are UPROPERTY names and values are scalars / structs / arrays / maps / sets per the FProperty reflection schema. Routes through the central `FMonolithBulkFillRegistry` "blueprint" adapter. Same dual-path asset load as `set_cdo_property` (Blueprint CDO first, then generic UObject — DataAsset, DataTable, GameplayEffect, AbilitySet, InputAction). Engine edit cradle (transaction → Modify → PreEditChange → write → ReparentTransientInstancedSubobjects → FireFullCradle) preserved per Issue #29. `dry_run=true` walks the tree via `FMonolithReflectionWalker::InspectTree` WITHOUT mutation and returns the full `FDryRunReport`. `strict=true` promotes silent drops / clamps / unknown-fields to hard errors and cancels the transaction. |
+| `describe_cdo_schema` | `asset_path` | Return the rich `FSchemaDescriptor` tree (type names, ImportText forms, enum-value lists, clamp ranges, nested struct/array/map children) for an asset's CDO. Counterpart to `get_cdo_properties` when the caller needs the schema, not the current values. Use before authoring `set_cdo_property` / `set_cdo_properties` payloads to discover the legal ImportText grammar. |
+
+**Existing CDO actions also gain `dry_run` + `strict` optional params:**
+- `set_cdo_property` — Phase 1 adds `dry_run`?, `strict`? optional params. When `dry_run=true`, validates the proposed write via the reflection walker and returns the per-field report without entering the engine edit cradle. Same `strict` semantics as the plural action.
+
 ---

@@ -13,6 +13,7 @@
 #include "MonolithBlueprintGraphExportActions.h"
 #include "MonolithBlueprintLayoutActions.h"
 #include "MonolithBlueprintSpawnActions.h"
+#include "MonolithBlueprintBulkFillAdapter.h"
 #include "MonolithToolRegistry.h"
 #include "MonolithJsonUtils.h"
 #include "MonolithSettings.h"
@@ -38,11 +39,18 @@ void FMonolithBlueprintModule::StartupModule()
 	FMonolithBlueprintGraphExportActions::RegisterActions(Registry);
 	FMonolithBlueprintLayoutActions::RegisterActions(Registry);
 	FMonolithBlueprintSpawnActions::RegisterActions(Registry);
-	UE_LOG(LogMonolith, Log, TEXT("Monolith — Blueprint module loaded (88 actions)"));
+
+	// Phase 1 bulk_fill / describe pilot adapter. Self-registers with
+	// FMonolithBulkFillRegistry under namespace "blueprint"; routed-to by the
+	// central bulk_fill.apply / describe.schema dispatchers (Phase 0).
+	FMonolithBlueprintBulkFillAdapter::Register();
+
+	UE_LOG(LogMonolith, Log, TEXT("Monolith — Blueprint module loaded (88 actions + bulk_fill/describe adapter)"));
 }
 
 void FMonolithBlueprintModule::ShutdownModule()
 {
+	FMonolithBlueprintBulkFillAdapter::Unregister();
 	FMonolithToolRegistry::Get().UnregisterNamespace(TEXT("blueprint"));
 }
 
