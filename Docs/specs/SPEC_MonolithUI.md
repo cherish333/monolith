@@ -11,7 +11,7 @@
 **Dependencies:** Core, CoreUObject, Engine, MonolithCore, UnrealEd, UMGEditor, UMG, Slate, SlateCore, Json, JsonUtilities, KismetCompiler, MovieScene, MovieSceneTracks, DeveloperSettings, AssetTools, ImageWrapper, ImageCore, Kismet, MaterialEditor, EditorSubsystem (Public — `UMonolithUIRegistrySubsystem` is exported), CommonUI (optional — `#if WITH_COMMONUI`)
 
 **The optional EffectSurface provider is NOT a build-system dependency** (decoupled 2026-04-27). EffectSurface support is delivered via UClass-by-name reflection through `MonolithUI::GetEffectSurfaceClass()` — see § "Optional Dep Probe API" and § "Error Contract — Optional EffectSurface Provider Absence (-32010)". External providers may depend on MonolithUI for registry/spec structs, but MonolithUI must not depend on them.
-**Total actions in `ui::` namespace:** **117** when `WITH_COMMONUI=1` (66 always-on owned by this module + 50 CommonUI owned by this module conditional on `WITH_COMMONUI` + 1 inline diagnostic `dump_style_cache_stats` registered from `MonolithUIModule.cpp` under the same gate) + **4 GAS UI binding aliases owned by `MonolithGAS`** (also registered into `ui::`, conditional on `WITH_GBA`). Without `WITH_COMMONUI`, the namespace registers **66** actions; without `WITH_GBA` the four bridge aliases are absent.
+**Total actions in `ui::` namespace:** **129** when `WITH_COMMONUI=1` (71 always-on owned by this module + 57 CommonUI owned by this module conditional on `WITH_COMMONUI` + 1 inline diagnostic `dump_style_cache_stats` registered from `MonolithUIModule.cpp` under the same gate) + **4 GAS UI binding aliases owned by `MonolithGAS`** (also registered into `ui::`, conditional on `WITH_GBA`). Without `WITH_COMMONUI`, the namespace registers **71** actions; without `WITH_GBA` the four bridge aliases are absent. Phase 3 of the 2026-05-16 UI Gap Audit (2026-05-16) landed 4 actions: 3 CommonUI scaffolders (`scaffold_main_menu`, `scaffold_settings_panel_with_tabs`, `scaffold_pause_menu`) + 1 always-on multi-screen menu builder (`build_menu_from_spec`).
 **Settings toggle:** `bEnableUI` (default: True)
 **MCP tool:** `ui_query`
 **Namespace:** `ui`
@@ -32,9 +32,9 @@
 | Accessibility (non-CommonUI) | 4 | `MonolithUIAccessibilityActions.cpp` | always |
 | Hoisted Design Import | 5 | `Actions/Hoisted/{TextureIngest,FontIngest,RoundedCorner,Shadow,Gradient}Actions.cpp` | always — `import_texture_from_bytes`, `import_font_family`, `set_rounded_corners`, `apply_box_shadow`, `create_gradient_mid_from_spec` |
 | Effect Surface Actions | 10 | `Actions/MonolithUIEffectActions.cpp` | always |
-| Spec Builder + Serializer | 3 | `Actions/MonolithUISpecActions.cpp` | always — `build_ui_from_spec`, `dump_ui_spec_schema`, `dump_ui_spec` |
+| Spec Builder + Serializer | 4 | `Actions/MonolithUISpecActions.cpp` | always — `build_ui_from_spec`, `dump_ui_spec_schema`, `dump_ui_spec`, plus Phase 3 (2026-05-16) `build_menu_from_spec` |
 | Type Registry diagnostic | 3 | `MonolithUIRegistryActions.cpp` | always — `dump_property_allowlist`, plus Phase 2 (2026-05-16) `add_widget_variable`, `list_widget_property_enums` |
-| **Always-on subtotal** | **70** | | |
+| **Always-on subtotal** | **71** | | |
 | CommonUI Activatables | 8 | `CommonUI/MonolithCommonUIActivatableActions.cpp` | `WITH_COMMONUI` |
 | CommonUI Buttons + Styling | 12 | `CommonUI/MonolithCommonUIButtonActions.cpp` | `WITH_COMMONUI` — Phase 2 (2026-05-16) added `apply_token_binding`, `convert_textblock_to_common`, `set_action_bar_button_class` |
 | CommonUI Input | 7 | `CommonUI/MonolithCommonUIInputActions.cpp` | `WITH_COMMONUI` |
@@ -44,12 +44,13 @@
 | CommonUI Dialogs | 2 | `CommonUI/MonolithCommonUIDialogActions.cpp` | `WITH_COMMONUI` |
 | CommonUI Audit + Lint | 4 | `CommonUI/MonolithCommonUIAuditActions.cpp` | `WITH_COMMONUI` |
 | CommonUI Accessibility | 4 | `CommonUI/MonolithCommonUIAccessibilityActions.cpp` | `WITH_COMMONUI` |
+| CommonUI Scaffolders | 3 | `CommonUI/MonolithCommonUITemplateActions.cpp` | `WITH_COMMONUI` — Phase 3 (2026-05-16) `scaffold_main_menu`, `scaffold_settings_panel_with_tabs`, `scaffold_pause_menu` |
 | Style Service Diagnostics | 1 | inline lambda in `MonolithUIModule.cpp` | `WITH_COMMONUI` — `dump_style_cache_stats` |
-| **CommonUI subtotal** | **55** | | conditional |
-| **MonolithUI total** | **125** | | full configuration |
+| **CommonUI subtotal** | **58** | | conditional |
+| **MonolithUI total** | **129** | | full configuration |
 | GAS UI binding aliases | 4 | `MonolithGAS/Private/MonolithGASUIBindingActions.cpp` | `WITH_GBA` — registered cross-namespace into `ui::` |
 
-Counts re-verified against `RegisterAction(TEXT("ui"), ...)` call sites on 2026-04-26 (Phase L). Phase 2 of the 2026-05-16 UI Gap Audit landed 8 additional actions (4 always-on + 4 CommonUI-gated) bringing the totals to 70 / 55 / 125. Production registration sites only — Tests/ excluded.
+Counts re-verified against `RegisterAction(TEXT("ui"), ...)` call sites on 2026-04-26 (Phase L). Phase 2 of the 2026-05-16 UI Gap Audit landed 8 additional actions (4 always-on + 4 CommonUI-gated) bringing the totals to 70 / 55 / 125. Phase 3 of the 2026-05-16 UI Gap Audit landed 4 more (1 always-on `build_menu_from_spec` + 3 CommonUI-gated scaffolders) bringing the totals to 71 / 58 / 129. Production registration sites only — Tests/ excluded.
 
 ### Classes
 
@@ -67,7 +68,8 @@ Counts re-verified against `RegisterAction(TEXT("ui"), ...)` call sites on 2026-
 | `FMonolithUIRegistryActions` | Registers `dump_property_allowlist` (Phase B diagnostic) |
 | `MonolithUI::FTextureIngestActions` / `FFontIngestActions` / `FAnimationCoreActions` / `FAnimationEventActions` / `FRoundedCornerActions` / `FShadowActions` / `FGradientActions` | Hoisted Design Import + Animation v2 verbs (Phase D, 2026-04-26) |
 | `MonolithUI::FEffectSurfaceActions` | EffectSurface sub-bag setters + preset (Phase F, 2026-04-26) |
-| `MonolithUI::FSpecActions` | `build_ui_from_spec` + `dump_ui_spec_schema` + `dump_ui_spec` (Phases H + J, 2026-04-26) |
+| `MonolithUI::FSpecActions` | `build_ui_from_spec` + `dump_ui_spec_schema` + `dump_ui_spec` (Phases H + J, 2026-04-26) + `build_menu_from_spec` (Phase 3 of the 2026-05-16 UI Gap Audit, MVP-STUB) |
+| `MonolithCommonUITemplate::Register` | CommonUI headline scaffolders: `scaffold_main_menu` / `scaffold_settings_panel_with_tabs` / `scaffold_pause_menu` (Phase 3 of the 2026-05-16 UI Gap Audit). File-static handlers in `CommonUI/MonolithCommonUITemplateActions.cpp` — `WITH_COMMONUI` only |
 | `UMonolithUIRegistrySubsystem` (UEditorSubsystem) | Live type registry + per-type property allowlist (Phase B) |
 | `FUITypeRegistry` / `FUIPropertyAllowlist` / `FUIPropertyPathCache` / `FUIReflectionHelper` | Registry data model + safe reflection write surface (Phases B + C) |
 | `FUISpecValidator` / `FUISpecBuilder` / `FUISpecSerializer` | Spec-driven UI generator + inverse roundtrip (Phases A + H + J) |
@@ -158,7 +160,7 @@ Counts re-verified against `RegisterAction(TEXT("ui"), ...)` call sites on 2026-
 
 ---
 
-## Actions — CommonUI (54 — namespace: "ui", conditional on `WITH_COMMONUI`)
+## Actions — CommonUI (57 — namespace: "ui", conditional on `WITH_COMMONUI`)
 
 Shipped M0.5, v0.14.0 (2026-04-19). Tested M0.5.1 (2026-04-25): 50/50 editor-time actions PASS, 8 bugs found and fixed. 11 actions marked [RUNTIME] need PIE testing.
 
@@ -277,6 +279,20 @@ Class-as-data: style creators (`create_common_button_style`, `create_common_text
 | `set_text_scale_binding` | `asset_path`, `widget_name`, `binding_spec` | Bind text scale to an accessibility setting |
 | `apply_high_contrast_variant` | `asset_path`, `style_map` | Apply high-contrast color overrides to CommonUI styled widgets |
 
+### Category J: Scaffolders (3 actions — Phase 3 of the 2026-05-16 UI Gap Audit)
+
+Headline one-shot scaffolders that compose Phase 1 + Phase 2 primitives (allowlist fixes, `create_bound_action_bar`, `add_widget_variable`, `set_action_bar_button_class`, `convert_textblock_to_common`) into single-call workflows for the three most common menu shapes. All three follow the same pipeline: `CreatePackage` → `UWidgetBlueprintFactory` (parent = `UTokenforgeActivatableWidget` if the TokenforgeRuntime plugin is enabled, else `UCommonActivatableWidget`; override with `parent_class`) → widget tree → `UCommonBoundActionBar` with `ActionButtonClass` reflection-write → `DesiredFocusTargetName` UPROPERTY stamp → nav-rule wiring → compile + `FCompilerResultsLog` capture → manifest return.
+
+Source: `CommonUI/MonolithCommonUITemplateActions.cpp`. Registered via `MonolithCommonUITemplate::Register` from `MonolithCommonUIActionsAggregator.cpp`.
+
+| Action | Params | Description |
+|--------|--------|-------------|
+| `scaffold_main_menu` | `save_path`, `button_names?`, `parent_class?`, `action_button_class?`, `action_table?`, `default_style_palette?` | Main-menu WBP: Overlay + Title + VerticalBox of `UCommonButtonBase` per `button_names[]` (default `["Continue","NewGame","Options","Quit"]`) + `UCommonBoundActionBar`. First button receives initial focus; Up/Down nav links adjacent buttons; last button's Down points at the action bar. |
+| `scaffold_settings_panel_with_tabs` | `save_path`, `tab_names?`, `parent_class?`, `action_table?`, `action_button_class?` | Settings panel WBP: Overlay + Title + `UCommonTabListWidgetBase` + `UCommonAnimatedSwitcher` with one stateless `UVerticalBox` content placeholder per tab (default `["Gameplay","Audio","Video","Accessibility","Controls"]`) + `UCommonBoundActionBar`. Initial focus → TabList. |
+| `scaffold_pause_menu` | `save_path`, `action_table`, `button_names?`, `parent_class?`, `action_button_class?`, `settings_class?`, `inventory_class?` | Pause-menu WBP: Overlay + UBorder backdrop + Title + VerticalBox of `UCommonButtonBase` per `button_names[]` (default `["Resume","Settings","Inventory","Quit"]`) + `UCommonBoundActionBar`. Resume = initial focus; Quit gets `SetRequiresHold(true)` (Phase 1.5 allowlist makes this writable without `raw_mode`). |
+
+**Return shape (all three):** `{ wbp_path, parent_class, used_tokenforge, action_button_class, action_button_class_was_default, focus_target_variable_ready, focus_target_stamped, compile_status, widgets_created[], errors[], warnings[] }`. `compile_status` is the `EBlueprintStatus` enum (`BS_UpToDate` / `BS_UpToDateWithWarnings` / `BS_Dirty` / `BS_Error`).
+
 ---
 
 ## GAS Bridge Aliases (4 — namespace: "ui", source: `MonolithGAS`)
@@ -390,6 +406,27 @@ ui::build_ui_from_spec({
 ```
 
 **`ui::dump_ui_spec_schema`** returns a JSON-Schema-style description of `FUISpecDocument` plus the live allowlist projection per widget type. LLMs use it to build valid spec inputs without crawling our headers.
+
+### Menu Spec Builder (M5 — Phase 3 of the 2026-05-16 UI Gap Audit)
+
+**Status:** MVP-STUB landed 2026-05-16. Per-screen `spec` builds run **FULL** via `FUISpecBuilder`. Cross-screen aggregation (`layers[]` activatable-stack hierarchy, `focus_table[]` CDO writes, `nav_overrides[]` propagation) is **DEFERRED** to issue #3-18b — captured entries echo back in the response under `deferred_aggregation` so user-space tooling can post-process.
+
+**Action surface:** `ui::build_menu_from_spec` (always-on — registered from `Actions/MonolithUISpecActions.cpp`, not WITH_COMMONUI-gated; per-screen builders may construct CommonUI widgets but the dispatch surface itself is engine-side).
+
+**Document shape:**
+
+```
+{
+  layers:        [{ id, screens: ["..."] }, ...],
+  screens:       [{ id, asset_path, spec?, kind? }, ...],
+  focus_table:   [{ screen, target }, ...],
+  nav_overrides: [{ screen, widget, direction, target }, ...]
+}
+```
+
+**Modes preserved from `build_ui_from_spec`:** `dry_run`, `treat_warnings_as_errors`, `raw_mode`, `overwrite`, `request_id`. Per-screen builds receive `<request_id>:<screen.id>` so consumers can correlate aggregate vs per-screen calls.
+
+**Response shape:** `{ bSuccess, status, request_id?, screens[], aggregate_node_counts, errors?, warnings?, deferred_aggregation? }` where each `screens[N]` entry includes a full `build_result` object (same shape as `build_ui_from_spec`'s response). `status` is `ok` when all screens succeeded and no `layers/focus_table/nav_overrides` entries were supplied; `partial_stub` when those deferred surfaces had caller-supplied entries; `validation_failed` on structural errors.
 
 ### Spec Serializer (M5 — Phase J, landed 2026-04-26)
 
