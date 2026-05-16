@@ -20,7 +20,7 @@
 
 | Category | Count | Source file(s) | Conditional? |
 |----------|-------|----------------|--------------|
-| Widget CRUD | 7 | `MonolithUIActions.cpp` | always |
+| Widget CRUD | 9 | `MonolithUIActions.cpp` | always — Phase 2 (2026-05-16) added `rename_widget`, `dump_blueprint_compile_log` |
 | Slot | 3 | `MonolithUISlotActions.cpp` | always |
 | Templates | 8 | `MonolithUITemplateActions.cpp` | always |
 | Styling | 6 | `MonolithUIStylingActions.cpp` | always |
@@ -33,23 +33,23 @@
 | Hoisted Design Import | 5 | `Actions/Hoisted/{TextureIngest,FontIngest,RoundedCorner,Shadow,Gradient}Actions.cpp` | always — `import_texture_from_bytes`, `import_font_family`, `set_rounded_corners`, `apply_box_shadow`, `create_gradient_mid_from_spec` |
 | Effect Surface Actions | 10 | `Actions/MonolithUIEffectActions.cpp` | always |
 | Spec Builder + Serializer | 3 | `Actions/MonolithUISpecActions.cpp` | always — `build_ui_from_spec`, `dump_ui_spec_schema`, `dump_ui_spec` |
-| Type Registry diagnostic | 1 | `MonolithUIRegistryActions.cpp` | always — `dump_property_allowlist` |
-| **Always-on subtotal** | **66** | | |
+| Type Registry diagnostic | 3 | `MonolithUIRegistryActions.cpp` | always — `dump_property_allowlist`, plus Phase 2 (2026-05-16) `add_widget_variable`, `list_widget_property_enums` |
+| **Always-on subtotal** | **70** | | |
 | CommonUI Activatables | 8 | `CommonUI/MonolithCommonUIActivatableActions.cpp` | `WITH_COMMONUI` |
-| CommonUI Buttons + Styling | 9 | `CommonUI/MonolithCommonUIButtonActions.cpp` | `WITH_COMMONUI` |
+| CommonUI Buttons + Styling | 12 | `CommonUI/MonolithCommonUIButtonActions.cpp` | `WITH_COMMONUI` — Phase 2 (2026-05-16) added `apply_token_binding`, `convert_textblock_to_common`, `set_action_bar_button_class` |
 | CommonUI Input | 7 | `CommonUI/MonolithCommonUIInputActions.cpp` | `WITH_COMMONUI` |
-| CommonUI Navigation/Focus | 5 | `CommonUI/MonolithCommonUINavigationActions.cpp` | `WITH_COMMONUI` |
+| CommonUI Navigation/Focus | 6 | `CommonUI/MonolithCommonUINavigationActions.cpp` | `WITH_COMMONUI` — Phase 2 (2026-05-16) added `audit_focus_chain` |
 | CommonUI Lists/Tabs/Groups | 7 | `CommonUI/MonolithCommonUIListActions.cpp` | `WITH_COMMONUI` |
 | CommonUI Content widgets | 4 | `CommonUI/MonolithCommonUIContentActions.cpp` | `WITH_COMMONUI` |
 | CommonUI Dialogs | 2 | `CommonUI/MonolithCommonUIDialogActions.cpp` | `WITH_COMMONUI` |
 | CommonUI Audit + Lint | 4 | `CommonUI/MonolithCommonUIAuditActions.cpp` | `WITH_COMMONUI` |
 | CommonUI Accessibility | 4 | `CommonUI/MonolithCommonUIAccessibilityActions.cpp` | `WITH_COMMONUI` |
 | Style Service Diagnostics | 1 | inline lambda in `MonolithUIModule.cpp` | `WITH_COMMONUI` — `dump_style_cache_stats` |
-| **CommonUI subtotal** | **51** | | conditional |
-| **MonolithUI total** | **117** | | full configuration |
+| **CommonUI subtotal** | **55** | | conditional |
+| **MonolithUI total** | **125** | | full configuration |
 | GAS UI binding aliases | 4 | `MonolithGAS/Private/MonolithGASUIBindingActions.cpp` | `WITH_GBA` — registered cross-namespace into `ui::` |
 
-Counts re-verified against `RegisterAction(TEXT("ui"), ...)` call sites on 2026-04-26 (Phase L). Production registration sites only — Tests/ excluded.
+Counts re-verified against `RegisterAction(TEXT("ui"), ...)` call sites on 2026-04-26 (Phase L). Phase 2 of the 2026-05-16 UI Gap Audit landed 8 additional actions (4 always-on + 4 CommonUI-gated) bringing the totals to 70 / 55 / 125. Production registration sites only — Tests/ excluded.
 
 ### Classes
 
@@ -77,9 +77,9 @@ Counts re-verified against `RegisterAction(TEXT("ui"), ...)` call sites on 2026-
 
 ---
 
-## Actions — UMG Baseline (42 — namespace: "ui")
+## Actions — UMG Baseline (44 — namespace: "ui")
 
-**Widget CRUD (7)**
+**Widget CRUD (9)**
 | Action | Params | Description |
 |--------|--------|-------------|
 | `create_widget_blueprint` | `save_path`, `parent_class` | Create a new Widget Blueprint asset |
@@ -89,6 +89,8 @@ Counts re-verified against `RegisterAction(TEXT("ui"), ...)` call sites on 2026-
 | `set_widget_property` | `asset_path`, `widget_name`, `property_name`, `value` (alias: `property_value`) | Set a property on a widget via reflection. Allowlist-gated unless `raw_mode=true`. `value` and `property_value` are accepted as aliases since the 2026-05-16 Bug #6 fix. |
 | `compile_widget` | `asset_path` | Compile the Widget Blueprint. Returns `errors[]`, `warnings[]`, `notes[]`, `error_count`, `warning_count` on success — shape mirrors `blueprint_query::compile_blueprint`. On BS_Error, the diagnostic list is packed into `valid_options[]` of the structured error (Bug #5 fix, 2026-05-16). |
 | `list_widget_types` | none | List all available widget classes that can be instantiated |
+| `rename_widget` | `wbp_path`, `old_name`, `new_name` | Rename a UWidget's FName in a WBP's tree. Uniqueness check runs against the full WidgetTree before the rename. Recompiles via `FKismetEditorUtilities::CompileBlueprint`. If `bIsVariable=true`, also walks `FBlueprintEditorUtils::RenameMemberVariable` so the BPVAR entry stays consistent with the new FName. Phase 2 Item #7 (2026-05-16 UI Gap Audit). |
+| `dump_blueprint_compile_log` | `asset_path` | Re-drive a compile and return `last_compile_status` (EBlueprintStatus → string) + `errors[]` / `warnings[]` / `notes[]`. Accepts both `UWidgetBlueprint` and plain `UBlueprint` paths so the action serves as a general-purpose "last status + messages" probe. Shape mirrors `compile_widget` on success. Phase 2 Item #14 (2026-05-16 UI Gap Audit). |
 
 **Slot Operations (3)**
 | Action | Params | Description |
@@ -156,7 +158,7 @@ Counts re-verified against `RegisterAction(TEXT("ui"), ...)` call sites on 2026-
 
 ---
 
-## Actions — CommonUI (50 — namespace: "ui", conditional on `WITH_COMMONUI`)
+## Actions — CommonUI (54 — namespace: "ui", conditional on `WITH_COMMONUI`)
 
 Shipped M0.5, v0.14.0 (2026-04-19). Tested M0.5.1 (2026-04-25): 50/50 editor-time actions PASS, 8 bugs found and fixed. 11 actions marked [RUNTIME] need PIE testing.
 
@@ -187,7 +189,7 @@ Class-as-data: style creators (`create_common_button_style`, `create_common_text
 | `get_activatable_stack_state` | `stack_widget` | [RUNTIME] Query the stack: active widget, depth, transition state |
 | `set_activatable_transition` | `asset_path`, `transition_type`, `duration` | Configure push/pop transition animations |
 
-### Category B: Buttons + Styling (9 actions)
+### Category B: Buttons + Styling (12 actions)
 
 > **Allowlist note (2026-05-16):** `CommonButtonBase` token now has `TriggeringInputAction` (FDataTableRowHandle) and `bDisplayInActionBar` (bool) on its curated allowlist. `set_widget_property` writes these without requiring `raw_mode=true` (Bug #2 fix).
 
@@ -202,6 +204,9 @@ Class-as-data: style creators (`create_common_button_style`, `create_common_text
 | `batch_retheme` | `asset_path`, `style_map` | Retheme multiple widgets in a single transaction |
 | `configure_common_text` | `asset_path`, `widget_name`, `properties` | Set `UCommonTextBlock` properties (style, scroll speed, auto-collapse) |
 | `configure_common_border` | `asset_path`, `widget_name`, `properties` | Set `UCommonBorder` properties (style, opacity, etc.) |
+| `apply_token_binding` | `wbp_path`, `widget_name`, `target_property`, `token_key` | **MVP-STUB.** Bind a widget property to a UI design token sourced from `TokenforgeRuntime`. Returns `-32011 ErrTokenforgeRuntimeUnavailable` when the plugin is absent (see § Error Contract — Optional Tokenforge Provider Absence (-32011)). Successful response carries `status:"stub"` — param validation + Tokenforge probe are FULL, BP-graph node-write into NativeConstruct is deferred to a follow-up. Phase 2 Item #10 (2026-05-16 UI Gap Audit). |
+| `convert_textblock_to_common` | `wbp_path`, `widget_name` | Replace a `UTextBlock` with a `UCommonTextBlock` while preserving the variable identity (FName + `bIsVariable`), parent slot, and authored text/font/colour/shadow state. Style left at engine default — chain `apply_style_to_widget` with a `UCommonTextStyle` reference to complete the rethemed migration. Mirrors the reconciliation pattern from `convert_button_to_common` (variable identity preserved Y). Phase 2 Item #12 (2026-05-16 UI Gap Audit). |
+| `set_action_bar_button_class` | `wbp_path`, `widget_name`, `button_class` | Set `UCommonBoundActionBar::ActionButtonClass` on an existing bar widget. Writes through BOTH the authoring tree (`Wbp->WidgetTree`) AND the generated class's archetype tree (`UWidgetBlueprintGeneratedClass::GetWidgetTreeArchetype()`) so the value survives subsequent `compile_blueprint` passes. `button_class` must resolve to a `UCommonButtonBase` subclass. Mirrors the FClassProperty reflection pattern from Phase 1 Bug #4 (`MonolithCommonUIInputActions.cpp:265-282`). Phase 2 Item #13 (2026-05-16 UI Gap Audit). |
 
 ### Category C: Input/Actions/Glyphs (7 actions)
 
@@ -215,12 +220,13 @@ Class-as-data: style creators (`create_common_button_style`, `create_common_text
 | `set_input_type_override` | `input_type` | [RUNTIME] Force a specific input type for glyph display |
 | `list_platform_input_tables` | none | List all registered platform input DataTables |
 
-### Category D: Navigation/Focus (5 actions)
+### Category D: Navigation/Focus (6 actions)
 
 | Action | Params | Description |
 |--------|--------|-------------|
 | `set_widget_navigation` | `asset_path`, `widget_name`, `nav_rules` | Configure explicit navigation rules (up/down/left/right targets) |
 | `set_initial_focus_target` | `asset_path`, `target_name` | Set the initial focus target for an activatable widget |
+| `audit_focus_chain` | `wbp_path` | Static audit of a WBP's `UWidget::Navigation` graph. Reports `unreachable[]`, `dead_ends[]`, `cycles[]`, `dangling_explicit[]`. Read-only — does not modify the WBP. Reachability BFS runs only when the WBP's CDO exposes `DesiredFocusTargetName` (or `InitialFocusTargetName`) as an FName UPROPERTY; otherwise the audit still reports cycles + dangling-explicit findings (the load-bearing defects) and skips the reachability check. Phase 2 Item #9 (2026-05-16 UI Gap Audit). |
 | `force_focus` | `widget_name` | [RUNTIME] Force focus to a specific widget |
 | `get_focus_path` | none | [RUNTIME] Query the current focus path (widget chain) |
 | `request_refresh_focus` | none | [RUNTIME] Request CommonUI to recalculate focus |
@@ -640,11 +646,13 @@ Mappings are explicit, NOT auto-generated from `UPROPERTY` reflection. Auto-walk
 
 Slot.* paths (`Slot.Padding`, `Slot.HAlign`, `Slot.VAlign`, `Slot.Anchors`, `Slot.Position`, `Slot.Size`, `Slot.SizeRule`, `Slot.FillWeight`, `Slot.Alignment`, `Slot.AutoSize`, `Slot.ZOrder`) are attached to the COMMON child widgets (TextBlock, Image, Button, Border, SizeBox, ProgressBar, the box panels, ScrollBox, RoundedBorder). The reflection helper performs per-parent-slot validation at write time — the allowlist is the generous outer envelope.
 
-### Diagnostic action
+### Diagnostic actions (3)
 
 | Action | Params | Description |
 |--------|--------|-------------|
 | `dump_property_allowlist` | `widget_type` (string) | Returns `{type, registered, container_kind, max_children, widget_class, allowed_paths:[...], allowed_path_count}`. Unknown types return `registered:false` with a hint that the type isn't in the registry. |
+| `add_widget_variable` | `wbp_path`, `var_name`, `var_type`, `default_value?`, `var_category?` | Wraps `FBlueprintEditorUtils::AddMemberVariable` to stamp a user-variable onto a WBP. `var_type` accepts the MCP-friendly token grammar (`bool`/`int`/`int64`/`float`/`double`/`string`/`name`/`text`/`byte`/`object:Class`/`class:Class`/`struct:Name`/`enum:Name`/`softobject:Class`/`softclass:Class`/`exec`/`wildcard`, with container prefixes `array:`/`set:`/`map:Key:Value`). AddMemberVariable defaults flags `CPF_Edit | CPF_BlueprintVisible | CPF_DisableEditOnInstance` — matches the editor's "add variable" affordance. Phase 2 Item #8 (2026-05-16 UI Gap Audit). |
+| `list_widget_property_enums` | `wbp_path?`, `widget_class?`, `property_name?` | Walks a widget class (or WBP's generated class) and returns every enum-typed property with its enumerator names. Surfaces both `FEnumProperty` (modern `enum class`) AND `FByteProperty` with non-null `Enum` (legacy `TEnumAsByte<EFoo>`). Use to discover the legal value set for `set_widget_property` writes against enum fields. At least one of `wbp_path`/`widget_class` is required. Phase 2 Item #11 (2026-05-16 UI Gap Audit). |
 
 ### Hot-reload behaviour
 
@@ -853,6 +861,76 @@ The probe / error-code / handler / serializer / test / builder sextuple is the c
 4. Serializer silent-no-op on null UClass (no `Context.Errors` entry).
 5. Tests skip-with-warning + `return true`.
 6. Builder leans on the type-resolver's existing `FUISpecError` Category="Type" path.
+
+---
+
+## Error Contract — Optional Tokenforge Provider Absence (-32011)
+
+**Status:** Shipped 2026-05-16 as part of Phase 2 of the UI Gap Audit (Item #10 — `apply_token_binding`). Mirrors the §-32010 EffectSurface contract above for a different optional provider: `TokenforgeRuntime`.
+
+### Error code allocation
+
+`-32011` is the FIRST allocation from the reserved range `-32011..-32019` (left open by the original `-32010` design specifically for future sibling-plugin codes — see § Error Contract — Optional EffectSurface Provider Absence (-32010), "Error code allocation"). Distinct from `-32010` so consumers can branch on **which** optional provider is missing without string-matching the message body.
+
+| Constant | Value | Use site |
+|----------|-------|----------|
+| (inline `-32011`) | `-32011` | `Plugins/Monolith/Source/MonolithUI/Private/CommonUI/MonolithCommonUIButtonActions.cpp` (`HandleApplyTokenBinding`) |
+
+The code is inline (not yet promoted to a `FMonolithJsonUtils::Err*` constant) because Tokenforge is the only consumer for now. If a second `apply_*_binding` style action joins later, promote `-32011` to `FMonolithJsonUtils::ErrTokenforgeRuntimeUnavailable` so both handlers reference the same identifier.
+
+### Action-handler contract — LOUD
+
+Trigger: `ui::apply_token_binding` invoked when `IPluginManager::Get().FindPlugin("TokenforgeRuntime")` returns null OR `->IsEnabled() == false`.
+
+Behaviour: probe runs FIRST in `HandleApplyTokenBinding` (before parsing `widget_name`, `target_property`, or `token_key`). On unavailable, returns a structured error inline-built in the handler.
+
+Canonical response shape:
+
+```jsonc
+{
+  "bSuccess": false,
+  "ErrorCode": -32011,
+  "ErrorMessage": "apply_token_binding unavailable — TokenforgeRuntime plugin not enabled. Install/enable the plugin in <Project>.uproject, or use create_common_*_style for project-static style classes instead.",
+  "Result": {
+    "dep_name":     "TokenforgeRuntime",
+    "widget_type":  "ApplyTokenBinding",
+    "alternative":  "create_common_*_style + apply_style_to_widget",
+    "category":     "OptionalDepUnavailable"
+  }
+}
+```
+
+The `category` value (`"OptionalDepUnavailable"`) matches the `-32010` shape, so LLM consumers can grep ONE category label across both error codes. Differentiation is via the numeric `ErrorCode` field, NOT the message body.
+
+Invariants: NEVER a crash. NEVER a silent success. NEVER a different code. The literal substring `"TokenforgeRuntime plugin not enabled"` is byte-stable across releases — tests assert that substring only, not the full message.
+
+### Implementation status (Phase 2 MVP-STUB)
+
+The Tokenforge availability probe and the structured -32011 error path are **FULL** as of 2026-05-16. The action's full responsibility — writing BP-graph nodes into the WBP's `NativeConstruct` event graph that call `UUISubsystem::GetColor` / `GetFont` / etc. and pipe the result into the target property's setter — is **DEFERRED** to a follow-up (tracked as issue #2-10b in the Phase 2 plan).
+
+Successful responses (Tokenforge IS available) carry `status:"stub"` + a `reason` string explaining the partial state, so callers can branch deterministically on "wired vs registered-only":
+
+```jsonc
+{
+  "bSuccess": true,
+  "Result": {
+    "wbp_path": "/Game/UI/WBP_MainMenu",
+    "widget_name": "Title",
+    "target_property": "ColorAndOpacity",
+    "token_key": "color.surface.default",
+    "tokenforge_available": true,
+    "tokenforge_version": "<version>",
+    "status": "stub",
+    "reason": "BP-graph node-write surface deferred. Param validation + Tokenforge probe FULL — node construction in NativeConstruct event graph awaits issue #2-10b follow-up. Action is registered + discoverable so callers can branch on status='stub'."
+  }
+}
+```
+
+Why register an MVP-STUB: keeping the action in the registry with a deterministic `status:"stub"` signal lets downstream tooling (LLM-driven UI authoring pipelines) discover the surface, validate inputs end-to-end, and write fail-soft branches NOW — without waiting for the BP-graph node-writer to land. When the follow-up ships, `status` flips to `"applied"` and the response payload gains a `bindings_written[]` array.
+
+### Pattern reusability
+
+This is the second optional-provider error code shipped (after `-32010`). The pattern stays the same: probe at handler entry, return structured payload with `dep_name`/`widget_type`/`alternative`/`category` fields, allocate a numeric code from the `-3201X..-32019` range, document the literal substring contract for tests, keep `category:"OptionalDepUnavailable"` stable across all codes for cross-cutting greps.
 
 ---
 

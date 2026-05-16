@@ -28,6 +28,23 @@
 #include "Kismet2/KismetEditorUtilities.h"
 #include "Logging/TokenizedMessage.h"
 
+// Phase 2 (2026-05-16 UI gap audit): rename_widget + dump_blueprint_compile_log.
+// rename_widget recompiles via FBlueprintCompilationManager so the Skeleton class
+// stamping (BPVAR rename in NewVariables[]) survives the post-compile reflection
+// walk that get_widget_tree / set_widget_property uses.
+#include "Kismet2/BlueprintEditorUtils.h"
+#include "Engine/Blueprint.h"
+
+// Phase 2 (Item #7 / #14) — file-static handler forward declarations. Lives
+// here rather than as static members on FMonolithUIActions because the plan
+// (Phase 2 §F6) prohibits header changes; we register through the class's
+// existing RegisterActions hook and dispatch into these file-static handlers.
+namespace MonolithUIActionsPhase2
+{
+    static FMonolithActionResult HandleRenameWidget(const TSharedPtr<FJsonObject>& Params);
+    static FMonolithActionResult HandleDumpBlueprintCompileLog(const TSharedPtr<FJsonObject>& Params);
+}
+
 void FMonolithUIActions::RegisterActions(FMonolithToolRegistry& Registry)
 {
     Registry.RegisterAction(
@@ -112,6 +129,42 @@ void FMonolithUIActions::RegisterActions(FMonolithToolRegistry& Registry)
         FParamSchemaBuilder()
             .Optional(TEXT("filter"), TEXT("string"), TEXT("Filter by category: panel, leaf, input, display, layout"))
             .Build()
+    );
+
+    // Phase 2 Item #7 (2026-05-16 UI gap audit): rename a widget in-place.
+    // Recompiles via FKismetEditorUtilities::CompileBlueprint so the structural
+    // modification + the Skeleton class refresh + the post-compile reflection
+    // walk all see the new FName.
+    Registry.RegisterAction(
+        TEXT("ui"), TEXT("rename_widget"),
+        TEXT("Rename a UWidget's FName in a WBP's tree; updates slot references and recompiles. "
+             "Uniqueness check runs against the full WidgetTree before the rename — colliding new_name returns -32602."),
+        FMonolithActionHandler::CreateStatic(&MonolithUIActionsPhase2::HandleRenameWidget),
+        FParamSchemaBuilder()
+            .Required(TEXT("wbp_path"), TEXT("string"), TEXT("Widget Blueprint path (alias: asset_path)"))
+            .Required(TEXT("old_name"), TEXT("string"), TEXT("Current widget FName"))
+            .Required(TEXT("new_name"), TEXT("string"), TEXT("Target widget FName (must be unique in tree)"))
+            .Build(),
+        TEXT("WidgetCRUD")
+    );
+
+    // Phase 2 Item #14 (2026-05-16 UI gap audit): re-compile a blueprint and
+    // return the last_compile_status (EBlueprintStatus → string) + the
+    // FCompilerResultsLog errors[]/warnings[]/notes[]. Phase 1's HandleCompileWidget
+    // captures the log on every call but does not cache it on the asset — so a
+    // dump call drives a fresh compile to harvest the messages. Shape mirrors
+    // blueprint_query("compile_blueprint") for parser reuse.
+    Registry.RegisterAction(
+        TEXT("ui"), TEXT("dump_blueprint_compile_log"),
+        TEXT("Run a fresh compile and return last_compile_status + errors[]/warnings[]/notes[]. "
+             "Same shape as compile_widget on success; useful when a prior call did not retain its log "
+             "(orchestrator did not parse the response, retried later, etc.). Accepts UWidgetBlueprint OR "
+             "UBlueprint paths — the action sniffs the type and reads ::Status accordingly."),
+        FMonolithActionHandler::CreateStatic(&MonolithUIActionsPhase2::HandleDumpBlueprintCompileLog),
+        FParamSchemaBuilder()
+            .Required(TEXT("asset_path"), TEXT("string"), TEXT("Blueprint or Widget Blueprint asset path"))
+            .Build(),
+        TEXT("WidgetCRUD")
     );
 }
 
@@ -931,4 +984,224 @@ FMonolithActionResult FMonolithUIActions::HandleListWidgetTypes(const TSharedPtr
     Result->SetArrayField(TEXT("widget_types"), ResultArray);
     Result->SetNumberField(TEXT("count"), ResultArray.Num());
     return FMonolithActionResult::Success(Result);
+}
+
+// =============================================================================
+// Phase 2 (2026-05-16 UI gap audit) — file-static handlers
+// =============================================================================
+//
+// Living below the class member definitions so the file's call-graph reads top
+// to bottom: registration -> class statics -> Phase 2 additions. The handlers
+// are file-static rather than members of FMonolithUIActions so the migration
+// did not require a header change (Phase 2 §F6 prohibits new .h surface).
+
+namespace MonolithUIActionsPhase2
+{
+    // ---- Phase 2 Item #7 — rename_widget --------------------------------------
+    //
+    // Renames a UWidget in a WBP's WidgetTree. Validates uniqueness against the
+    // full tree (case-sensitive FName match) before calling Widget->Rename so
+    // the rename never silently produces "Name_1" auto-suffixed via the engine's
+    // collision handling — that would silently drift the caller's expected
+    // identifier. Recompile through FKismetEditorUtilities::CompileBlueprint
+    // matches every other mutation site in this module (e.g. HandleAddWidget,
+    // HandleRemoveWidget, the CommonUI button category) for behavioural parity.
+
+    static FMonolithActionResult HandleRenameWidget(const TSharedPtr<FJsonObject>& Params)
+    {
+        // Both `wbp_path` (CommonUI convention) and `asset_path` (base UMG
+        // convention) are accepted — matches MonolithCommonUI::GetWbpPath.
+        FString WbpPath;
+        if (!Params.IsValid()
+            || (!Params->TryGetStringField(TEXT("wbp_path"), WbpPath)
+                && !Params->TryGetStringField(TEXT("asset_path"), WbpPath))
+            || WbpPath.IsEmpty())
+        {
+            return FMonolithActionResult::Error(
+                TEXT("wbp_path (or asset_path) required"), -32602);
+        }
+
+        FString OldName, NewName;
+        FMonolithActionResult ParamError;
+        if (!MonolithUIInternal::TryGetRequiredString(Params, TEXT("old_name"), OldName, ParamError))
+            return ParamError;
+        if (!MonolithUIInternal::TryGetRequiredString(Params, TEXT("new_name"), NewName, ParamError))
+            return ParamError;
+
+        if (OldName.Equals(NewName, ESearchCase::CaseSensitive))
+        {
+            return FMonolithActionResult::Error(
+                TEXT("new_name is identical to old_name — nothing to do"), -32602);
+        }
+
+        FMonolithActionResult LoadErr;
+        UWidgetBlueprint* WBP = MonolithUIInternal::LoadWidgetBlueprint(WbpPath, LoadErr);
+        if (!WBP) return LoadErr;
+        if (!WBP->WidgetTree)
+        {
+            return FMonolithActionResult::Error(TEXT("WidgetTree is null (editor-only data not available)"), -32603);
+        }
+
+        // Locate the target + verify uniqueness in a single tree walk. We also
+        // collect any existing widget already named `new_name` so the error
+        // message reports which widget is colliding.
+        UWidget* Target = nullptr;
+        UWidget* Collider = nullptr;
+        const FName OldFName(*OldName);
+        const FName NewFName(*NewName);
+        WBP->WidgetTree->ForEachWidget([&](UWidget* W)
+        {
+            if (!W) return;
+            if (W->GetFName() == OldFName) Target = W;
+            if (W->GetFName() == NewFName) Collider = W;
+        });
+
+        if (!Target)
+        {
+            return FMonolithActionResult::Error(
+                FString::Printf(TEXT("Widget '%s' not found in WBP '%s'"), *OldName, *WbpPath),
+                -32602);
+        }
+        if (Collider)
+        {
+            return FMonolithActionResult::Error(
+                FString::Printf(TEXT("new_name '%s' is already in use by another widget (%s) in WBP '%s'"),
+                    *NewName, *Collider->GetClass()->GetName(), *WbpPath),
+                -32602);
+        }
+
+        const FString OldClass = Target->GetClass()->GetName();
+        const bool bWasBoundAsVariable = Target->bIsVariable;
+
+        Target->Modify();
+        WBP->Modify();
+
+        // Rename to the same Outer (WidgetTree). REN_DontCreateRedirectors
+        // keeps the package clean — no lingering linker-level redirect entry.
+        // Pass `nullptr` Outer to keep the existing one (UWidget::Rename semantics).
+        const bool bRenamed = Target->Rename(*NewName, nullptr, REN_DontCreateRedirectors);
+        if (!bRenamed)
+        {
+            return FMonolithActionResult::Error(
+                FString::Printf(TEXT("UObject::Rename returned false for widget '%s' -> '%s'"),
+                    *OldName, *NewName),
+                -32603);
+        }
+
+        // If the widget was a named variable (bIsVariable=true), the WBP holds
+        // a Bindings entry and a NewVariables entry keyed on the old FName.
+        // FBlueprintEditorUtils::RenameMemberVariable is the canonical fixup
+        // path — it walks both arrays and replaces the FName. We only invoke
+        // it when bIsVariable was set, matching the engine's own widget rename
+        // path in WidgetBlueprintEditorUtils.
+        if (bWasBoundAsVariable)
+        {
+            FBlueprintEditorUtils::RenameMemberVariable(WBP, OldFName, NewFName);
+        }
+
+        // Reconcile + recompile. The reconcile pass clears stale variable GUIDs
+        // for the legacy name; MarkAsStructurallyModified bumps the
+        // BlueprintCompileVersion so the next CDO load picks up the new layout.
+        MonolithUIInternal::ReconcileWidgetVariableGuids(WBP);
+        FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WBP);
+        FKismetEditorUtilities::CompileBlueprint(WBP);
+        WBP->GetOutermost()->MarkPackageDirty();
+
+        TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+        Result->SetStringField(TEXT("wbp_path"), WbpPath);
+        Result->SetStringField(TEXT("old_name"), OldName);
+        Result->SetStringField(TEXT("new_name"), NewName);
+        Result->SetStringField(TEXT("widget_class"), OldClass);
+        Result->SetBoolField(TEXT("was_bound_as_variable"), bWasBoundAsVariable);
+        Result->SetBoolField(TEXT("recompiled"), true);
+        return FMonolithActionResult::Success(Result);
+    }
+
+    // ---- Phase 2 Item #14 — dump_blueprint_compile_log ------------------------
+    //
+    // Re-drives a compile through the FCompilerResultsLog-capturing overload
+    // and returns the messages in the same shape blueprint_query("compile_blueprint")
+    // produces. Phase 1's HandleCompileWidget does NOT cache the FCompilerResultsLog
+    // on the asset — the Phase 1 fix surfaced the log only inside its own call.
+    // dump_blueprint_compile_log is intended to be called AFTER a compile when
+    // the orchestrator dropped or never parsed the original payload.
+    //
+    // Accepts both UWidgetBlueprint and plain UBlueprint paths so the action
+    // works as a general-purpose "last status + messages" probe.
+
+    FMonolithActionResult HandleDumpBlueprintCompileLog(const TSharedPtr<FJsonObject>& Params)
+    {
+        FString AssetPath;
+        FMonolithActionResult ParamError;
+        if (!MonolithUIInternal::TryGetRequiredString(Params, TEXT("asset_path"), AssetPath, ParamError))
+            return ParamError;
+
+        UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *AssetPath);
+        if (!Blueprint)
+        {
+            return FMonolithActionResult::Error(
+                FString::Printf(TEXT("Failed to load Blueprint at '%s'"), *AssetPath),
+                -32602);
+        }
+
+        // Capture pre-compile status so callers can tell whether the action
+        // observed a stale BS_Dirty / BS_UpToDate from a previous edit
+        // (vs. forcing a fresh compile because the asset was clean).
+        const TEnumAsByte<EBlueprintStatus> PreStatus = Blueprint->Status;
+
+        FCompilerResultsLog Results;
+        FKismetEditorUtilities::CompileBlueprint(
+            Blueprint, EBlueprintCompileOptions::SkipGarbageCollection, &Results);
+
+        // Status-string mapping aligned with HandleCompileWidget (line ~793).
+        auto StatusToString = [](EBlueprintStatus S) -> FString
+        {
+            switch (S)
+            {
+                case BS_Unknown:              return TEXT("unknown");
+                case BS_Dirty:                return TEXT("dirty");
+                case BS_Error:                return TEXT("error");
+                case BS_UpToDate:             return TEXT("up_to_date");
+                case BS_UpToDateWithWarnings: return TEXT("up_to_date_with_warnings");
+                case BS_BeingCreated:         return TEXT("being_created");
+                default:                      return TEXT("other");
+            }
+        };
+
+        TArray<TSharedPtr<FJsonValue>> ErrorArr;
+        TArray<TSharedPtr<FJsonValue>> WarnArr;
+        TArray<TSharedPtr<FJsonValue>> NoteArr;
+        for (const TSharedRef<FTokenizedMessage>& Msg : Results.Messages)
+        {
+            TSharedPtr<FJsonObject> MsgObj = MakeShared<FJsonObject>();
+            MsgObj->SetStringField(TEXT("message"), Msg->ToText().ToString());
+
+            const EMessageSeverity::Type Sev = Msg->GetSeverity();
+            if (Sev == EMessageSeverity::Error)
+            {
+                ErrorArr.Add(MakeShared<FJsonValueObject>(MsgObj));
+            }
+            else if (Sev == EMessageSeverity::Warning)
+            {
+                WarnArr.Add(MakeShared<FJsonValueObject>(MsgObj));
+            }
+            else
+            {
+                NoteArr.Add(MakeShared<FJsonValueObject>(MsgObj));
+            }
+        }
+
+        TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+        Result->SetStringField(TEXT("asset_path"), AssetPath);
+        Result->SetStringField(TEXT("blueprint_class"), Blueprint->GetClass()->GetName());
+        Result->SetStringField(TEXT("pre_compile_status"), StatusToString(PreStatus));
+        Result->SetStringField(TEXT("last_compile_status"), StatusToString(Blueprint->Status));
+        Result->SetArrayField(TEXT("errors"),   ErrorArr);
+        Result->SetArrayField(TEXT("warnings"), WarnArr);
+        Result->SetArrayField(TEXT("notes"),    NoteArr);
+        Result->SetNumberField(TEXT("error_count"),   ErrorArr.Num());
+        Result->SetNumberField(TEXT("warning_count"), WarnArr.Num());
+        Result->SetBoolField(TEXT("ran_fresh_compile"), true);
+        return FMonolithActionResult::Success(Result);
+    }
 }
