@@ -332,6 +332,39 @@ The following correctness bugs were fixed in the 2026-05-16 sprint (plan: [`Docs
 
 ---
 
+## CommonUI Property Allowlist Coverage
+
+**Purpose:** `set_widget_property`'s default (non-`raw_mode`) path gates writes through a per-type curated allowlist. This section documents which CommonUI properties have curated mappings (work without `raw_mode=true`) versus which require the legacy `raw_mode=true` bypass. Seed source: `Source/MonolithUI/Private/Registry/MonolithUIRegistrySubsystem.cpp:393-403` (CommonButtonBase curated block, expanded by Phase 1 Bug #2).
+
+### Curated CommonUI properties (no `raw_mode` required)
+
+| Class token | Curated property | Type | requires raw_mode? | Notes |
+|-------------|------------------|------|--------------------|-------|
+| `CommonButtonBase` | `TriggeringInputAction` | `FDataTableRowHandle` | No | Phase 1 Bug #2 — row handle into `CommonInputActionDataBase` driving the action-bar binding. |
+| `CommonButtonBase` | `bDisplayInActionBar` | `bool` | No | Phase 1 Bug #2 — whether the button surfaces in a bound action bar. |
+
+The token comes from `MakeTokenFromClassName(UCommonButtonBase::StaticClass())` which strips the leading `U` and returns `CommonButtonBase`. Subclasses inherit via the per-class walk in `FMonolithUIRegistrySubsystem::ResolveCuratedPropertyMapping`.
+
+### Non-curated CommonUI properties (require `raw_mode=true`)
+
+All other CommonUI UPROPERTYs not listed above (e.g. `Style`, `ClickMethod`, `TouchMethod`, `bSelectable`, `bToggleable`, `bLocked`, `InputType`, `GamepadInputType`, custom `UCommonActivatableWidget` properties, etc.) currently route through `raw_mode=true` only. The catch-all rationale:
+
+1. `raw_mode=true` opens the unconditional `ImportText_Direct` path — every CDO-reachable UPROPERTY is writeable regardless of allowlist membership.
+2. Curated entries are added on a needs-basis when an LLM-driven authoring pipeline trips the "needs `raw_mode`" papercut twice or more.
+3. Curated mode also runs ParseFailed / TypeMismatch diagnostics from `FUIReflectionApplyResult` — raw_mode skips those, so per-property curation is preferred where reachable.
+
+### Adding a new CommonUI curated entry
+
+In `MonolithUIRegistrySubsystem.cpp::SeedCuratedAllowlist()` (the function that calls `AddMappingTo` at the lines cited above), append:
+
+```cpp
+AddMappingTo(TypeRegistry, FName(TEXT("<ClassToken>")), TEXT("<PropertyName>"), TEXT("<EngineFieldName>"), TEXT("<doc string>"));
+```
+
+The token MUST match `MakeTokenFromClassName(UYourClass::StaticClass())` (strip leading `U` from the C++ class name). The third arg is the property-name the caller sends; the fourth arg is the engine-reflection field name (usually identical unless the curated alias differs from the engine name — e.g. `Style` -> `WidgetStyle` for `UButton`).
+
+---
+
 ## Spec System (M5)
 
 **Status:** Phases A–L all landed 2026-04-26 (plan: [`Docs/plans/2026-04-25-monolith-ui-architecture-expansion.md`](../../../../Docs/plans/2026-04-25-monolith-ui-architecture-expansion.md)). Phase L (this pass) marked v1 animation actions deprecated, refreshed action counts and roll-ups across all SPEC docs, and preserved one-major-release compatibility for legacy sibling UI aliases.
@@ -1181,8 +1214,9 @@ These are tracked drift / deferred work that did not block Phase L closure:
 | 9 | JSON-path → engine-path helper migration | Phase F per-handler `FEffectSurfaceActions::ApplyPath` is now a thin wrapper around `FUIReflectionHelper::ApplyJsonPath` (the Phase H hoist). Other handlers can migrate at leisure — the wrapper-and-hoist pattern is canonical going forward. |
 | 10 | Preset-literal drift detector (post-decouple R2.9) | The R2.9 metadata table in `MonolithUIEffectActions.cpp` (6 named presets — `rounded-rect`, `pill`, `circle`, `glass`, `glowing-button`, `neon`) and the provider's canonical presets MUST stay byte-aligned. Currently relies on manual diff in PR review. Future automation: a provider-side unit test that round-trips each preset name through both code paths and asserts pixel-identical render. Tracked here so the next post-decouple audit picks it up. |
 | 11 | EEffectSurfaceFeature drift detector (post-decouple R2.5) | Raw `int32` constants `EffectFeature_RoundedCorners = 1<<0` … `EffectFeature_InsetHighlight = 1<<10` in `MonolithUIEffectActions.cpp` shadow the provider's canonical feature enum. Same drift class as #10 — manual diff today; would be neat to gate with a provider-side static assert. |
+| 12 | Editor-down semantic distinction (2026-05-16 UI gap audit Item #22) | Editor-down semantic distinction: when MCP transport drops, agents get a generic disconnect. Wrapper distinguishing 'editor crashed' vs 'MCP proxy crashed' + auto-suggest offline `monolith_query.exe` fallback. Out of scope for MonolithUI; lives in MCP proxy / transport layer. Captured for visibility — separate Monolith MCP proxy ticket. |
 
-Items 4 + 5 are the only Phase L deprecation markers; items 10 + 11 were added by the optional provider decouple (2026-04-27). The rest are drift the audit caught while sweeping the spec but predate the relevant phase.
+Items 4 + 5 are the only Phase L deprecation markers; items 10 + 11 were added by the optional provider decouple (2026-04-27); item 12 was added by the 2026-05-16 UI gap audit. The rest are drift the audit caught while sweeping the spec but predate the relevant phase.
 
 ---
 

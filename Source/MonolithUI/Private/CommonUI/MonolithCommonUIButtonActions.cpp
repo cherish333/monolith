@@ -300,6 +300,23 @@ namespace MonolithCommonUIButton
 
 	// ----- 2.B.1 convert_button_to_common --------------------------------------
 
+	// Phase 4 Item #19 (2026-05-16 UI gap audit): when caller omits `target_class`
+	// AND TokenforgeRuntime is installed + enabled, prefer Tokenforge's
+	// `TokenforgeCommonButton` over the transient `MonolithDefaultCommonButton`
+	// fallback. Probe is reflective (no compile-time dep on Tokenforge) and
+	// gracefully degrades when the plugin / class is absent. Caller-supplied
+	// target_class always wins — this helper only fires on the no-target path.
+	static FString ResolveDefaultButtonClass()
+	{
+		if (IPluginManager::Get().FindPlugin(TEXT("TokenforgeRuntime")).IsValid()
+			&& IPluginManager::Get().FindPlugin(TEXT("TokenforgeRuntime"))->IsEnabled())
+		{
+			if (UClass* TokenforgeButtonClass = FindFirstObject<UClass>(TEXT("TokenforgeCommonButton")))
+				return TokenforgeButtonClass->GetPathName();
+		}
+		return TEXT("/Game/Monolith/CommonUI/MonolithDefaultCommonButton.MonolithDefaultCommonButton_C");
+	}
+
 	static FMonolithActionResult HandleConvertButtonToCommon(const TSharedPtr<FJsonObject>& Params)
 	{
 		FString WidgetName;
@@ -341,51 +358,74 @@ namespace MonolithCommonUIButton
 		}
 		else
 		{
-			// No target_class specified — create a persistent concrete Blueprint
-			// subclass of UCommonButtonBase on demand. Cached per-session so we
-			// only create it once. Cannot use a UCLASS here because UHT rejects
-			// UCLASS inside #if WITH_COMMONUI preprocessor blocks.
-			// Must live in a real package (not transient) so WBPs referencing
-			// the generated class can save to disk.
-			static TWeakObjectPtr<UClass> CachedDefaultClass;
-			if (!CachedDefaultClass.IsValid())
+			// Phase 4 Item #19 (2026-05-16 UI gap audit): probe TokenforgeRuntime
+			// FIRST. If installed + enabled AND a TokenforgeCommonButton class is
+			// resolvable, use it. The transient `MonolithDefaultCommonButton`
+			// fallback below stays in place for the Tokenforge-absent case.
+			const FString ResolvedDefault = ResolveDefaultButtonClass();
+			if (!ResolvedDefault.StartsWith(TEXT("/Game/Monolith/CommonUI/MonolithDefaultCommonButton")))
 			{
-				const FString DefaultPath = TEXT("/Game/Monolith/CommonUI/MonolithDefaultCommonButton");
-				// Check if it already exists on disk from a prior session
-				UBlueprint* BP = LoadObject<UBlueprint>(nullptr, *DefaultPath);
-				if (!BP)
+				if (UClass* TokenforgeClass = LoadClass<UObject>(nullptr, *ResolvedDefault))
 				{
-					UPackage* Pkg = CreatePackage(*DefaultPath);
-					if (Pkg)
+					if (TokenforgeClass->IsChildOf(UCommonButtonBase::StaticClass())
+						&& !TokenforgeClass->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated | CLASS_NewerVersionExists))
 					{
-						BP = FKismetEditorUtilities::CreateBlueprint(
-							UCommonButtonBase::StaticClass(),
-							Pkg,
-							TEXT("MonolithDefaultCommonButton"),
-							BPTYPE_Normal,
-							UBlueprint::StaticClass(),
-							UBlueprintGeneratedClass::StaticClass());
-						if (BP)
-						{
-							FKismetEditorUtilities::CompileBlueprint(BP);
-							FAssetRegistryModule::AssetCreated(BP);
-							Pkg->MarkPackageDirty();
-							FSavePackageArgs SaveArgs;
-							SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
-							UPackage::SavePackage(Pkg, BP,
-								*FPackageName::LongPackageNameToFilename(DefaultPath, FPackageName::GetAssetPackageExtension()),
-								SaveArgs);
-						}
+						TargetClass = TokenforgeClass;
 					}
 				}
-				if (BP && BP->GeneratedClass)
-				{
-					CachedDefaultClass = BP->GeneratedClass;
-				}
 			}
-			TargetClass = CachedDefaultClass.Get();
+
+			// Fallback (Phase 4 Item #19): only run the persistent
+			// MonolithDefaultCommonButton creation path if the Tokenforge probe
+			// above did NOT resolve a class. Gated by `TargetClass == nullptr`.
 			if (!TargetClass)
-				return FMonolithActionResult::Error(TEXT("Failed to create default CommonButton subclass. Pass a concrete target_class explicitly."));
+			{
+				// No target_class specified — create a persistent concrete Blueprint
+				// subclass of UCommonButtonBase on demand. Cached per-session so we
+				// only create it once. Cannot use a UCLASS here because UHT rejects
+				// UCLASS inside #if WITH_COMMONUI preprocessor blocks.
+				// Must live in a real package (not transient) so WBPs referencing
+				// the generated class can save to disk.
+				static TWeakObjectPtr<UClass> CachedDefaultClass;
+				if (!CachedDefaultClass.IsValid())
+				{
+					const FString DefaultPath = TEXT("/Game/Monolith/CommonUI/MonolithDefaultCommonButton");
+					// Check if it already exists on disk from a prior session
+					UBlueprint* BP = LoadObject<UBlueprint>(nullptr, *DefaultPath);
+					if (!BP)
+					{
+						UPackage* Pkg = CreatePackage(*DefaultPath);
+						if (Pkg)
+						{
+							BP = FKismetEditorUtilities::CreateBlueprint(
+								UCommonButtonBase::StaticClass(),
+								Pkg,
+								TEXT("MonolithDefaultCommonButton"),
+								BPTYPE_Normal,
+								UBlueprint::StaticClass(),
+								UBlueprintGeneratedClass::StaticClass());
+							if (BP)
+							{
+								FKismetEditorUtilities::CompileBlueprint(BP);
+								FAssetRegistryModule::AssetCreated(BP);
+								Pkg->MarkPackageDirty();
+								FSavePackageArgs SaveArgs;
+								SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+								UPackage::SavePackage(Pkg, BP,
+									*FPackageName::LongPackageNameToFilename(DefaultPath, FPackageName::GetAssetPackageExtension()),
+									SaveArgs);
+							}
+						}
+					}
+					if (BP && BP->GeneratedClass)
+					{
+						CachedDefaultClass = BP->GeneratedClass;
+					}
+				}
+				TargetClass = CachedDefaultClass.Get();
+				if (!TargetClass)
+					return FMonolithActionResult::Error(TEXT("Failed to create default CommonButton subclass. Pass a concrete target_class explicitly."));
+			}
 		}
 
 		if (TargetClass->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated | CLASS_NewerVersionExists))

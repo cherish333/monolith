@@ -49,7 +49,7 @@ void FMonolithUIActions::RegisterActions(FMonolithToolRegistry& Registry)
 {
     Registry.RegisterAction(
         TEXT("ui"), TEXT("create_widget_blueprint"),
-        TEXT("Create a new Widget Blueprint asset"),
+        TEXT("Create a UWidgetBlueprint at save_path. parent_class accepts /Script/Module.Class form OR short name ('TokenforgeActivatableWidget', 'CommonActivatableWidget', 'UserWidget') — short name resolves via UClass::FindClassByName."),
         FMonolithActionHandler::CreateStatic(&HandleCreateWidgetBlueprint),
         FParamSchemaBuilder()
             .Required(TEXT("save_path"), TEXT("string"), TEXT("Asset path, e.g. /Game/UI/WBP_MyWidget"))
@@ -115,7 +115,7 @@ void FMonolithUIActions::RegisterActions(FMonolithToolRegistry& Registry)
 
     Registry.RegisterAction(
         TEXT("ui"), TEXT("compile_widget"),
-        TEXT("Compile a Widget Blueprint"),
+        TEXT("Compile a Widget Blueprint. Response includes errors[] and warnings[] arrays populated when status=BS_Error (added v0.14.11)."),
         FMonolithActionHandler::CreateStatic(&HandleCompileWidget),
         FParamSchemaBuilder()
             .Required(TEXT("asset_path"), TEXT("string"), TEXT("Widget Blueprint asset path"))

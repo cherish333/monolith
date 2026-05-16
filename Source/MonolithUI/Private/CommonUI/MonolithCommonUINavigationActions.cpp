@@ -686,7 +686,7 @@ namespace MonolithCommonUINavigation
 
 		Registry.RegisterAction(
 			TEXT("ui"), TEXT("set_initial_focus_target"),
-			TEXT("Store DesiredFocusTargetName FName UPROPERTY on a UCommonActivatableWidget CDO. WBP must expose this UPROPERTY and override NativeGetDesiredFocusTarget."),
+			TEXT("Store DesiredFocusTargetName FName UPROPERTY on a UCommonActivatableWidget CDO. WBP must expose this UPROPERTY and override NativeGetDesiredFocusTarget. Satisfying parent classes: UTokenforgeActivatableWidget, UMonolithReduceMotionAwareWidget. If parent doesn't expose the UPROPERTY, use ui::add_widget_variable to add it first."),
 			FMonolithActionHandler::CreateStatic(&HandleSetInitialFocusTarget),
 			FParamSchemaBuilder()
 				.Required(TEXT("wbp_path"), TEXT("string"), TEXT("UCommonActivatableWidget blueprint path"))
