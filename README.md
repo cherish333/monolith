@@ -76,6 +76,7 @@ Most MCP integrations register every action as a separate tool, which floods the
 - **MCP auto-reconnect proxy** — stdio-to-HTTP proxy keeps Claude Code sessions alive across editor restarts. Available as native exe (zero dependencies) or Python script (fallback)
 - **Optional module system** — Extend Monolith with new MCP namespaces for third-party plugins (GeometryScripting, BlueprintAssist, GBA, ComboGraph, Logic Driver, MetaSound) without breaking the build for users who don't own them. The sibling-plugin pattern lets you ship your own integration plugin alongside Monolith — see `Docs/SIBLING_PLUGIN_GUIDE.md`
 - **Claude Code skills** — 16 domain-specific workflow guides bundled with the plugin
+- **`monolith_guide()`** — Section-keyed editorial cross-namespace guide for your AI: onboarding script, worked cross-namespace recipes, X-vs-Y decision matrices, error-to-recovery maps, and Monolith-specific gotchas, plus a live registry overlay. Pull a single section (`monolith_guide(section="recipes")`) to bound context cost. Hand-authored markdown + live counts; offline CLI parity. Error messages now self-describe their recovery steps inline
 - **Pure C++** — Direct UE API access, embedded HTTP MCP server, zero external dependencies
 
 ---
