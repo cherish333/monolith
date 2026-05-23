@@ -2,7 +2,7 @@
 // Private declaration for Phase 4 ui adapter.
 // Pattern: mirrors Phase 1 Plugins/Monolith/Source/MonolithBlueprint/Private/MonolithBlueprintBulkFillAdapter.h,
 // Phase 2 Plugins/Monolith/Source/MonolithGAS/Private/MonolithGASBulkFillAdapter.h,
-// and Phase 3 Plugins/MonolithISX/Source/MonolithISX/Private/MonolithISXBulkFillAdapter.h.
+// and the per-namespace adapters in the other Monolith modules.
 //
 // H5 stub-adapter invariant: Register() ALWAYS runs from FMonolithUIModule::StartupModule,
 // regardless of WITH_COMMONUI. The adapter body splits per call-shape, NOT around the

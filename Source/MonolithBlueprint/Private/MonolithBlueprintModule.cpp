@@ -7,6 +7,9 @@
 #include "MonolithBlueprintCompileActions.h"
 #include "MonolithBlueprintCDOActions.h"
 #include "MonolithBlueprintStructActions.h"
+#include "MonolithBlueprintDataTableActions.h"
+#include "MonolithBlueprintCurveTableActions.h"
+#include "MonolithBlueprintStringTableActions.h"
 #include "MonolithBlueprintBuildActions.h"
 #include "MonolithBlueprintDiffActions.h"
 #include "MonolithBlueprintTemplateActions.h"
@@ -33,6 +36,9 @@ void FMonolithBlueprintModule::StartupModule()
 	FMonolithBlueprintCompileActions::RegisterActions(Registry);
 	FMonolithBlueprintCDOActions::RegisterActions(Registry);
 	FMonolithBlueprintStructActions::RegisterActions(Registry);
+	FMonolithBlueprintDataTableActions::RegisterActions(Registry);
+	FMonolithBlueprintCurveTableActions::RegisterActions(Registry);
+	FMonolithBlueprintStringTableActions::RegisterActions(Registry);
 	FMonolithBlueprintBuildActions::RegisterActions(Registry);
 	FMonolithBlueprintDiffActions::RegisterActions(Registry);
 	FMonolithBlueprintTemplateActions::RegisterActions(Registry);
@@ -45,7 +51,7 @@ void FMonolithBlueprintModule::StartupModule()
 	// central bulk_fill.apply / describe.schema dispatchers (Phase 0).
 	FMonolithBlueprintBulkFillAdapter::Register();
 
-	UE_LOG(LogMonolith, Log, TEXT("Monolith — Blueprint module loaded (88 actions + bulk_fill/describe adapter)"));
+	UE_LOG(LogMonolith, Log, TEXT("Monolith — Blueprint module loaded (105 actions + bulk_fill/describe adapter)"));
 }
 
 void FMonolithBlueprintModule::ShutdownModule()

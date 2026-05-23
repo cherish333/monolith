@@ -51,6 +51,12 @@ namespace MonolithCommonUINavigation
 		return false;
 	}
 
+	// Forward declarations — the rule/direction stringifiers are defined further
+	// down (shared with audit_focus_chain) but are referenced by the bulk/dump
+	// handlers above their definitions.
+	static FString NavRuleToString(EUINavigationRule Rule);
+	static FString NavDirectionToString(EUINavigation Dir);
+
 	// ----- 3.D.1 set_widget_navigation -----------------------------------------
 
 	static FMonolithActionResult HandleSetWidgetNavigation(const TSharedPtr<FJsonObject>& Params)
@@ -108,6 +114,226 @@ namespace MonolithCommonUINavigation
 		Result->SetStringField(TEXT("widget_name"), WidgetName);
 		Result->SetStringField(TEXT("direction"), DirStr);
 		Result->SetStringField(TEXT("rule"), RuleStr);
+		return FMonolithActionResult::Success(Result);
+	}
+
+	// ----- set_widget_navigation_bulk ------------------------------------------
+	//
+	// Apply N navigation-rule writes across a WBP, then compile ONCE. The
+	// single-write set_widget_navigation compiles per call; for callers wiring an
+	// entire screen's nav graph that is N redundant compiles. This action mirrors
+	// the same widget/rule resolution but defers MarkBlueprintAsStructurallyModified
+	// + CompileBlueprint to a single pass after every write succeeds.
+	//
+	// Each entry: { widget_name, direction, rule, explicit_target? }. Per-entry
+	// failures are collected (not fatal) so a partial batch still applies the
+	// valid writes and reports which entries failed and why.
+
+	static FMonolithActionResult HandleSetWidgetNavigationBulk(const TSharedPtr<FJsonObject>& Params)
+	{
+		FString WbpPath = MonolithCommonUI::GetWbpPath(Params);
+		if (WbpPath.IsEmpty())
+			return FMonolithActionResult::Error(TEXT("wbp_path (or asset_path) required"));
+
+		const TArray<TSharedPtr<FJsonValue>>* Entries = nullptr;
+		if (!Params.IsValid() || !Params->TryGetArrayField(TEXT("entries"), Entries) || !Entries)
+			return FMonolithActionResult::Error(TEXT("entries array required: [{widget_name, direction, rule, explicit_target?}]"));
+
+		UWidgetBlueprint* Wbp = LoadObject<UWidgetBlueprint>(nullptr, *WbpPath);
+		if (!Wbp || !Wbp->WidgetTree)
+			return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load WBP '%s'"), *WbpPath));
+
+		// Cache widget lookups so a multi-entry batch resolves each widget once.
+		TMap<FName, UWidget*> WidgetByName;
+		Wbp->WidgetTree->ForEachWidget([&](UWidget* W)
+		{
+			if (W)
+			{
+				WidgetByName.Add(W->GetFName(), W);
+			}
+		});
+
+		auto ResolveWidget = [&](const FString& Name) -> UWidget*
+		{
+			UWidget** Found = WidgetByName.Find(FName(*Name));
+			return Found ? *Found : nullptr;
+		};
+
+		int32 Written = 0;
+		TArray<TSharedPtr<FJsonValue>> Failed;
+
+		auto FailEntry = [&](int32 Index, const FString& Reason)
+		{
+			TSharedPtr<FJsonObject> F = MakeShared<FJsonObject>();
+			F->SetNumberField(TEXT("index"), Index);
+			F->SetStringField(TEXT("reason"), Reason);
+			Failed.Add(MakeShared<FJsonValueObject>(F));
+		};
+
+		for (int32 Index = 0; Index < Entries->Num(); ++Index)
+		{
+			const TSharedPtr<FJsonObject>* EntryObj = nullptr;
+			if (!(*Entries)[Index]->TryGetObject(EntryObj) || !EntryObj || !(*EntryObj).IsValid())
+			{
+				FailEntry(Index, TEXT("entry is not an object"));
+				continue;
+			}
+
+			FString WidgetName, DirStr, RuleStr;
+			if (!(*EntryObj)->TryGetStringField(TEXT("widget_name"), WidgetName) ||
+				!(*EntryObj)->TryGetStringField(TEXT("direction"), DirStr) ||
+				!(*EntryObj)->TryGetStringField(TEXT("rule"), RuleStr))
+			{
+				FailEntry(Index, TEXT("widget_name, direction, rule required"));
+				continue;
+			}
+
+			EUINavigation Dir;
+			if (!ParseDirection(DirStr, Dir))
+			{
+				FailEntry(Index, TEXT("direction must be Up/Down/Left/Right/Next/Previous"));
+				continue;
+			}
+			EUINavigationRule Rule;
+			if (!ParseRule(RuleStr, Rule))
+			{
+				FailEntry(Index, TEXT("rule must be Escape/Stop/Wrap/Explicit/Custom/CustomBoundary"));
+				continue;
+			}
+
+			UWidget* Target = ResolveWidget(WidgetName);
+			if (!Target)
+			{
+				FailEntry(Index, FString::Printf(TEXT("widget '%s' not found"), *WidgetName));
+				continue;
+			}
+
+			if (Rule == EUINavigationRule::Explicit)
+			{
+				FString ExplicitTargetName;
+				if (!(*EntryObj)->TryGetStringField(TEXT("explicit_target"), ExplicitTargetName))
+				{
+					FailEntry(Index, TEXT("rule=Explicit requires explicit_target"));
+					continue;
+				}
+				UWidget* ExplicitTarget = ResolveWidget(ExplicitTargetName);
+				if (!ExplicitTarget)
+				{
+					FailEntry(Index, FString::Printf(TEXT("explicit_target '%s' not found"), *ExplicitTargetName));
+					continue;
+				}
+				Target->SetNavigationRuleExplicit(Dir, ExplicitTarget);
+			}
+			else
+			{
+				Target->SetNavigationRuleBase(Dir, Rule);
+			}
+			++Written;
+		}
+
+		// Single deferred compile after all writes — the whole point of the bulk path.
+		// When save is requested, route through CompileAndSaveWidgetBlueprint which
+		// performs the mark/compile/save in one pass (no double-compile).
+		bool bCompiledOnce = false;
+		if (Written > 0)
+		{
+			bool bSave = false;
+			Params->TryGetBoolField(TEXT("save"), bSave);
+			if (bSave)
+			{
+				MonolithCommonUI::CompileAndSaveWidgetBlueprint(Wbp);
+			}
+			else
+			{
+				FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Wbp);
+				FKismetEditorUtilities::CompileBlueprint(Wbp);
+				Wbp->GetOutermost()->MarkPackageDirty();
+			}
+			bCompiledOnce = true;
+		}
+
+		TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+		Result->SetStringField(TEXT("wbp_path"), WbpPath);
+		Result->SetNumberField(TEXT("written"), Written);
+		Result->SetArrayField(TEXT("failed"), Failed);
+		Result->SetBoolField(TEXT("compiled_once"), bCompiledOnce);
+		return FMonolithActionResult::Success(Result);
+	}
+
+	// ----- dump_widget_navigation ----------------------------------------------
+	//
+	// Read-only dump of UWidget::Navigation per-direction rules. audit_focus_chain
+	// only surfaces Explicit edges (its graph is built from explicit targets);
+	// Wrap/Stop/Escape rules are invisible to it. This action reports the raw rule
+	// for every authored direction so callers can see the full nav configuration.
+	// Returns one entry per (widget, direction) that has an authored rule.
+
+	static FMonolithActionResult HandleDumpWidgetNavigation(const TSharedPtr<FJsonObject>& Params)
+	{
+		FString WbpPath = MonolithCommonUI::GetWbpPath(Params);
+		if (WbpPath.IsEmpty())
+			return FMonolithActionResult::Error(TEXT("wbp_path (or asset_path) required"));
+
+		UWidgetBlueprint* Wbp = LoadObject<UWidgetBlueprint>(nullptr, *WbpPath);
+		if (!Wbp || !Wbp->WidgetTree)
+			return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load WBP '%s'"), *WbpPath));
+
+		// Optional filter: a single widget by name.
+		FString FilterName;
+		const bool bHasFilter = Params->TryGetStringField(TEXT("widget_name"), FilterName);
+
+		TArray<TSharedPtr<FJsonValue>> Out;
+
+		// Emit one JSON entry per authored direction of a UWidgetNavigation.
+		auto EmitDir = [&](const FName& WidgetName, const FWidgetNavigationData& Data, EUINavigation Dir)
+		{
+			TSharedPtr<FJsonObject> Entry = MakeShared<FJsonObject>();
+			Entry->SetStringField(TEXT("widget_name"), WidgetName.ToString());
+			Entry->SetStringField(TEXT("direction"), NavDirectionToString(Dir));
+			Entry->SetStringField(TEXT("rule"), NavRuleToString(Data.Rule));
+			if (Data.Rule == EUINavigationRule::Explicit)
+			{
+				// Widget pointer is only resolved at PIE; fall back to the
+				// editor-stored WidgetToFocus FName (FWidgetNavigationData.h:33).
+				FName TargetName;
+				if (Data.Widget.IsValid())
+				{
+					TargetName = Data.Widget->GetFName();
+				}
+				else if (!Data.WidgetToFocus.IsNone())
+				{
+					TargetName = Data.WidgetToFocus;
+				}
+				if (!TargetName.IsNone())
+				{
+					Entry->SetStringField(TEXT("target"), TargetName.ToString());
+				}
+			}
+			Out.Add(MakeShared<FJsonValueObject>(Entry));
+		};
+
+		Wbp->WidgetTree->ForEachWidget([&](UWidget* W)
+		{
+			if (!W) return;
+			if (bHasFilter && W->GetFName() != FName(*FilterName)) return;
+
+			UWidgetNavigation* Nav = W->Navigation;
+			if (!Nav) return;
+
+			const FName WName = W->GetFName();
+			EmitDir(WName, Nav->Up,       EUINavigation::Up);
+			EmitDir(WName, Nav->Down,     EUINavigation::Down);
+			EmitDir(WName, Nav->Left,     EUINavigation::Left);
+			EmitDir(WName, Nav->Right,    EUINavigation::Right);
+			EmitDir(WName, Nav->Next,     EUINavigation::Next);
+			EmitDir(WName, Nav->Previous, EUINavigation::Previous);
+		});
+
+		// The action contract returns an array of {widget_name, direction, rule, target?}.
+		TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+		Result->SetStringField(TEXT("wbp_path"), WbpPath);
+		Result->SetArrayField(TEXT("navigation"), Out);
+		Result->SetNumberField(TEXT("count"), Out.Num());
 		return FMonolithActionResult::Success(Result);
 	}
 
@@ -681,6 +907,31 @@ namespace MonolithCommonUINavigation
 				.Required(TEXT("direction"), TEXT("string"), TEXT("Up|Down|Left|Right|Next|Previous"))
 				.Required(TEXT("rule"), TEXT("string"), TEXT("Escape|Stop|Wrap|Explicit|Custom|CustomBoundary"))
 				.Optional(TEXT("explicit_target"), TEXT("string"), TEXT("Required when rule=Explicit: target widget name"))
+				.Build(),
+			Cat);
+
+		Registry.RegisterAction(
+			TEXT("ui"), TEXT("set_widget_navigation_bulk"),
+			TEXT("Apply N navigation-rule writes to a WBP then compile ONCE (vs set_widget_navigation's per-call compile). "
+				 "entries: [{widget_name, direction, rule, explicit_target?}]. Per-entry failures are non-fatal and reported "
+				 "in 'failed'; valid writes still apply. Returns {written, failed[], compiled_once}."),
+			FMonolithActionHandler::CreateStatic(&HandleSetWidgetNavigationBulk),
+			FParamSchemaBuilder()
+				.Required(TEXT("wbp_path"), TEXT("string"), TEXT("Widget Blueprint path (alias: asset_path)"))
+				.Required(TEXT("entries"), TEXT("array"), TEXT("[{widget_name, direction(Up|Down|Left|Right|Next|Previous), rule(Escape|Stop|Wrap|Explicit|Custom|CustomBoundary), explicit_target?}]"))
+				.Optional(TEXT("save"), TEXT("boolean"), TEXT("Also save the package after the single compile (default false)"))
+				.Build(),
+			Cat);
+
+		Registry.RegisterAction(
+			TEXT("ui"), TEXT("dump_widget_navigation"),
+			TEXT("Read-only dump of UWidget::Navigation per-direction rules (Wrap/Stop/Escape included — these are invisible "
+				 "to audit_focus_chain which only graphs Explicit edges). Returns 'navigation': [{widget_name, direction, rule, target?}]. "
+				 "Pass widget_name to filter to a single widget. Does not modify or compile the WBP."),
+			FMonolithActionHandler::CreateStatic(&HandleDumpWidgetNavigation),
+			FParamSchemaBuilder()
+				.Required(TEXT("wbp_path"), TEXT("string"), TEXT("Widget Blueprint path (alias: asset_path)"))
+				.Optional(TEXT("widget_name"), TEXT("string"), TEXT("Filter to a single widget's nav rules"))
 				.Build(),
 			Cat);
 

@@ -64,6 +64,31 @@ public:
 	 */
 	static FProperty* FindPropertyForwarding(UStruct* Struct, const FString& Name);
 
+	/**
+	 * Recover the UEnum backing a UserDefinedEnum field inside a UserDefinedStruct.
+	 *
+	 * A UserDefinedEnum field compiles to a plain numeric FProperty with no Enum
+	 * association at runtime: UUserDefinedEnum is always ECppForm::Namespaced, and
+	 * the KismetCompiler only emits an FEnumProperty for ECppForm::EnumClass. The
+	 * UEnum is therefore only recoverable from editor-only UDS metadata
+	 * (FStructVariableDescription::SubCategoryObject).
+	 *
+	 * Returns the UEnum* for such a field, or nullptr for everything else (native
+	 * enums already surface as FEnumProperty/FByteProperty and need no recovery).
+	 * Editor-only — returns nullptr in non-editor builds.
+	 */
+	static UEnum* RecoverUserDefinedEnum(const FProperty* Prop);
+
+	/**
+	 * Map an incoming token to the integer value of a recovered UserDefinedEnum
+	 * field. The token may be a friendly display name, the authored short/full
+	 * name, or a bare integer. Returns false if the field is not a recoverable UDS
+	 * enum, or if the token does not resolve to one of its enumerators. Bare-integer
+	 * tokens are intentionally NOT resolved here so callers preserve back-compat by
+	 * falling through to their existing ImportText path.
+	 */
+	static bool ResolveUserDefinedEnumToken(const FProperty* Prop, const FString& Token, int64& OutValue);
+
 private:
 	// Inner switch — routes a single JSON value to its FProperty subtype handler.
 	static void DispatchByPropertyType(

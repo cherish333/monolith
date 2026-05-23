@@ -1138,6 +1138,199 @@ namespace MonolithCommonUIButton
 		return FMonolithActionResult::Success(Result);
 	}
 
+	// ----- convert_border_to_common --------------------------------------------
+	//
+	// Replace a UBorder with a UCommonBorder, preserving the variable identity,
+	// parent slot, AND the single content child. Unlike the UButton ->
+	// UCommonButtonBase case (which crosses from UContentWidget to a
+	// UCommonUserWidget with an internal tree), both UBorder and UCommonBorder are
+	// UContentWidget subclasses, so the content child transfers cleanly via
+	// SetContent. UCommonBorder is a concrete (non-abstract) UCLASS, so we
+	// construct it directly — no on-demand subclass creation needed.
+
+	static FMonolithActionResult HandleConvertBorderToCommon(const TSharedPtr<FJsonObject>& Params)
+	{
+		FString WidgetName;
+		if (!Params.IsValid() || !Params->TryGetStringField(TEXT("widget_name"), WidgetName))
+			return FMonolithActionResult::Error(TEXT("wbp_path and widget_name required"));
+		FString WbpPath = MonolithCommonUI::GetWbpPath(Params);
+		if (WbpPath.IsEmpty())
+			return FMonolithActionResult::Error(TEXT("wbp_path (or asset_path) required"));
+
+		UWidgetBlueprint* Wbp = nullptr;
+		UWidget* Target = nullptr;
+		FMonolithActionResult Loaded = MonolithCommonUI::LoadWidgetForMutation(WbpPath, FName(*WidgetName), Wbp, Target);
+		if (!Loaded.bSuccess) return Loaded;
+
+		UBorder* OldBorder = Cast<UBorder>(Target);
+		if (!OldBorder)
+			return FMonolithActionResult::Error(FString::Printf(TEXT("Widget '%s' is not a UBorder"), *WidgetName));
+		// A UCommonBorder is itself a UBorder; converting it would be a no-op.
+		if (OldBorder->IsA<UCommonBorder>())
+			return FMonolithActionResult::Error(FString::Printf(TEXT("Widget '%s' is already a UCommonBorder"), *WidgetName));
+
+		UPanelSlot* ParentSlot = OldBorder->Slot;
+		UPanelWidget* Parent = ParentSlot ? ParentSlot->Parent : nullptr;
+		const bool bIsRoot = (Wbp->WidgetTree && Wbp->WidgetTree->RootWidget == OldBorder);
+		if (!Parent && !bIsRoot)
+			return FMonolithActionResult::Error(TEXT("Cannot convert a border with no parent that is also not the tree root"));
+
+		// Detach the existing content child so it survives the swap.
+		UWidget* Content = OldBorder->GetContent();
+		if (Content)
+		{
+			OldBorder->Modify();
+			OldBorder->ClearChildren();
+		}
+
+		const FName BorderName = OldBorder->GetFName();
+		const FName TempName = MakeUniqueObjectName(
+			Wbp->WidgetTree, UCommonBorder::StaticClass(),
+			FName(*FString::Printf(TEXT("%s_CommonReplacement"), *BorderName.ToString())));
+
+		UCommonBorder* NewBorder = Wbp->WidgetTree->ConstructWidget<UCommonBorder>(UCommonBorder::StaticClass(), TempName);
+		if (!NewBorder)
+			return FMonolithActionResult::Error(TEXT("ConstructWidget<UCommonBorder> returned null"));
+
+		// Splice the new border into the old border's place (parent slot OR tree root).
+		OldBorder->Modify();
+		if (bIsRoot)
+		{
+			OldBorder->Rename(nullptr, GetTransientPackage(), REN_DontCreateRedirectors | REN_DoNotDirty);
+			NewBorder->Rename(*BorderName.ToString(), Wbp->WidgetTree, REN_DontCreateRedirectors | REN_DoNotDirty);
+			Wbp->WidgetTree->RootWidget = NewBorder;
+		}
+		else
+		{
+			Parent->RemoveChild(OldBorder);
+			OldBorder->Rename(nullptr, GetTransientPackage(), REN_DontCreateRedirectors | REN_DoNotDirty);
+			NewBorder->Rename(*BorderName.ToString(), Wbp->WidgetTree, REN_DontCreateRedirectors | REN_DoNotDirty);
+			Parent->AddChild(NewBorder);
+		}
+		MonolithUI::RegisterCreatedWidget(Wbp, NewBorder);
+
+		// Reattach the preserved content child to the new border.
+		if (Content)
+		{
+			NewBorder->SetContent(Content);
+		}
+
+		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Wbp);
+		MonolithUI::ReconcileWidgetVariableGuids(Wbp);
+		FKismetEditorUtilities::CompileBlueprint(Wbp);
+		Wbp->GetOutermost()->MarkPackageDirty();
+
+		TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+		Result->SetStringField(TEXT("wbp_path"), WbpPath);
+		Result->SetStringField(TEXT("widget_name"), BorderName.ToString());
+		Result->SetStringField(TEXT("new_class"), UCommonBorder::StaticClass()->GetName());
+		Result->SetBoolField(TEXT("was_root"), bIsRoot);
+		Result->SetBoolField(TEXT("had_content"), Content != nullptr);
+		if (Content)
+		{
+			Result->SetStringField(TEXT("preserved_content"), Content->GetName());
+		}
+		return FMonolithActionResult::Success(Result);
+	}
+
+	// ----- reparent_widget_root ------------------------------------------------
+	//
+	// Replace a WBP's root widget with a new widget of an arbitrary class, moving
+	// the old root's children onto the new root. The new class is resolved by
+	// STRING (FindFirstObject / LoadClass) so this stays engine-generic — no
+	// hardcoded sibling/marketplace widget types. The new class must derive from
+	// UPanelWidget (it must be able to host children) and be concrete.
+
+	static FMonolithActionResult HandleReparentWidgetRoot(const TSharedPtr<FJsonObject>& Params)
+	{
+		FString NewClassName;
+		if (!Params.IsValid() || !Params->TryGetStringField(TEXT("new_class"), NewClassName) || NewClassName.IsEmpty())
+			return FMonolithActionResult::Error(TEXT("wbp_path and new_class required"));
+		FString WbpPath = MonolithCommonUI::GetWbpPath(Params);
+		if (WbpPath.IsEmpty())
+			return FMonolithActionResult::Error(TEXT("wbp_path (or asset_path) required"));
+
+		UWidgetBlueprint* Wbp = LoadObject<UWidgetBlueprint>(nullptr, *WbpPath);
+		if (!Wbp || !Wbp->WidgetTree)
+			return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load WBP '%s'"), *WbpPath));
+
+		// Resolve the new root class by string — never a hardcoded type.
+		UClass* NewClass = FindFirstObject<UClass>(*NewClassName, EFindFirstObjectOptions::NativeFirst);
+		if (!NewClass && !NewClassName.StartsWith(TEXT("U")))
+			NewClass = FindFirstObject<UClass>(*(TEXT("U") + NewClassName), EFindFirstObjectOptions::NativeFirst);
+		if (!NewClass)
+			NewClass = LoadClass<UObject>(nullptr, *NewClassName);
+		if (!NewClass)
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("new_class '%s' could not be resolved. Use /Script/Module.ClassName, a /Game/... _C path, or a loaded class name."),
+				*NewClassName));
+
+		if (!NewClass->IsChildOf(UPanelWidget::StaticClass()))
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("new_class '%s' is not a UPanelWidget subclass — a root that hosts children must be a panel widget"), *NewClassName));
+		if (NewClass->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated | CLASS_NewerVersionExists))
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("new_class '%s' is abstract/deprecated — cannot construct"), *NewClassName));
+
+		UWidget* OldRoot = Wbp->WidgetTree->RootWidget;
+		if (!OldRoot)
+			return FMonolithActionResult::Error(TEXT("WBP has no root widget to reparent"));
+
+		// Gather the old root's direct children (if it was a panel) to migrate.
+		TArray<UWidget*> Children;
+		if (UPanelWidget* OldPanel = Cast<UPanelWidget>(OldRoot))
+		{
+			OldPanel->Modify();
+			for (int32 i = 0; i < OldPanel->GetChildrenCount(); ++i)
+			{
+				if (UWidget* Child = OldPanel->GetChildAt(i))
+				{
+					Children.Add(Child);
+				}
+			}
+			OldPanel->ClearChildren();
+		}
+
+		const FName OldRootName = OldRoot->GetFName();
+		const FName TempName = MakeUniqueObjectName(
+			Wbp->WidgetTree, NewClass,
+			FName(*FString::Printf(TEXT("%s_ReparentedRoot"), *OldRootName.ToString())));
+
+		UPanelWidget* NewRoot = Wbp->WidgetTree->ConstructWidget<UPanelWidget>(NewClass, TempName);
+		if (!NewRoot)
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("ConstructWidget returned null for new_class '%s'"), *NewClassName));
+
+		OldRoot->Modify();
+		OldRoot->Rename(nullptr, GetTransientPackage(), REN_DontCreateRedirectors | REN_DoNotDirty);
+		NewRoot->Rename(*OldRootName.ToString(), Wbp->WidgetTree, REN_DontCreateRedirectors | REN_DoNotDirty);
+		Wbp->WidgetTree->RootWidget = NewRoot;
+		MonolithUI::RegisterCreatedWidget(Wbp, NewRoot);
+
+		// Migrate the preserved children onto the new root.
+		int32 Migrated = 0;
+		for (UWidget* Child : Children)
+		{
+			if (Child && NewRoot->AddChild(Child))
+			{
+				++Migrated;
+			}
+		}
+
+		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Wbp);
+		MonolithUI::ReconcileWidgetVariableGuids(Wbp);
+		FKismetEditorUtilities::CompileBlueprint(Wbp);
+		Wbp->GetOutermost()->MarkPackageDirty();
+
+		TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+		Result->SetStringField(TEXT("wbp_path"), WbpPath);
+		Result->SetStringField(TEXT("root_widget"), OldRootName.ToString());
+		Result->SetStringField(TEXT("new_class"), NewClass->GetName());
+		Result->SetNumberField(TEXT("children_migrated"), Migrated);
+		Result->SetNumberField(TEXT("children_total"), Children.Num());
+		return FMonolithActionResult::Success(Result);
+	}
+
 	// ----- Registration --------------------------------------------------------
 
 	void Register(FMonolithToolRegistry& Registry)
@@ -1315,6 +1508,37 @@ namespace MonolithCommonUIButton
 				.Required(TEXT("wbp_path"), TEXT("string"), TEXT("Widget Blueprint path"))
 				.Required(TEXT("widget_name"), TEXT("string"), TEXT("Name of the UCommonBoundActionBar"))
 				.Required(TEXT("button_class"), TEXT("string"), TEXT("UCommonButtonBase subclass path (e.g. /Game/UI/BP_MyButton.BP_MyButton_C)"))
+				.Build(),
+			Cat);
+
+		// Phase 3 Item #1 (2026-05-23 UI/BP gap closure): convert_border_to_common.
+		// UBorder -> UCommonBorder (both UContentWidget) preserving variable
+		// identity, parent slot / tree-root position, AND the single content child.
+		Registry.RegisterAction(
+			TEXT("ui"), TEXT("convert_border_to_common"),
+			TEXT("Replace a UBorder in a WBP with a UCommonBorder, preserving the variable identity, parent slot "
+				 "(or tree-root position), and the single content child. UCommonBorder is concrete so no target_class "
+				 "is needed. Chain apply_style_to_widget with a UCommonBorderStyle to finish the rethemed migration."),
+			FMonolithActionHandler::CreateStatic(&HandleConvertBorderToCommon),
+			FParamSchemaBuilder()
+				.Required(TEXT("wbp_path"), TEXT("string"), TEXT("Widget Blueprint path (alias: asset_path)"))
+				.Required(TEXT("widget_name"), TEXT("string"), TEXT("Name of the UBorder to convert"))
+				.Build(),
+			Cat);
+
+		// Phase 3 Item #1 (2026-05-23 UI/BP gap closure): reparent_widget_root.
+		// General-form root swap — new_class resolved by STRING (engine-generic,
+		// no hardcoded sibling/marketplace types). New root must be a concrete
+		// UPanelWidget subclass; the old root's children migrate onto it.
+		Registry.RegisterAction(
+			TEXT("ui"), TEXT("reparent_widget_root"),
+			TEXT("Replace a WBP's root widget with a new UPanelWidget-derived class (resolved by string: "
+				 "/Script/Module.ClassName, a /Game/... _C path, or a loaded class name), migrating the old root's "
+				 "children onto the new root. new_class must be a concrete UPanelWidget subclass."),
+			FMonolithActionHandler::CreateStatic(&HandleReparentWidgetRoot),
+			FParamSchemaBuilder()
+				.Required(TEXT("wbp_path"), TEXT("string"), TEXT("Widget Blueprint path (alias: asset_path)"))
+				.Required(TEXT("new_class"), TEXT("string"), TEXT("New root class (UPanelWidget subclass) resolved by string"))
 				.Build(),
 			Cat);
 	}

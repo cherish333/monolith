@@ -7,8 +7,49 @@
 #include "UObject/EnumProperty.h"
 #include "UObject/PropertyPortFlags.h"
 #include "UObject/SoftObjectPtr.h"
+#include "UObject/Class.h"
 #include "Misc/StringOutputDevice.h"
 #include "Algo/Count.h"
+
+#if WITH_EDITOR
+#include "Kismet2/StructureEditorUtils.h"
+#include "StructUtils/UserDefinedStruct.h"
+#include "UserDefinedStructure/UserDefinedStructEditorData.h"
+#endif
+
+namespace
+{
+	// -----------------------------------------------------------------------
+	// Robust per-index test for the auto-generated _MAX sentinel.
+	//
+	// UEnum::NumEnums() counts ALL stored names, INCLUDING the hidden _MAX
+	// sentinel — but only when one exists (UEnum::ContainsExistingMax()).
+	// Native C++ UENUMs almost always carry a _MAX; UserDefinedEnums usually do
+	// NOT (the asset editor manages the enumerator list directly). The old
+	// blanket `NumEnums() - 1` therefore dropped the LAST REAL enumerator of any
+	// enum without a sentinel — e.g. a 2-value UDS enum yielded only index 0.
+	//
+	// Engine reference for the conditional form:
+	//   PCGAttributeAccessorFactory.cpp:231 —
+	//     ContainsExistingMax() ? NumEnums() - 1 : NumEnums()
+	//
+	// We go one step more defensive: skip a given index ONLY if it is genuinely
+	// the sentinel (name ends with "_MAX" AND the enum reports a max). This never
+	// drops a real trailing value even if the sentinel were not strictly last,
+	// and is a no-op improvement for native enums.
+	bool IsAutoMaxSentinel(const UEnum* Enum, int32 Index)
+	{
+		if (!Enum)
+		{
+			return false;
+		}
+		if (!Enum->ContainsExistingMax())
+		{
+			return false;
+		}
+		return Enum->GetNameStringByIndex(Index).EndsWith(TEXT("_MAX"), ESearchCase::CaseSensitive);
+	}
+}
 
 // ---------------------------------------------------------------------------
 // Lookup helper. Mirrors MonolithBlueprintCDOActions.cpp:385-396 — exact match
@@ -34,6 +75,136 @@ FProperty* FMonolithReflectionWalker::FindPropertyForwarding(UStruct* Struct, co
 		}
 	}
 	return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// Recover the UEnum backing a UserDefinedEnum field inside a UserDefinedStruct.
+//
+// A UDS field of UserDefinedEnum type compiles to a plain numeric FProperty with
+// NO Enum association (UUserDefinedEnum is always ECppForm::Namespaced; the
+// KismetCompiler emits FEnumProperty only for ECppForm::EnumClass). So
+// CastField<FEnumProperty> returns null and GetCPPType() yields "int32". The
+// UEnum survives only in editor-only UDS metadata:
+//   GetGuidFromPropertyName(VarName) -> GetVarDescByGuid -> SubCategoryObject.
+//
+// Native enums (FEnumProperty) and FByteProperty-with-enum are deliberately NOT
+// matched here — they already carry their UEnum and need no recovery.
+// ---------------------------------------------------------------------------
+UEnum* FMonolithReflectionWalker::RecoverUserDefinedEnum(const FProperty* Prop)
+{
+#if WITH_EDITOR
+	if (!Prop)
+	{
+		return nullptr;
+	}
+
+	// Native enums already surface as FEnumProperty (or FByteProperty with Enum) —
+	// they are not the broken case and must keep their existing handling.
+	if (Prop->IsA(FEnumProperty::StaticClass()))
+	{
+		return nullptr;
+	}
+	if (const FByteProperty* ByteProp = CastField<FByteProperty>(Prop))
+	{
+		if (ByteProp->Enum)
+		{
+			return nullptr;
+		}
+	}
+
+	// Only the numeric integer/byte fall-through can hide a UDS enum.
+	if (!Prop->IsA(FNumericProperty::StaticClass()))
+	{
+		return nullptr;
+	}
+
+	const UUserDefinedStruct* UDStruct = Cast<const UUserDefinedStruct>(Prop->GetOwnerStruct());
+	if (!UDStruct)
+	{
+		return nullptr;
+	}
+
+	const FGuid VarGuid = FStructureEditorUtils::GetGuidFromPropertyName(Prop->GetFName());
+	if (!VarGuid.IsValid())
+	{
+		return nullptr;
+	}
+
+	const FStructVariableDescription* VarDesc =
+		FStructureEditorUtils::GetVarDescByGuid(UDStruct, VarGuid);
+	if (!VarDesc)
+	{
+		return nullptr;
+	}
+
+	// SubCategoryObject is a TSoftObjectPtr<UObject>; the enum asset is loaded at
+	// editor time. LoadSynchronous resolves it (no-op if already in memory).
+	return Cast<UEnum>(VarDesc->SubCategoryObject.LoadSynchronous());
+#else
+	return nullptr;
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Map an incoming token (display name / authored name / bare integer) to the
+// integer VALUE of a recovered UDS UserDefinedEnum field. One implementation,
+// shared by every write site so resolution behaviour cannot drift.
+//
+// Bare-integer tokens return false on purpose: callers then fall through to their
+// existing ImportText path, preserving back-compat for numeric authoring.
+// ---------------------------------------------------------------------------
+bool FMonolithReflectionWalker::ResolveUserDefinedEnumToken(const FProperty* Prop, const FString& Token, int64& OutValue)
+{
+#if WITH_EDITOR
+	UEnum* Enum = RecoverUserDefinedEnum(Prop);
+	if (!Enum)
+	{
+		return false;
+	}
+
+	const FString Trimmed = Token.TrimStartAndEnd();
+	if (Trimmed.IsEmpty())
+	{
+		return false;
+	}
+
+	// Bare integer -> defer to the existing numeric ImportText path (back-compat).
+	if (Trimmed.IsNumeric())
+	{
+		return false;
+	}
+
+	// 1) Authored short/full name (GetValueByNameString handles both).
+	const int64 ByName = Enum->GetValueByNameString(Trimmed);
+	if (ByName != INDEX_NONE)
+	{
+		OutValue = ByName;
+		return true;
+	}
+
+	// 2) Friendly display-name scan (UserDefinedEnum display names differ from the
+	//    authored short names, which carry a GUID-ish suffix). Iterate EVERY index
+	//    and skip only the genuine auto-_MAX sentinel, so non-first values
+	//    (e.g. "Heavy") resolve — the old `NumEnums() - 1` dropped the last value
+	//    of any enum without a sentinel.
+	const int32 NumEntries = Enum->NumEnums();
+	for (int32 i = 0; i < NumEntries; ++i)
+	{
+		if (IsAutoMaxSentinel(Enum, i))
+		{
+			continue;
+		}
+		if (Enum->GetDisplayNameTextByIndex(i).ToString().Equals(Trimmed, ESearchCase::IgnoreCase))
+		{
+			OutValue = Enum->GetValueByIndex(i);
+			return true;
+		}
+	}
+
+	return false;
+#else
+	return false;
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -126,6 +297,21 @@ void FMonolithReflectionWalker::WriteScalar(FProperty* Prop, void* ValuePtr, con
 	// Snapshot current value for the report.
 	Prop->ExportText_Direct(OutWrite.CurrentValue, ValuePtr, ValuePtr, Owner, PPF_None);
 	OutWrite.ProposedValue = ValStr;
+
+	// UserDefinedEnum-in-UserDefinedStruct fields compile to a plain numeric
+	// FProperty (no FEnumProperty), so a friendly-name/authored-name token would
+	// be rejected by the numeric ImportText. Resolve it to the enum's integer
+	// value first; bare-integer tokens return false and fall through unchanged.
+	int64 ResolvedEnumValue = 0;
+	if (ResolveUserDefinedEnumToken(Prop, ValStr, ResolvedEnumValue))
+	{
+		if (FNumericProperty* NumProp = CastField<FNumericProperty>(Prop))
+		{
+			NumProp->SetIntPropertyValue(ValuePtr, ResolvedEnumValue);
+			OutWrite.bOk = true;
+			return;
+		}
+	}
 
 	// Per UE 5.7 source_query result: ImportText_Direct(Buffer, Data, OwnerObject, PortFlags, ErrorText)
 	// returns nullptr on failure. Capture errors via FStringOutputDevice.
@@ -614,9 +800,16 @@ FSchemaDescriptor FMonolithReflectionWalker::DescribeStruct(UStruct* TopStruct, 
 		{
 			if (UEnum* Enum = EnumProp->GetEnum())
 			{
-				const int32 N = Enum->NumEnums() - 1; // -1 for _MAX
+				// Native FEnumProperty: real C++ enum (or UENUM) that already
+				// carries its UEnum. Same robust sentinel skip as the UDS path
+				// so a missing/non-terminal _MAX never drops a real value.
+				const int32 N = Enum->NumEnums();
 				for (int32 i = 0; i < N; ++i)
 				{
+					if (IsAutoMaxSentinel(Enum, i))
+					{
+						continue;
+					}
 					Child.EnumValues.Add(Enum->GetNameStringByIndex(i));
 				}
 			}
@@ -682,6 +875,26 @@ FSchemaDescriptor FMonolithReflectionWalker::DescribeStruct(UStruct* TopStruct, 
 		{
 			Child.ImportTextForm = TEXT("/Game/Path/To/Asset.Asset");
 			Child.TypeName = FString::Printf(TEXT("%s*"), ObjProp->PropertyClass ? *ObjProp->PropertyClass->GetName() : TEXT("UObject"));
+		}
+		else if (UEnum* UdsEnum = RecoverUserDefinedEnum(Prop))
+		{
+			// UserDefinedEnum field inside a UserDefinedStruct: compiles to a plain
+			// numeric FProperty, so the FEnumProperty branch above never fires.
+			// Surface the recovered enumerators (friendly display names) and a
+			// human type name instead of the bare "int32" CPPType. Iterate EVERY
+			// index, skipping only the genuine auto-_MAX sentinel — UserDefinedEnums
+			// usually have none, so the old `NumEnums() - 1` dropped the last value.
+			const int32 N = UdsEnum->NumEnums();
+			for (int32 i = 0; i < N; ++i)
+			{
+				if (IsAutoMaxSentinel(UdsEnum, i))
+				{
+					continue;
+				}
+				Child.EnumValues.Add(UdsEnum->GetDisplayNameTextByIndex(i).ToString());
+			}
+			Child.TypeName = UdsEnum->GetName();
+			Child.ImportTextForm = (Child.EnumValues.Num() > 0) ? Child.EnumValues[0] : FString();
 		}
 		else
 		{
