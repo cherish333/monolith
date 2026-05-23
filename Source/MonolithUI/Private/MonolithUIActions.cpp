@@ -316,7 +316,12 @@ FMonolithActionResult FMonolithUIActions::HandleCreateWidgetBlueprint(const TSha
 // --- get_widget_tree ---
 FMonolithActionResult FMonolithUIActions::HandleGetWidgetTree(const TSharedPtr<FJsonObject>& Params)
 {
-    FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+    FString AssetPath;
+    if (!Params.IsValid() || !Params->TryGetStringField(TEXT("asset_path"), AssetPath) || AssetPath.IsEmpty())
+    {
+        return FMonolithActionResult::Error(TEXT("missing required asset_path parameter"));
+    }
+
     FMonolithActionResult Err;
     UWidgetBlueprint* WBP = MonolithUIInternal::LoadWidgetBlueprint(AssetPath, Err);
     if (!WBP) return Err;

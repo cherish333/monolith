@@ -297,6 +297,87 @@ namespace MonolithUIRegistryPhase2
         return FMonolithActionResult::Success(Result);
     }
 
+    // ---- Phase 4 Item #2 — set_widget_is_variable ----------------------------
+    //
+    // First-class flip of UWidget::bIsVariable. When true, the widget is exposed
+    // as a named BindWidget-style variable on the WBP's generated class (visible
+    // to get_variables and accessible from the graph); when false, it becomes an
+    // anonymous tree-only widget. bIsVariable is a public uint8:1 member on the
+    // base UWidget — the engine's own SWidgetDetailsView sets it via direct
+    // member write (UMGEditor SWidgetDetailsView.cpp), which is the path used
+    // here since MonolithUI links UMG. MonolithBlueprint's get_variables reads
+    // the same flag through reflection only because that module has no UMG dep.
+    // After the flip the WBP must be marked structurally modified + compiled so
+    // the generated class regenerates with (or without) the variable binding.
+
+    static FMonolithActionResult HandleSetWidgetIsVariable(const TSharedPtr<FJsonObject>& Params)
+    {
+        if (!Params.IsValid())
+        {
+            return FMonolithActionResult::Error(TEXT("Missing parameters object."), -32602);
+        }
+
+        FString WbpPath;
+        if (!Params->TryGetStringField(TEXT("wbp_path"), WbpPath))
+        {
+            Params->TryGetStringField(TEXT("asset_path"), WbpPath);
+        }
+        if (WbpPath.IsEmpty())
+        {
+            return FMonolithActionResult::Error(TEXT("wbp_path (or asset_path) required"), -32602);
+        }
+
+        FString WidgetName;
+        if (!Params->TryGetStringField(TEXT("widget_name"), WidgetName) || WidgetName.IsEmpty())
+        {
+            return FMonolithActionResult::Error(TEXT("Required parameter 'widget_name' missing or empty."), -32602);
+        }
+
+        bool bIsVariable = false;
+        if (!Params->TryGetBoolField(TEXT("is_variable"), bIsVariable))
+        {
+            return FMonolithActionResult::Error(TEXT("Required parameter 'is_variable' (bool) missing."), -32602);
+        }
+
+        FMonolithActionResult LoadErr;
+        UWidgetBlueprint* WBP = MonolithUI::LoadWidgetBlueprint(WbpPath, LoadErr);
+        if (!WBP) return LoadErr;
+
+        if (!WBP->WidgetTree)
+        {
+            return FMonolithActionResult::Error(
+                TEXT("WidgetTree is null (editor-only data not available)."), -32603);
+        }
+
+        UWidget* Target = WBP->WidgetTree->FindWidget(FName(*WidgetName));
+        if (!Target)
+        {
+            return FMonolithActionResult::Error(
+                FString::Printf(TEXT("Widget '%s' not found in '%s'."), *WidgetName, *WbpPath),
+                -32602);
+        }
+
+        const bool bWasVariable = Target->bIsVariable;
+
+        // Mark the WBP modified BEFORE the write so the transaction captures the
+        // pre-edit state, matching the engine's Modify()-then-mutate ordering.
+        Target->Modify();
+        Target->bIsVariable = bIsVariable;
+
+        // Structural modification + compile so the generated class adds/removes
+        // the variable binding; without this the flip stays inert until the next
+        // editor-driven compile.
+        FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WBP);
+        FKismetEditorUtilities::CompileBlueprint(WBP);
+        WBP->GetOutermost()->MarkPackageDirty();
+
+        TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+        Result->SetStringField(TEXT("widget_name"), WidgetName);
+        Result->SetBoolField(TEXT("is_variable"), bIsVariable);
+        Result->SetBoolField(TEXT("changed"), bWasVariable != bIsVariable);
+        return FMonolithActionResult::Success(Result);
+    }
+
     // ---- Phase 2 Item #11 — list_widget_property_enums -----------------------
     //
     // Walks the curated allowlist for a given widget type (or resolved WBP)
@@ -486,6 +567,23 @@ void FMonolithUIRegistryActions::RegisterActions(FMonolithToolRegistry& Registry
             .Required(TEXT("var_type"), TEXT("string"), TEXT("Type token. See action description for grammar."))
             .Optional(TEXT("default_value"), TEXT("string"), TEXT("Default value as UE text format (engine ImportText grammar)"))
             .Optional(TEXT("var_category"), TEXT("string"), TEXT("Details-panel grouping label"))
+            .Build(),
+        TEXT("Registry")
+    );
+
+    // Phase 4 Item #2 (2026-05-23 UI gap closure): set_widget_is_variable.
+    Registry.RegisterAction(
+        TEXT("ui"), TEXT("set_widget_is_variable"),
+        TEXT("Set a UWidget's bIsVariable flag. When true the widget is exposed as a named "
+             "variable on the WBP's generated class (visible to get_variables, accessible from "
+             "the graph); when false it becomes an anonymous tree-only widget. Marks the WBP "
+             "structurally modified + compiles so the binding materializes. "
+             "Returns {widget_name, is_variable, changed}."),
+        FMonolithActionHandler::CreateStatic(&MonolithUIRegistryPhase2::HandleSetWidgetIsVariable),
+        FParamSchemaBuilder()
+            .Required(TEXT("wbp_path"), TEXT("string"), TEXT("Widget Blueprint path"), {TEXT("asset_path")})
+            .Required(TEXT("widget_name"), TEXT("string"), TEXT("Name of the widget in the WBP's WidgetTree"))
+            .Required(TEXT("is_variable"), TEXT("bool"), TEXT("New bIsVariable value (true = expose as named variable)"))
             .Build(),
         TEXT("Registry")
     );

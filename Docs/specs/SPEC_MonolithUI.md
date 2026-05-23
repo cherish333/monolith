@@ -11,7 +11,7 @@
 **Dependencies:** Core, CoreUObject, Engine, MonolithCore, UnrealEd, UMGEditor, UMG, Slate, SlateCore, Json, JsonUtilities, KismetCompiler, MovieScene, MovieSceneTracks, DeveloperSettings, AssetTools, ImageWrapper, ImageCore, Kismet, MaterialEditor, EditorSubsystem (Public — `UMonolithUIRegistrySubsystem` is exported), CommonUI (optional — `#if WITH_COMMONUI`)
 
 **The optional EffectSurface provider is NOT a build-system dependency** (decoupled 2026-04-27). EffectSurface support is delivered via UClass-by-name reflection through `MonolithUI::GetEffectSurfaceClass()` — see § "Optional Dep Probe API" and § "Error Contract — Optional EffectSurface Provider Absence (-32010)". External providers may depend on MonolithUI for registry/spec structs, but MonolithUI must not depend on them.
-**Total actions in `ui::` namespace:** **129** when `WITH_COMMONUI=1` (71 always-on owned by this module + 57 CommonUI owned by this module conditional on `WITH_COMMONUI` + 1 inline diagnostic `dump_style_cache_stats` registered from `MonolithUIModule.cpp` under the same gate) + **4 GAS UI binding aliases owned by `MonolithGAS`** (also registered into `ui::`, conditional on `WITH_GBA`). Without `WITH_COMMONUI`, the namespace registers **71** actions; without `WITH_GBA` the four bridge aliases are absent. Phase 3 of the 2026-05-16 UI Gap Audit (2026-05-16) landed 4 actions: 3 CommonUI scaffolders (`scaffold_main_menu`, `scaffold_settings_panel_with_tabs`, `scaffold_pause_menu`) + 1 always-on multi-screen menu builder (`build_menu_from_spec`).
+**Total actions in `ui::` namespace:** **130** when `WITH_COMMONUI=1` (72 always-on owned by this module + 57 CommonUI owned by this module conditional on `WITH_COMMONUI` + 1 inline diagnostic `dump_style_cache_stats` registered from `MonolithUIModule.cpp` under the same gate) + **4 GAS UI binding aliases owned by `MonolithGAS`** (also registered into `ui::`, conditional on `WITH_GBA`). Without `WITH_COMMONUI`, the namespace registers **72** actions; without `WITH_GBA` the four bridge aliases are absent. Phase 3 of the 2026-05-16 UI Gap Audit (2026-05-16) landed 4 actions: 3 CommonUI scaffolders (`scaffold_main_menu`, `scaffold_settings_panel_with_tabs`, `scaffold_pause_menu`) + 1 always-on multi-screen menu builder (`build_menu_from_spec`).
 **Settings toggle:** `bEnableUI` (default: True)
 **MCP tool:** `ui_query`
 **Namespace:** `ui`
@@ -33,8 +33,8 @@
 | Hoisted Design Import | 5 | `Actions/Hoisted/{TextureIngest,FontIngest,RoundedCorner,Shadow,Gradient}Actions.cpp` | always — `import_texture_from_bytes`, `import_font_family`, `set_rounded_corners`, `apply_box_shadow`, `create_gradient_mid_from_spec` |
 | Effect Surface Actions | 10 | `Actions/MonolithUIEffectActions.cpp` | always |
 | Spec Builder + Serializer | 4 | `Actions/MonolithUISpecActions.cpp` | always — `build_ui_from_spec`, `dump_ui_spec_schema`, `dump_ui_spec`, plus Phase 3 (2026-05-16) `build_menu_from_spec` |
-| Type Registry diagnostic | 3 | `MonolithUIRegistryActions.cpp` | always — `dump_property_allowlist`, plus Phase 2 (2026-05-16) `add_widget_variable`, `list_widget_property_enums` |
-| **Always-on subtotal** | **71** | | |
+| Type Registry diagnostic | 4 | `MonolithUIRegistryActions.cpp` | always — `dump_property_allowlist`, plus Phase 2 (2026-05-16) `add_widget_variable`, `list_widget_property_enums`, plus Phase 4 (2026-05-23) `set_widget_is_variable` |
+| **Always-on subtotal** | **72** | | |
 | CommonUI Activatables | 8 | `CommonUI/MonolithCommonUIActivatableActions.cpp` | `WITH_COMMONUI` |
 | CommonUI Buttons + Styling | 14 | `CommonUI/MonolithCommonUIButtonActions.cpp` | `WITH_COMMONUI` — Phase 2 (2026-05-16) added `apply_token_binding`, `convert_textblock_to_common`, `set_action_bar_button_class`; Phase 3 (2026-05-23) added `convert_border_to_common`, `reparent_widget_root` |
 | CommonUI Input | 7 | `CommonUI/MonolithCommonUIInputActions.cpp` | `WITH_COMMONUI` |
@@ -47,10 +47,10 @@
 | CommonUI Scaffolders | 3 | `CommonUI/MonolithCommonUITemplateActions.cpp` | `WITH_COMMONUI` — Phase 3 (2026-05-16) `scaffold_main_menu`, `scaffold_settings_panel_with_tabs`, `scaffold_pause_menu` |
 | Style Service Diagnostics | 1 | inline lambda in `MonolithUIModule.cpp` | `WITH_COMMONUI` — `dump_style_cache_stats` |
 | **CommonUI subtotal** | **62** | | conditional |
-| **MonolithUI total** | **133** | | full configuration |
+| **MonolithUI total** | **134** | | full configuration |
 | GAS UI binding aliases | 4 | `MonolithGAS/Private/MonolithGASUIBindingActions.cpp` | `WITH_GBA` — registered cross-namespace into `ui::` |
 
-Counts re-verified against `RegisterAction(TEXT("ui"), ...)` call sites on 2026-04-26 (Phase L). Phase 2 of the 2026-05-16 UI Gap Audit landed 8 additional actions (4 always-on + 4 CommonUI-gated) bringing the totals to 70 / 55 / 125. Phase 3 of the 2026-05-16 UI Gap Audit landed 4 more (1 always-on `build_menu_from_spec` + 3 CommonUI-gated scaffolders) bringing the totals to 71 / 58 / 129. Phase 3 of the 2026-05-22 UI Blueprint Gap Audit landed 4 more CommonUI-gated actions (`set_widget_navigation_bulk`, `dump_widget_navigation`, `convert_border_to_common`, `reparent_widget_root`) bringing the totals to 71 / 62 / 133. Production registration sites only — Tests/ excluded.
+Counts re-verified against `RegisterAction(TEXT("ui"), ...)` call sites on 2026-04-26 (Phase L). Phase 2 of the 2026-05-16 UI Gap Audit landed 8 additional actions (4 always-on + 4 CommonUI-gated) bringing the totals to 70 / 55 / 125. Phase 3 of the 2026-05-16 UI Gap Audit landed 4 more (1 always-on `build_menu_from_spec` + 3 CommonUI-gated scaffolders) bringing the totals to 71 / 58 / 129. Phase 3 of the 2026-05-22 UI Blueprint Gap Audit landed 4 more CommonUI-gated actions (`set_widget_navigation_bulk`, `dump_widget_navigation`, `convert_border_to_common`, `reparent_widget_root`) bringing the totals to 71 / 62 / 133. Phase 4 of the 2026-05-22 UI Blueprint Gap Audit (2026-05-23) landed 1 always-on action (`set_widget_is_variable`) bringing the totals to 72 / 62 / 134 (CommonUI subtotal unchanged). Production registration sites only — Tests/ excluded.
 
 ### Classes
 
@@ -85,7 +85,7 @@ Counts re-verified against `RegisterAction(TEXT("ui"), ...)` call sites on 2026-
 | Action | Params | Description |
 |--------|--------|-------------|
 | `create_widget_blueprint` | `save_path`, `parent_class` | Create a new Widget Blueprint asset |
-| `get_widget_tree` | `asset_path` | Get the full widget hierarchy tree |
+| `get_widget_tree` | `asset_path` | Get the full widget hierarchy tree. An empty/missing `asset_path` now returns a clear `missing required asset_path parameter` error instead of a confusing downstream "not found" (2026-05-23). |
 | `add_widget` | `asset_path`, `widget_class`, `parent_slot` | Add a widget to the widget tree |
 | `remove_widget` | `asset_path`, `widget_name` | Remove a widget from the widget tree |
 | `set_widget_property` | `asset_path`, `widget_name`, `property_name`, `value` (alias: `property_value`) | Set a property on a widget via reflection. Allowlist-gated unless `raw_mode=true`. `value` and `property_value` are accepted as aliases since the 2026-05-16 Bug #6 fix. |
@@ -720,13 +720,14 @@ Mappings are explicit, NOT auto-generated from `UPROPERTY` reflection. Auto-walk
 
 Slot.* paths (`Slot.Padding`, `Slot.HAlign`, `Slot.VAlign`, `Slot.Anchors`, `Slot.Position`, `Slot.Size`, `Slot.SizeRule`, `Slot.FillWeight`, `Slot.Alignment`, `Slot.AutoSize`, `Slot.ZOrder`) are attached to the COMMON child widgets (TextBlock, Image, Button, Border, SizeBox, ProgressBar, the box panels, ScrollBox, RoundedBorder). The reflection helper performs per-parent-slot validation at write time — the allowlist is the generous outer envelope.
 
-### Diagnostic actions (3)
+### Diagnostic actions (4)
 
 | Action | Params | Description |
 |--------|--------|-------------|
 | `dump_property_allowlist` | `widget_type` (string) | Returns `{type, registered, container_kind, max_children, widget_class, allowed_paths:[...], allowed_path_count}`. Unknown types return `registered:false` with a hint that the type isn't in the registry. |
 | `add_widget_variable` | `wbp_path`, `var_name`, `var_type`, `default_value?`, `var_category?` | Wraps `FBlueprintEditorUtils::AddMemberVariable` to stamp a user-variable onto a WBP. `var_type` accepts the MCP-friendly token grammar (`bool`/`int`/`int64`/`float`/`double`/`string`/`name`/`text`/`byte`/`object:Class`/`class:Class`/`struct:Name`/`enum:Name`/`softobject:Class`/`softclass:Class`/`exec`/`wildcard`, with container prefixes `array:`/`set:`/`map:Key:Value`). AddMemberVariable defaults flags `CPF_Edit | CPF_BlueprintVisible | CPF_DisableEditOnInstance` — matches the editor's "add variable" affordance. Phase 2 Item #8 (2026-05-16 UI Gap Audit). |
 | `list_widget_property_enums` | `wbp_path?`, `widget_class?`, `property_name?` | Walks a widget class (or WBP's generated class) and returns every enum-typed property with its enumerator names. Surfaces both `FEnumProperty` (modern `enum class`) AND `FByteProperty` with non-null `Enum` (legacy `TEnumAsByte<EFoo>`). Use to discover the legal value set for `set_widget_property` writes against enum fields. At least one of `wbp_path`/`widget_class` is required. Phase 2 Item #11 (2026-05-16 UI Gap Audit). |
+| `set_widget_is_variable` | `wbp_path` (alias `asset_path`), `widget_name`, `is_variable` (bool) | First-class flip of `UWidget::bIsVariable` — marks or unmarks a tree widget as an exposed Blueprint variable. Calls `Modify()` + a direct member write, then recompiles. Returns `{widget_name, is_variable, changed}` (`changed=false` when the flag already matched). Always-on (not `WITH_COMMONUI`-gated). Phase 4 (2026-05-23 UI Blueprint Gap Audit). |
 
 ### Hot-reload behaviour
 

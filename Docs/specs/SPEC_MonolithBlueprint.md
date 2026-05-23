@@ -62,7 +62,7 @@
 **Graph Management (10)**
 | Action | Params | Description |
 |--------|--------|-------------|
-| `add_function` | `asset_path`, `function_name` | Add a new function graph |
+| `add_function` | `asset_path`, `name` (alias `function_name`) | Add a new function graph. The `name` param accepts `function_name` as an alias (2026-05-23) — both forms work. |
 | `override_parent_function` | `asset_path`, `parent_function_name` | Author a Blueprint override of an overridable parent function (`BlueprintImplementableEvent` / `BlueprintNativeEvent`), including those that RETURN a value (e.g. `UCommonActivatableWidget::BP_GetDesiredFocusTarget` → `UWidget*`) — which `add_function` cannot do and the event-node form has no ReturnValue pin for. Declaring class resolved generically by name. Returns `graph_name`, `entry_node_id`, `return_pin_id`, `return_pin_name`, `override_class`, `has_return_value` |
 | `remove_function` | `asset_path`, `function_name` | Remove a function graph |
 | `rename_function` | `asset_path`, `old_name`, `new_name` | Rename a function graph |
@@ -76,7 +76,7 @@
 **Node & Pin Operations (7)**
 | Action | Params | Description |
 |--------|--------|-------------|
-| `add_node` | `asset_path`, `graph_name`, `node_class`, `position` | Add a node to a graph. Accepts common aliases (e.g. `CallFunction`, `VariableGet`, `ComponentBoundEvent`, `AddDelegate`, `RemoveDelegate`, `ClearDelegate`, `CallDelegate`) and tries `K2_` prefix fallback for function calls |
+| `add_node` | `asset_path`, `graph_name`, `node_class`, `position` (alias `pos`), `target_class?` (aliases `function_class`, `member_class`) | Add a node to a graph. Accepts common aliases (e.g. `CallFunction`, `VariableGet`, `ComponentBoundEvent`, `AddDelegate`, `RemoveDelegate`, `ClearDelegate`, `CallDelegate`) and tries `K2_` prefix fallback for function calls. `target_class` is the class to search for the CallFunction/delegate; it accepts `function_class` and `member_class` aliases (2026-05-23). The `position` param accepts a `pos` alias (2026-05-23, silences the prior `pos` unknown-param warning). |
 | `remove_node` | `asset_path`, `graph_name`, `node_id` | Remove a node by ID |
 | `connect_pins` | `asset_path`, `graph_name`, `source_node`, `source_pin`, `target_node`, `target_pin` | Connect two pins |
 | `disconnect_pins` | `asset_path`, `graph_name`, `source_node`, `source_pin`, `target_node`, `target_pin` | Disconnect two pins |

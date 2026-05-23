@@ -19,7 +19,7 @@ void FMonolithBlueprintGraphActions::RegisterActions(FMonolithToolRegistry& Regi
 		FMonolithActionHandler::CreateStatic(&HandleAddFunction),
 		FParamSchemaBuilder()
 			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Blueprint asset path"))
-			.Required(TEXT("name"), TEXT("string"), TEXT("Function name"))
+			.Required(TEXT("name"), TEXT("string"), TEXT("Function name"), {TEXT("function_name")})
 			.Optional(TEXT("is_pure"), TEXT("bool"), TEXT("Mark as pure (no exec pins)"), TEXT("false"))
 			.Optional(TEXT("is_const"), TEXT("bool"), TEXT("Mark as const"), TEXT("false"))
 			.Optional(TEXT("is_static"), TEXT("bool"), TEXT("Mark as static"), TEXT("false"))
