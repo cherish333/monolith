@@ -14,11 +14,13 @@
 
 | Class | Responsibility |
 |-------|---------------|
-| `FMonolithBlueprintModule` | Registers 92 blueprint actions |
+| `FMonolithBlueprintModule` | Registers 109 blueprint actions |
 | `FMonolithBlueprintActions` | Static handlers. Uses `FMonolithAssetUtils::LoadAssetByPath<UBlueprint>` |
 | `MonolithBlueprintInternal` | Helpers: AddGraphArray, FindGraphByName, PinTypeToString, SerializePin/Node, TraceExecFlow, FindEntryNode |
 
-### Actions (92 — namespace: "blueprint")
+### Actions (109 — namespace: "blueprint")
+
+> **Per-module baseline note (2026-05-23):** this file's baseline was 92 (it carries the 2026-05-22 `add_property_access` +1 but predates the Phase 2 `override_parent_function` / `save_dirty_assets` +2 that SPEC_CORE §12 already folded into its authoritative 94). Part B adds +17 (dataset ergonomics, below), so this file's count moves 92 → 109 while §12's authoritative `blueprint` row moves 94 → 111. The residual 2-action gap (this file's 109 vs §12's 111) is the pre-existing Phase 2 drift §12's reconciliation notes already track — deferred to the next holistic count-audit, not patched here.
 
 **Read Actions (14)**
 | Action | Params | Description |
@@ -118,6 +120,43 @@
 **Existing CDO actions also gain `dry_run` + `strict` optional params:**
 - `set_cdo_property` — Phase 1 adds `dry_run`?, `strict`? optional params. When `dry_run=true`, validates the proposed write via the reflection walker and returns the per-field report without entering the engine edit cradle. Same `strict` semantics as the plural action.
 
+**Datasets (DataTable / CurveTable / StringTable) (2026-05-23, Part B — 17)**
+
+> **DataAssets/PrimaryDataAssets need NO dedicated action — they round-trip via `bulk_fill_query("apply", target_namespace="blueprint", target=<asset_path>, tree={...})` + `describe_query("schema", ...)`** (or the convenience `set_cdo_properties` / `describe_cdo_schema` aliases above). Their fields ARE asset UPROPERTYs the reflection walker can address. The dedicated dataset actions below exist precisely BECAUSE DataTable rows, CurveTable keys, and StringTable entries are **NOT** asset UPROPERTYs — they live in `TMap<FName,uint8*>` / `TMap<FName,FRealCurve*>` / an `FStringTable` key→source map whose schema is a *different* `UScriptStruct` (`RowStruct`) or a bespoke curve/string container, so the framework walker cannot reach them. The actions still REUSE the framework engine (`FMonolithReflectionWalker::DescribeStruct` for inline row schema; the per-field ImportText / `FDryRunReport` reporting shape for writes) — they bridge framework primitives to the non-UPROPERTY row/key/entry surface. See plan [`Docs/plans/2026-05-22-monolith-ui-bp-gap-actions.md`](../plans/2026-05-22-monolith-ui-bp-gap-actions.md) §B.5 for the architecture rationale. `seed_data_asset` is the one exception — it is sugar for create-DataAsset + bulk_fill in one call, included for atomic scaffolding.
+
+*DataTable (8)*
+| Action | Params | Description |
+|--------|--------|-------------|
+| `read_data_table` | `asset_path`, `include_schema`? (default true), `row_name`? | Read the whole table (or one row) WITH inline row schema. Returns `asset_path`, `row_struct`, `row_struct_path`, `total_rows`, `schema` (per-field `FSchemaDescriptor` from `DescribeStruct(GetRowStruct())` — `name`, `type_name`, `import_text_form`, `enum_values`, `range_min`/`range_max`, nested children; present when `include_schema=true`), and `rows` (`[{row_name, values:{field: stringified-value}}]`). Schema-inline-with-data is the keystone: the LLM never guesses field names or types. Supersedes the older `get_data_table_rows`. |
+| `describe_data_table_schema` | `asset_path` | Schema only, no rows — for planning edits on a huge table without pulling every row. Returns `row_struct`, `row_struct_path`, `schema` (same per-field `FSchemaDescriptor` array as `read_data_table`). |
+| `set_data_table_rows` | `asset_path`, `rows` (`[{row_name, values:{field:value}, mode?:"upsert"\|"add"\|"update"}]`), `dry_run`? (default false), `strict`? (default false), `save`? (default false) | Bulk add/update rows in one transaction. Mirrors `bulk_fill_query("apply")` ergonomics: per-field writes go through the same ImportText path as `add_data_table_row` and report `current`/`proposed`/`ok`/`reason`. `dry_run` validates without mutating; `strict` promotes coercion/unknown-field/enum-miss to hard errors. Default `mode` is `upsert` (closes the can't-edit-existing-row gap). Returns an `FDryRunReport`-shaped payload (`rows[]`, `errors`, `would_apply`, `saved`). Calls `FDataTableEditorUtils::BroadcastPostChange` once so open editors refresh. |
+| `remove_data_table_row` | `asset_path`, `row_name`, `save`? | Remove a row. Thin wrapper over `FDataTableEditorUtils::RemoveRow` (which broadcasts internally). Returns `{removed}`. |
+| `rename_data_table_row` | `asset_path`, `old_name`, `new_name`, `save`? | Rename a row. Wrapper over `FDataTableEditorUtils::RenameRow`. Returns `{renamed}`. |
+| `duplicate_data_table_row` | `asset_path`, `source_row`, `new_name`, `save`? | Duplicate a row with all values. Wrapper over `FDataTableEditorUtils::DuplicateRow`. Returns `{row_name}`. |
+| `export_data_table` | `asset_path`, `format`? (`"json"`\|`"csv"`, default `"json"`), `use_json_objects`? (default true), `simple_text`? (default false) | Read the WHOLE table as one text blob (JSON or CSV) for token-efficient in-context editing. Calls `UDataTable::GetTableAsJSON`/`GetTableAsCSV` (`#if WITH_EDITOR`). `use_json_objects` sets `EDataTableExportFlags::UseJsonObjectsForStructs` so nested structs export as clean JSON objects (not GUID-suffixed ExportText blobs) — default-on to match the engine's own export. Returns `row_struct`, `row_struct_path`, `total_rows`, `format`, `text`. |
+| `import_data_table` | `asset_path`, `format`? (`"json"`\|`"csv"`, default `"json"`), `text`, `mode` (`"replace"` — must be passed explicitly), `save`? (default false) | Re-import a whole-table text blob. Calls `UDataTable::CreateTableFromJSONString`/`CreateTableFromCSVString`. **REPLACES the entire row set** (import, not merge — unlisted rows are deleted by design); `mode` accepts only `"replace"` and must be explicit. Requires `GetRowStruct() != nullptr` (errors otherwise). Broadcasts `PostChange` after import. Returns `{rows_written, problems:[string], replaced, saved}`. |
+
+*DataAsset (1)*
+| Action | Params | Description |
+|--------|--------|-------------|
+| `seed_data_asset` | `save_path`, `class_name`, `tree` (nested JSON), `dry_run`?, `strict`?, `skip_save`? | Create a DataAsset AND populate it from a nested `tree` in one atomic call — sugar over `create_data_asset` + `bulk_fill apply`. Create body reuses `HandleCreateDataAsset`; fill reuses `FMonolithReflectionWalker::WriteTree`. Returns `asset_path`, `actual_class`, `field_writes[]`, `errors`, `saved`. (For populating an *existing* DataAsset, use `bulk_fill_query("apply")` / `set_cdo_properties` instead — this action is for the create-then-populate scaffold case.) |
+
+*CurveTable (5) — first CurveTable surface in Monolith*
+| Action | Params | Description |
+|--------|--------|-------------|
+| `read_curve_table` | `asset_path`, `row_name`? | Read all curves (or one). Iterates `UCurveTable::GetRowMap()`, branching on `GetCurveTableMode()`. Returns `mode` (`"rich"`\|`"simple"`\|`"empty"`), `total_rows`, `rows` (`[{row_name, keys:[{time, value, interp_mode?, arrive_tangent?, leave_tangent?}]}]` — interp/tangent only for rich curves). |
+| `set_curve_table_keys` | `asset_path`, `row_name`, `keys` (`[{time, value}]`), `mode`? (`"replace"`\|`"merge"`, default `"replace"`), `interp_mode`? (`"linear"`\|`"constant"`\|`"cubic"`, default `"linear"`), `save`? | Write keys into a curve row, creating it if absent. `mode:"replace"` clears existing keys first; `merge` adds without clearing. Resolves/creates the curve via `FindRichCurve`/`AddRichCurve` (or simple equivalent) then `FRichCurve::AddKey` per key. **Mode lock:** a fresh CurveTable is `ECurveTableMode::Empty`; the FIRST add (cubic → rich, else simple) permanently locks rich-vs-simple — a later mode-mismatched write is rejected with a clear error. Returns `{row_name, keys_written, created_row, saved}`. |
+| `add_curve_table_row` | `asset_path`, `row_name`, `save`? | Add an empty curve row (`AddRichCurve`/`AddSimpleCurve` — locks mode if the table was empty). Returns `{row_name, created}`. |
+| `remove_curve_table_row` | `asset_path`, `row_name`, `save`? | Remove a curve row via `UCurveTable::RemoveRow`. Returns `{removed}`. |
+| `rename_curve_table_row` | `asset_path`, `old_name`, `new_name`, `save`? | Rename a curve row via `UCurveTable::RenameRow`. Returns `{renamed}`. |
+
+*StringTable (3)*
+| Action | Params | Description |
+|--------|--------|-------------|
+| `read_string_table` | `asset_path` | Read all entries. Resolves `UStringTable`, enumerates via `FStringTable::EnumerateKeysAndSourceStrings`, reads `GetNamespace()`. Returns `namespace`, `total_entries`, `entries` (`[{key, source_string, meta?:{id:value}}]`). |
+| `set_string_table_entries` | `asset_path`, `entries` (`[{key, source_string}]`), `mode`? (`"upsert"`\|`"replace"`, default `"upsert"`), `namespace`?, `save`? | Write entries via `UStringTable::GetMutableStringTable()` → `FStringTable::SetSourceString` (natively upsert — replaces existing). `mode:"replace"` first calls `ClearSourceStrings()`. `namespace` → `SetNamespace`. After mutation marks the package dirty + `Modify()` (there is NO editor-refresh broadcast for StringTables — an open tab may need reselect). Returns `{entries_written, removed, namespace, saved}`. |
+| `remove_string_table_entry` | `asset_path`, `key`, `save`? | Remove one entry via `FStringTable::RemoveSourceString`. Returns `{removed}`. |
+
 ### Bulk Fill & Describe Surface (2026-05-11)
 
 `MonolithBlueprintBulkFillAdapter` registers under `FMonolithBulkFillRegistry` for the `blueprint` namespace, exposed via the framework-level `bulk_fill_query("apply", ...)` and `describe_query("schema", ...)` dispatchers. Phase 1 of the MCP ergonomics rollout (design spec `Docs/plans/2026-05-11-monolith-mcp-ergonomics-design.md`, implementation plan `Docs/plans/2026-05-11-monolith-mcp-ergonomics.md`).
@@ -129,6 +168,8 @@
 | `fill_kind` | Target shape | Walks |
 |---|---|---|
 | `CDOProperties` | Blueprint asset OR generic UObject (DataAsset, DataTable, GameplayEffect, AbilitySet, InputAction) | nested JSON object keyed by UPROPERTY names against the asset's CDO; dual-path asset load tries `LoadAssetByPath<UBlueprint>` then falls back to generic UObject `StaticLoadObject` |
+
+> **DataTable container-vs-rows boundary (2026-05-23):** running `bulk_fill_query`/`describe_query` (or `set_cdo_properties`/`describe_cdo_schema`) against a `UDataTable` describes/writes the **container's** UPROPERTYs (e.g. `RowStruct`), NOT the row data — the rows are not addressable by the reflection walker. Use the dedicated `read_data_table` / `describe_data_table_schema` / `set_data_table_rows` family (above) for row content. The same applies to `UCurveTable` and `UStringTable`: their keys/entries are NOT walker-addressable — use the bespoke CurveTable / StringTable dataset actions. DataAssets ARE walker-addressable, so `bulk_fill`/`describe` is the right tool for them.
 
 **Adapter convenience surface.** The two `blueprint::set_cdo_properties` / `blueprint::describe_cdo_schema` actions documented above are aliases routed through this same adapter — they exist for symmetry with the read-side `get_cdo_properties` and skip the `target_namespace="blueprint"` parameter. Authoring `blueprint::set_cdo_properties` and `bulk_fill_query("apply", target_namespace="blueprint", ...)` are semantically identical; the framework call is preferred when wiring multi-namespace tooling that already routes through the central dispatchers.
 
