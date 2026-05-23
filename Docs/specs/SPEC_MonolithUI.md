@@ -36,9 +36,9 @@
 | Type Registry diagnostic | 3 | `MonolithUIRegistryActions.cpp` | always — `dump_property_allowlist`, plus Phase 2 (2026-05-16) `add_widget_variable`, `list_widget_property_enums` |
 | **Always-on subtotal** | **71** | | |
 | CommonUI Activatables | 8 | `CommonUI/MonolithCommonUIActivatableActions.cpp` | `WITH_COMMONUI` |
-| CommonUI Buttons + Styling | 12 | `CommonUI/MonolithCommonUIButtonActions.cpp` | `WITH_COMMONUI` — Phase 2 (2026-05-16) added `apply_token_binding`, `convert_textblock_to_common`, `set_action_bar_button_class` |
+| CommonUI Buttons + Styling | 14 | `CommonUI/MonolithCommonUIButtonActions.cpp` | `WITH_COMMONUI` — Phase 2 (2026-05-16) added `apply_token_binding`, `convert_textblock_to_common`, `set_action_bar_button_class`; Phase 3 (2026-05-23) added `convert_border_to_common`, `reparent_widget_root` |
 | CommonUI Input | 7 | `CommonUI/MonolithCommonUIInputActions.cpp` | `WITH_COMMONUI` |
-| CommonUI Navigation/Focus | 6 | `CommonUI/MonolithCommonUINavigationActions.cpp` | `WITH_COMMONUI` — Phase 2 (2026-05-16) added `audit_focus_chain` |
+| CommonUI Navigation/Focus | 8 | `CommonUI/MonolithCommonUINavigationActions.cpp` | `WITH_COMMONUI` — Phase 2 (2026-05-16) added `audit_focus_chain`; Phase 3 (2026-05-23) added `set_widget_navigation_bulk`, `dump_widget_navigation` |
 | CommonUI Lists/Tabs/Groups | 7 | `CommonUI/MonolithCommonUIListActions.cpp` | `WITH_COMMONUI` |
 | CommonUI Content widgets | 4 | `CommonUI/MonolithCommonUIContentActions.cpp` | `WITH_COMMONUI` |
 | CommonUI Dialogs | 2 | `CommonUI/MonolithCommonUIDialogActions.cpp` | `WITH_COMMONUI` |
@@ -46,11 +46,11 @@
 | CommonUI Accessibility | 4 | `CommonUI/MonolithCommonUIAccessibilityActions.cpp` | `WITH_COMMONUI` |
 | CommonUI Scaffolders | 3 | `CommonUI/MonolithCommonUITemplateActions.cpp` | `WITH_COMMONUI` — Phase 3 (2026-05-16) `scaffold_main_menu`, `scaffold_settings_panel_with_tabs`, `scaffold_pause_menu` |
 | Style Service Diagnostics | 1 | inline lambda in `MonolithUIModule.cpp` | `WITH_COMMONUI` — `dump_style_cache_stats` |
-| **CommonUI subtotal** | **58** | | conditional |
-| **MonolithUI total** | **129** | | full configuration |
+| **CommonUI subtotal** | **62** | | conditional |
+| **MonolithUI total** | **133** | | full configuration |
 | GAS UI binding aliases | 4 | `MonolithGAS/Private/MonolithGASUIBindingActions.cpp` | `WITH_GBA` — registered cross-namespace into `ui::` |
 
-Counts re-verified against `RegisterAction(TEXT("ui"), ...)` call sites on 2026-04-26 (Phase L). Phase 2 of the 2026-05-16 UI Gap Audit landed 8 additional actions (4 always-on + 4 CommonUI-gated) bringing the totals to 70 / 55 / 125. Phase 3 of the 2026-05-16 UI Gap Audit landed 4 more (1 always-on `build_menu_from_spec` + 3 CommonUI-gated scaffolders) bringing the totals to 71 / 58 / 129. Production registration sites only — Tests/ excluded.
+Counts re-verified against `RegisterAction(TEXT("ui"), ...)` call sites on 2026-04-26 (Phase L). Phase 2 of the 2026-05-16 UI Gap Audit landed 8 additional actions (4 always-on + 4 CommonUI-gated) bringing the totals to 70 / 55 / 125. Phase 3 of the 2026-05-16 UI Gap Audit landed 4 more (1 always-on `build_menu_from_spec` + 3 CommonUI-gated scaffolders) bringing the totals to 71 / 58 / 129. Phase 3 of the 2026-05-22 UI Blueprint Gap Audit landed 4 more CommonUI-gated actions (`set_widget_navigation_bulk`, `dump_widget_navigation`, `convert_border_to_common`, `reparent_widget_root`) bringing the totals to 71 / 62 / 133. Production registration sites only — Tests/ excluded.
 
 ### Classes
 
@@ -160,7 +160,7 @@ Counts re-verified against `RegisterAction(TEXT("ui"), ...)` call sites on 2026-
 
 ---
 
-## Actions — CommonUI (57 — namespace: "ui", conditional on `WITH_COMMONUI`)
+## Actions — CommonUI (62 — namespace: "ui", conditional on `WITH_COMMONUI`)
 
 Shipped M0.5, v0.14.0 (2026-04-19). Tested M0.5.1 (2026-04-25): 50/50 editor-time actions PASS, 8 bugs found and fixed. 11 actions marked [RUNTIME] need PIE testing.
 
@@ -191,7 +191,7 @@ Class-as-data: style creators (`create_common_button_style`, `create_common_text
 | `get_activatable_stack_state` | `stack_widget` | [RUNTIME] Query the stack: active widget, depth, transition state |
 | `set_activatable_transition` | `asset_path`, `transition_type`, `duration` | Configure push/pop transition animations |
 
-### Category B: Buttons + Styling (12 actions)
+### Category B: Buttons + Styling (14 actions)
 
 > **Allowlist note (2026-05-16):** `CommonButtonBase` token now has `TriggeringInputAction` (FDataTableRowHandle) and `bDisplayInActionBar` (bool) on its curated allowlist. `set_widget_property` writes these without requiring `raw_mode=true` (Bug #2 fix).
 
@@ -209,6 +209,8 @@ Class-as-data: style creators (`create_common_button_style`, `create_common_text
 | `apply_token_binding` | `wbp_path`, `widget_name`, `target_property`, `token_key` | **MVP-STUB.** Bind a widget property to a UI design token sourced from `TokenforgeRuntime`. Returns `-32011 ErrTokenforgeRuntimeUnavailable` when the plugin is absent (see § Error Contract — Optional Tokenforge Provider Absence (-32011)). Successful response carries `status:"stub"` — param validation + Tokenforge probe are FULL, BP-graph node-write into NativeConstruct is deferred to a follow-up. Phase 2 Item #10 (2026-05-16 UI Gap Audit). |
 | `convert_textblock_to_common` | `wbp_path`, `widget_name` | Replace a `UTextBlock` with a `UCommonTextBlock` while preserving the variable identity (FName + `bIsVariable`), parent slot, and authored text/font/colour/shadow state. Style left at engine default — chain `apply_style_to_widget` with a `UCommonTextStyle` reference to complete the rethemed migration. Mirrors the reconciliation pattern from `convert_button_to_common` (variable identity preserved Y). Phase 2 Item #12 (2026-05-16 UI Gap Audit). |
 | `set_action_bar_button_class` | `wbp_path`, `widget_name`, `button_class` | Set `UCommonBoundActionBar::ActionButtonClass` on an existing bar widget. Writes through BOTH the authoring tree (`Wbp->WidgetTree`) AND the generated class's archetype tree (`UWidgetBlueprintGeneratedClass::GetWidgetTreeArchetype()`) so the value survives subsequent `compile_blueprint` passes. `button_class` must resolve to a `UCommonButtonBase` subclass. Mirrors the FClassProperty reflection pattern from Phase 1 Bug #4 (`MonolithCommonUIInputActions.cpp:265-282`). Phase 2 Item #13 (2026-05-16 UI Gap Audit). |
+| `convert_border_to_common` | `wbp_path` (alias `asset_path`), `widget_name` | Replace a `UBorder` with a `UCommonBorder`, preserving the variable identity (FName + `bIsVariable`), parent slot (or tree-root position), and the single content child. `UCommonBorder` is concrete, so no `target_class` is needed. Style left at engine default — chain `apply_style_to_widget` with a `UCommonBorderStyle` to finish the rethemed migration. Mirrors the reconciliation pattern from `convert_button_to_common` / `convert_textblock_to_common`. Phase 3 (2026-05-23 UI Blueprint Gap Audit). |
+| `reparent_widget_root` | `wbp_path` (alias `asset_path`), `new_class` | Replace a WBP's root widget with a new `UPanelWidget`-derived class resolved BY STRING (`/Script/Module.ClassName`, a `/Game/..._C` path, or a loaded class name), migrating the old root's children onto the new root. `new_class` must resolve to a concrete `UPanelWidget` subclass. Phase 3 (2026-05-23 UI Blueprint Gap Audit). |
 
 ### Category C: Input/Actions/Glyphs (7 actions)
 
@@ -222,11 +224,13 @@ Class-as-data: style creators (`create_common_button_style`, `create_common_text
 | `set_input_type_override` | `input_type` | [RUNTIME] Force a specific input type for glyph display |
 | `list_platform_input_tables` | none | List all registered platform input DataTables |
 
-### Category D: Navigation/Focus (6 actions)
+### Category D: Navigation/Focus (8 actions)
 
 | Action | Params | Description |
 |--------|--------|-------------|
 | `set_widget_navigation` | `asset_path`, `widget_name`, `nav_rules` | Configure explicit navigation rules (up/down/left/right targets) |
+| `set_widget_navigation_bulk` | `wbp_path` (alias `asset_path`), `entries[]`, `save?` | Apply N navigation-rule writes to a WBP then compile ONCE (vs `set_widget_navigation`'s per-call compile). Each `entries[]` item is `{widget_name, direction(Up\|Down\|Left\|Right\|Next\|Previous), rule(Escape\|Stop\|Wrap\|Explicit\|Custom\|CustomBoundary), explicit_target?}`. Per-entry failures are non-fatal. `save` defaults `false`. Returns `{written, failed[], compiled_once}`. Phase 3 (2026-05-23 UI Blueprint Gap Audit). |
+| `dump_widget_navigation` | `wbp_path` (alias `asset_path`), `widget_name?` | Read-only dump of `UWidget::Navigation` per-direction rules INCLUDING Wrap/Stop/Escape — which `audit_focus_chain` cannot see (it graphs Explicit edges only). Optional `widget_name` filters to one widget. Returns `{navigation:[{widget_name, direction, rule, target?}], count}`. Does not modify or compile. Phase 3 (2026-05-23 UI Blueprint Gap Audit). |
 | `set_initial_focus_target` | `asset_path`, `target_name` | Set the initial focus target for an activatable widget |
 | `audit_focus_chain` | `wbp_path` | Static audit of a WBP's `UWidget::Navigation` graph. Reports `unreachable[]`, `dead_ends[]`, `cycles[]`, `dangling_explicit[]`. Read-only — does not modify the WBP. Reachability BFS runs only when the WBP's CDO exposes `DesiredFocusTargetName` (or `InitialFocusTargetName`) as an FName UPROPERTY; otherwise the audit still reports cycles + dangling-explicit findings (the load-bearing defects) and skips the reachability check. Phase 2 Item #9 (2026-05-16 UI Gap Audit). |
 | `force_focus` | `widget_name` | [RUNTIME] Force focus to a specific widget |

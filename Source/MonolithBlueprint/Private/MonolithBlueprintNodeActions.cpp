@@ -150,6 +150,103 @@ static const TMap<FString, FNodeAlias>& GetNodeAliases()
 }
 
 // ============================================================
+//  CallFunction default target-class resolution (engine-generic)
+// ============================================================
+//
+// When a CallFunction node is requested without an explicit target_class, the
+// resolver scans loaded UClasses for the first one exposing a matching function.
+// A bare first-match by TObjectIterator order is non-deterministic and, for a
+// Widget Blueprint, frequently lands on an unrelated engine class that happens
+// to share a function name (e.g. SetVisibility) instead of the UMG widget the
+// author meant. When the owning asset is a UWidget-derived Blueprint, prefer a
+// candidate whose owning class is itself UWidget-derived before falling back to
+// the unbiased first match.
+//
+// The bias is purely reflection-based: UWidget is resolved by string so this
+// module needs no UMG link-time dependency, and no sibling/marketplace widget
+// class names are referenced. If UMG is not loaded the helper degrades to the
+// original first-match behaviour.
+
+// Resolve the UMG base widget class by path without a compile-time UMG dependency.
+// Returns nullptr when UMG is not loaded (cooked/standalone configs that strip it).
+static UClass* ResolveWidgetBaseClass()
+{
+	static TWeakObjectPtr<UClass> Cached;
+	if (UClass* Hit = Cached.Get())
+	{
+		return Hit;
+	}
+	// /Script/UMG.Widget is the canonical path; prefer it to avoid colliding with
+	// any unrelated class that merely happens to be named "Widget".
+	UClass* WidgetClass = FindObject<UClass>(nullptr, TEXT("/Script/UMG.Widget"));
+	if (!WidgetClass)
+	{
+		WidgetClass = FindFirstObject<UClass>(TEXT("Widget"), EFindFirstObjectOptions::NativeFirst);
+	}
+	Cached = WidgetClass;
+	return WidgetClass;
+}
+
+// True when the Blueprint generates a UWidget-derived class (Widget Blueprint).
+static bool IsWidgetBlueprintContext(const UBlueprint* BP)
+{
+	if (!BP)
+	{
+		return false;
+	}
+	UClass* WidgetBase = ResolveWidgetBaseClass();
+	if (!WidgetBase)
+	{
+		return false;
+	}
+	if (BP->GeneratedClass && BP->GeneratedClass->IsChildOf(WidgetBase))
+	{
+		return true;
+	}
+	return BP->ParentClass && BP->ParentClass->IsChildOf(WidgetBase);
+}
+
+// Scan loaded classes for the first one exposing any of the candidate function
+// names. When bPreferWidget is set, a UWidget-derived owner wins over a
+// non-widget owner found earlier in iteration order (the Widget-BP bias). The
+// first non-widget match is retained as the fallback so non-widget functions
+// (e.g. KismetMathLibrary helpers used inside a Widget BP) still resolve.
+static UFunction* FindFunctionAcrossLoadedClasses(const TArray<FName>& Candidates, bool bPreferWidget)
+{
+	UClass* WidgetBase = bPreferWidget ? ResolveWidgetBaseClass() : nullptr;
+	UFunction* FirstMatch = nullptr;
+	for (TObjectIterator<UClass> It; It; ++It)
+	{
+		UClass* Class = *It;
+		if (!Class)
+		{
+			continue;
+		}
+		for (const FName& Candidate : Candidates)
+		{
+			if (UFunction* Found = Class->FindFunctionByName(Candidate))
+			{
+				if (!FirstMatch)
+				{
+					FirstMatch = Found;
+				}
+				// With the Widget-BP bias, a widget-owned match short-circuits.
+				if (WidgetBase && Class->IsChildOf(WidgetBase))
+				{
+					return Found;
+				}
+				if (!WidgetBase)
+				{
+					return Found;
+				}
+				break; // candidate matched on this class; move to next class
+			}
+		}
+	}
+	return FirstMatch;
+}
+
+// ============================================================
 //  MonolithBlueprintInternal helpers
 // ============================================================
 
@@ -533,14 +630,10 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddNode(const TShared
 		}
 		else
 		{
-			for (TObjectIterator<UClass> It; It && !Func; ++It)
-			{
-				for (const FName& Candidate : FuncNameCandidates)
-				{
-					Func = It->FindFunctionByName(Candidate);
-					if (Func) break;
-				}
-			}
+			// Widget Blueprints bias toward UWidget-derived owners so name
+			// collisions (e.g. SetVisibility) resolve to the UMG widget the
+			// author meant rather than an arbitrary first-match engine class.
+			Func = FindFunctionAcrossLoadedClasses(FuncNameCandidates, IsWidgetBlueprintContext(BP));
 			if (!Func)
 			{
 				return FMonolithActionResult::Error(FString::Printf(
@@ -1980,14 +2073,19 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleResolveNode(const TSh
 		}
 		else
 		{
-			for (TObjectIterator<UClass> It; It && !Func; ++It)
+			// resolve_node is a dry-run with only an optional asset_path. When a
+			// Widget Blueprint path is supplied, apply the same UWidget-derived
+			// bias used by add_node so the resolved pin layout matches what the
+			// real write would produce. Without an asset_path the bias is off and
+			// behaviour is the unbiased first-match.
+			bool bPreferWidget = false;
+			if (!Params->GetStringField(TEXT("asset_path")).IsEmpty())
 			{
-				for (const FName& C : Candidates)
-				{
-					Func = It->FindFunctionByName(C);
-					if (Func) break;
-				}
+				FString ResolveAssetPath;
+				UBlueprint* ContextBP = MonolithBlueprintInternal::LoadBlueprintFromParams(Params, ResolveAssetPath);
+				bPreferWidget = IsWidgetBlueprintContext(ContextBP);
 			}
+			Func = FindFunctionAcrossLoadedClasses(Candidates, bPreferWidget);
 			if (!Func)
 			{
 				return FMonolithActionResult::Error(FString::Printf(
