@@ -90,8 +90,8 @@ namespace
 namespace MonolithUIBulkFillInternal
 {
 	// Build a single-error FDryRunReport for use when target resolution / validation
-	// fails. Mirrors MonolithGASBulkFillAdapter.cpp::MakeResolveFailureReport and
-	// MonolithISXBulkFillAdapter.cpp::MakeResolveFailureReport (Phase 2/3 precedent).
+	// fails. Mirrors MonolithGASBulkFillAdapter.cpp::MakeResolveFailureReport
+	// (the shared per-namespace adapter precedent).
 	static FDryRunReport MakeResolveFailureReport(const FString& Reason)
 	{
 		FDryRunReport Report;

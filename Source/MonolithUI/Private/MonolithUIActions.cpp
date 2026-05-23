@@ -673,8 +673,8 @@ FMonolithActionResult FMonolithUIActions::HandleSetWidgetProperty(const TSharedP
 
     // Bug #6 fix (2026-05-16 UI gap audit): accept BOTH `value` and
     // `property_value` as aliases. Discovery output's schema description
-    // historically left the param name ambiguous; some callers (and the
-    // BlackMassUI Phase 4 subagent) probed with `property_value` and got
+    // historically left the param name ambiguous; some callers probed
+    // with `property_value` and got
     // "Missing required param" followed by a SECOND error about wbp_path
     // when the param was renamed — the dual-failure mode wasted calls. We
     // now accept either spelling and surface a single coherent error that
