@@ -454,6 +454,23 @@ This folder is both the working copy and the git repo (`git@github.com:tumourlov
 
 ---
 
+### Editor Component Persistence (UPROPERTY-Backed References)
+
+Any MCP action that builds components on an editor-spawned `AActor` via `NewObject<...>(Actor, ...)` MUST register each component on `AActor::InstanceComponents` (a `UPROPERTY(Instanced) TArray<TObjectPtr<UActorComponent>>` at `Engine/Source/Runtime/Engine/Classes/GameFramework/Actor.h:4331`). Without `AActor::AddInstanceComponent(Comp)` the owning actor holds no UPROPERTY-backed reference to the component, `RegisterComponent()` wires it up for the current session only, and the component disappears on level save/reload — silent data loss. This was the root cause of Issue #63 across three action sites. The canonical sequence — `Modify()` -> `NewObject(... RF_Transactional)` -> `SetupAttachment` / `SetRootComponent` -> `AddInstanceComponent` -> `RegisterComponent` -> component setup -> `MarkPackageDirty()` — matches `Engine/Source/Editor/UnrealEd/Private/Factories/ActorFactory.cpp:1321` and `Engine/Source/Editor/UnrealEd/Private/Kismet2/ComponentEditorUtils.cpp:621`:
+
+```cpp
+Actor->Modify();
+USomeComponent* Comp = NewObject<USomeComponent>(
+    Actor, USomeComponent::StaticClass(), TEXT("ComponentName"), RF_Transactional);
+Comp->SetupAttachment(RootComp);   // or Actor->SetRootComponent(Comp) for the root
+Actor->AddInstanceComponent(Comp); // THE persistence anchor — order vs RegisterComponent is flexible; what matters is the array references the component at save-time
+Comp->RegisterComponent();
+Comp->SetStaticMesh(...);          // component-specific configuration AFTER register
+Actor->MarkPackageDirty();         // once all components are added
+```
+
+---
+
 ## 11. Known Issues & Workarounds
 
 See `TODO.md` for the full list. Key architectural constraints:

@@ -4,6 +4,15 @@ All notable changes to Monolith will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **Component persistence (Issue #63, @Heiselisha):** `mesh.convert_to_hism`, `mesh.place_spline`, and
+  `ai.place_smart_object_actor` now call `AActor::AddInstanceComponent` on every component they create, so
+  the components survive level save/reload. Convert-to-HISM also gains a pre-destroy guard that preserves
+  source actors if HISM instance creation reports a count mismatch.
+
 ## [0.15.0] - 2026-05-23
 
 This release rolls up everything since v0.14.10 (20 commits). Headline work: the **MCP ergonomics framework** (`bulk_fill_query` + `describe_query` routing to 12 per-namespace adapters), a **dataset read/edit ergonomics pack** (17 new `blueprint` actions for round-tripping DataTables / CurveTables / StringTables + `seed_data_asset`), the **UI/Blueprint MCP gap-closure** sweep (9 new actions across 4 phases + the 0516 UI gap-audit Tier 1–4), the new **`monolith_guide`** editorial action, and two community PRs (#58, #60). Two reflection/enum correctness fixes, plus a sibling-plugin-reference scrub in shipping comments.
