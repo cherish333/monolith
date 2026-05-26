@@ -265,4 +265,152 @@ bool FMonolithEditorPreviewCaptureWidgetTest::RunTest(const FString& /*Parameter
 	return true;
 }
 
+// ============================================================================
+// Test 4 — editor::inspect_material_pbr (Phase 2)
+//
+// Smoke test: load a known engine material, invoke HandleInspectMaterialPBR
+// directly, assert top-level keys are populated and slots[0] returned with at
+// least one of the scalar/vector/texture parameter arrays present.
+//
+// The default engine material has very few params; we don't assert non-empty
+// arrays — only that they exist. The classification fields are allowed to be
+// null because the default material doesn't bind named PBR textures.
+// ============================================================================
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMonolithEditorInspectMaterialPBRTest,
+	"Monolith.Editor.Inspect.MaterialPBR",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FMonolithEditorInspectMaterialPBRTest::RunTest(const FString& /*Parameters*/)
+{
+	// Engine ships a few canonical materials; first one to load wins.
+	static const TCHAR* Candidates[] =
+	{
+		TEXT("/Engine/EngineMaterials/DefaultMaterial"),
+		TEXT("/Engine/BasicShapes/BasicShapeMaterial"),
+		TEXT("/Engine/EngineMaterials/WorldGridMaterial")
+	};
+
+	FString FoundPath;
+	for (const TCHAR* Candidate : Candidates)
+	{
+		UObject* Probe = LoadObject<UObject>(nullptr, Candidate);
+		if (Probe)
+		{
+			FoundPath = Candidate;
+			break;
+		}
+	}
+
+	if (FoundPath.IsEmpty())
+	{
+		AddInfo(TEXT("Skipped — no engine material found at any candidate path."));
+		return true;
+	}
+
+	TSharedPtr<FJsonObject> Params = MakeShared<FJsonObject>();
+	Params->SetStringField(TEXT("asset_path"), FoundPath);
+
+	FMonolithActionResult Result = FMonolithEditorActions::HandleInspectMaterialPBR(Params);
+
+	TestTrue(TEXT("inspect_material_pbr returned success"), Result.bSuccess);
+	if (!Result.bSuccess || !Result.Result.IsValid())
+	{
+		AddError(FString::Printf(TEXT("Action failed: %s"), *Result.ErrorMessage));
+		return false;
+	}
+
+	TestTrue(TEXT("payload has asset_path"), Result.Result->HasTypedField<EJson::String>(TEXT("asset_path")));
+	TestTrue(TEXT("payload has material_class"), Result.Result->HasTypedField<EJson::String>(TEXT("material_class")));
+	TestTrue(TEXT("payload has slots array"), Result.Result->HasTypedField<EJson::Array>(TEXT("slots")));
+
+	const TArray<TSharedPtr<FJsonValue>>* SlotsArr = nullptr;
+	if (Result.Result->TryGetArrayField(TEXT("slots"), SlotsArr) && SlotsArr && SlotsArr->Num() > 0)
+	{
+		const TSharedPtr<FJsonObject>& Slot0 = (*SlotsArr)[0]->AsObject();
+		TestTrue(TEXT("slots[0] has scalar_params array"), Slot0.IsValid() && Slot0->HasTypedField<EJson::Array>(TEXT("scalar_params")));
+		TestTrue(TEXT("slots[0] has vector_params array"), Slot0.IsValid() && Slot0->HasTypedField<EJson::Array>(TEXT("vector_params")));
+		TestTrue(TEXT("slots[0] has texture_params array"), Slot0.IsValid() && Slot0->HasTypedField<EJson::Array>(TEXT("texture_params")));
+		TestTrue(TEXT("slots[0] has packed_orm_detected bool"), Slot0.IsValid() && Slot0->HasTypedField<EJson::Boolean>(TEXT("packed_orm_detected")));
+	}
+	else
+	{
+		AddError(TEXT("slots array missing or empty"));
+		return false;
+	}
+
+	return true;
+}
+
+// ============================================================================
+// Test 5 — editor::inspect_texture_channels (Phase 2)
+//
+// Smoke test: load a known engine texture, invoke HandleInspectTextureChannels
+// (emit_splits=false default), assert top-level width / height / format are
+// populated and the call succeeds. Non-BGRA8 sources may produce a warning
+// payload; we still expect a success result with width/height/format set.
+// ============================================================================
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMonolithEditorInspectTextureChannelsTest,
+	"Monolith.Editor.Inspect.TextureChannels",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FMonolithEditorInspectTextureChannelsTest::RunTest(const FString& /*Parameters*/)
+{
+	// Engine ships a few canonical UTexture2D assets; first one to load wins.
+	static const TCHAR* Candidates[] =
+	{
+		TEXT("/Engine/EngineMaterials/DefaultDiffuse"),
+		TEXT("/Engine/EngineMaterials/DefaultNormal"),
+		TEXT("/Engine/EngineResources/DefaultTexture"),
+		TEXT("/Engine/EngineResources/WhiteSquareTexture"),
+		TEXT("/Engine/EngineResources/Black")
+	};
+
+	FString FoundPath;
+	for (const TCHAR* Candidate : Candidates)
+	{
+		UObject* Probe = LoadObject<UObject>(nullptr, Candidate);
+		if (Probe)
+		{
+			FoundPath = Candidate;
+			break;
+		}
+	}
+
+	if (FoundPath.IsEmpty())
+	{
+		AddInfo(TEXT("Skipped — no engine UTexture2D found at any candidate path."));
+		return true;
+	}
+
+	TSharedPtr<FJsonObject> Params = MakeShared<FJsonObject>();
+	Params->SetStringField(TEXT("asset_path"), FoundPath);
+	// emit_splits intentionally omitted — exercises the default-false path.
+
+	FMonolithActionResult Result = FMonolithEditorActions::HandleInspectTextureChannels(Params);
+
+	TestTrue(TEXT("inspect_texture_channels returned success"), Result.bSuccess);
+	if (!Result.bSuccess || !Result.Result.IsValid())
+	{
+		AddError(FString::Printf(TEXT("Action failed: %s"), *Result.ErrorMessage));
+		return false;
+	}
+
+	TestTrue(TEXT("payload has asset_path"), Result.Result->HasTypedField<EJson::String>(TEXT("asset_path")));
+	TestTrue(TEXT("payload has width number"), Result.Result->HasTypedField<EJson::Number>(TEXT("width")));
+	TestTrue(TEXT("payload has height number"), Result.Result->HasTypedField<EJson::Number>(TEXT("height")));
+	TestTrue(TEXT("payload has format string"), Result.Result->HasTypedField<EJson::String>(TEXT("format")));
+	TestTrue(TEXT("payload has srgb bool"), Result.Result->HasTypedField<EJson::Boolean>(TEXT("srgb")));
+
+	const double Width = Result.Result->GetNumberField(TEXT("width"));
+	const double Height = Result.Result->GetNumberField(TEXT("height"));
+	TestTrue(TEXT("width > 0"), Width > 0.0);
+	TestTrue(TEXT("height > 0"), Height > 0.0);
+
+	return true;
+}
+
 #endif // WITH_DEV_AUTOMATION_TESTS

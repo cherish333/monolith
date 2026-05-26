@@ -424,6 +424,26 @@ void FMonolithEditorActions::RegisterActions(FMonolithLogCapture* LogCapture)
 			.Optional(TEXT("output_path"), TEXT("string"), TEXT("Output PNG path (absolute or relative to project)"))
 			.Build());
 
+	// --- Inspect actions (Phase 2: 2026-05-26-monolith-editor-preview-expansion plan) ---
+	// Pure reflection / source-mip-read. No render path. Bodies in
+	// MonolithEditorInspectActions.cpp.
+
+	Registry.RegisterAction(TEXT("editor"), TEXT("inspect_material_pbr"),
+		TEXT("Inspect a UMaterialInterface's PBR parameter set. Returns scalar/vector/texture parameter lists plus heuristic classification of base color / normal / roughness / metallic textures and ORM / ARM / MRA channel-packing detection. Pure reflection — no render, no thumbnail. Use this when capture_scene_preview's pixel output isn't enough and you need the actual parameter values."),
+		FMonolithActionHandler::CreateStatic(&HandleInspectMaterialPBR),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("UMaterialInterface asset path (e.g. /Game/Materials/M_Foo or /Game/Materials/MI_Foo)"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("editor"), TEXT("inspect_texture_channels"),
+		TEXT("Inspect a UTexture2D's R/G/B/A channel statistics (min/max/mean per channel) plus format/dimensions/sRGB/alpha. Optional per-channel split PNGs for visual debugging. Reads source mip 0 directly — bypasses runtime mip selection and compression. Useful for ORM/ARM channel-packing audits, alpha-coverage checks, and verifying source authoring against runtime appearance."),
+		FMonolithActionHandler::CreateStatic(&HandleInspectTextureChannels),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("UTexture2D asset path (e.g. /Game/Textures/T_Foo)"))
+			.Optional(TEXT("emit_splits"), TEXT("bool"), TEXT("If true, emit 4 grayscale PNGs (R/G/B/A) under output_dir. Default false (stats only)."), TEXT("false"))
+			.Optional(TEXT("output_dir"), TEXT("string"), TEXT("Output directory for split PNGs (default: Saved/Tests/Monolith/InspectTexture/<TextureName>/)"))
+			.Build());
+
 	Registry.RegisterAction(TEXT("editor"), TEXT("capture_sequence_frames"),
 		TEXT("Capture multiple frames of an animated effect at specified timestamps"),
 		FMonolithActionHandler::CreateStatic(&HandleCaptureSequenceFrames),
