@@ -444,6 +444,33 @@ void FMonolithEditorActions::RegisterActions(FMonolithLogCapture* LogCapture)
 			.Optional(TEXT("output_dir"), TEXT("string"), TEXT("Output directory for split PNGs (default: Saved/Tests/Monolith/InspectTexture/<TextureName>/)"))
 			.Build());
 
+	// --- Composite-capture actions (Phase 3: 2026-05-26-monolith-editor-preview-expansion plan) ---
+	// Multi-asset / show-flag overlay captures. Bodies live in
+	// MonolithEditorPreviewActions.cpp.
+
+	Registry.RegisterAction(TEXT("editor"), TEXT("capture_material_grid"),
+		TEXT("Render N materials side-by-side on identical preview meshes in ONE scene, ONE camera, ONE PNG. Shares lighting + HDRI across all cells (the value-add over N separate captures). Auto-grid layout via ceil(sqrt(N)) columns unless overridden. Use when comparing material variations visually — e.g. tweaking roughness across MI tiers, A/B-testing a master vs an instance, or auditing a packs's hero/variant materials."),
+		FMonolithActionHandler::CreateStatic(&HandleCaptureMaterialGrid),
+		FParamSchemaBuilder()
+			.Required(TEXT("material_paths"), TEXT("array"), TEXT("Array of UMaterialInterface asset paths (1..16). Each becomes one grid cell."))
+			.Optional(TEXT("output_path"), TEXT("string"), TEXT("Output PNG path. Default: Saved/Screenshots/Monolith/CaptureMaterialGrid/<timestamp>.png"))
+			.Optional(TEXT("resolution"), TEXT("array"), TEXT("[width, height] total grid PNG size. Default [1024, 1024]."), TEXT("[1024,1024]"))
+			.Optional(TEXT("columns"), TEXT("integer"), TEXT("Grid columns. Default: ceil(sqrt(material_count))."))
+			.Optional(TEXT("preview_mesh"), TEXT("string"), TEXT("Mesh per cell: plane | sphere | cube. Default sphere."), TEXT("sphere"))
+			.Optional(TEXT("camera"), TEXT("object"), TEXT("{location:[x,y,z], rotation:[p,y,r], fov:60} — overrides auto-framing"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("editor"), TEXT("capture_with_overlay"),
+		TEXT("Render a static mesh with an FEngineShowFlags overlay (wireframe | normals | uv_density | lightmap_density | shader_complexity). Useful for visual debugging — overdraw audits, UV-density checks, lightmap-density layout review, shader-complexity heatmaps. Static-mesh only in v1 (skeletal/material flavours can be added later)."),
+		FMonolithActionHandler::CreateStatic(&HandleCaptureWithOverlay),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("UStaticMesh asset path (e.g. /Engine/BasicShapes/Cube)"))
+			.Required(TEXT("mode"), TEXT("string"), TEXT("Overlay: wireframe | normals | uv_density | lightmap_density | shader_complexity"))
+			.Optional(TEXT("output_path"), TEXT("string"), TEXT("Output PNG path. Default: Saved/Screenshots/Monolith/CaptureWithOverlay/<timestamp>.png"))
+			.Optional(TEXT("resolution"), TEXT("array"), TEXT("[width, height]. Default [512, 512]."), TEXT("[512,512]"))
+			.Optional(TEXT("camera"), TEXT("object"), TEXT("{location:[x,y,z], rotation:[p,y,r], fov:60}"))
+			.Build());
+
 	Registry.RegisterAction(TEXT("editor"), TEXT("capture_sequence_frames"),
 		TEXT("Capture multiple frames of an animated effect at specified timestamps"),
 		FMonolithActionHandler::CreateStatic(&HandleCaptureSequenceFrames),

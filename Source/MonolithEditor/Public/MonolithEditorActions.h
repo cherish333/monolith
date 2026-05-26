@@ -76,6 +76,12 @@ public:
 	static FMonolithActionResult HandleInspectMaterialPBR(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleInspectTextureChannels(const TSharedPtr<FJsonObject>& Params);
 
+	// --- Composite-capture actions (Phase 3: 2026-05-26-monolith-editor-preview-expansion plan) ---
+	// Multi-asset / show-flag overlay capture. Bodies live in
+	// MonolithEditorPreviewActions.cpp.
+	static FMonolithActionResult HandleCaptureMaterialGrid(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleCaptureWithOverlay(const TSharedPtr<FJsonObject>& Params);
+
 	// --- Automation tests ---
 	static FMonolithActionResult HandleRunAutomationTests(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleListAutomationTests(const TSharedPtr<FJsonObject>& Params);

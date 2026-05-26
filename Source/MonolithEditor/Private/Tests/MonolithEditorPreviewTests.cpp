@@ -413,4 +413,247 @@ bool FMonolithEditorInspectTextureChannelsTest::RunTest(const FString& /*Paramet
 	return true;
 }
 
+// ============================================================================
+// Phase 3 — composite-capture actions (plan §12)
+// ============================================================================
+
+namespace MonolithEditorPreviewTests
+{
+	/** Build capture_material_grid params with a list of material paths + output path. */
+	static TSharedPtr<FJsonObject> MakeGridParams(
+		const TArray<FString>& MaterialPaths,
+		const FString& OutputPath,
+		int32 Resolution = 512)
+	{
+		TSharedPtr<FJsonObject> Params = MakeShared<FJsonObject>();
+
+		TArray<TSharedPtr<FJsonValue>> Arr;
+		for (const FString& Path : MaterialPaths)
+		{
+			Arr.Add(MakeShared<FJsonValueString>(Path));
+		}
+		Params->SetArrayField(TEXT("material_paths"), Arr);
+		Params->SetStringField(TEXT("output_path"), OutputPath);
+
+		TArray<TSharedPtr<FJsonValue>> ResArr;
+		ResArr.Add(MakeShared<FJsonValueNumber>((double)Resolution));
+		ResArr.Add(MakeShared<FJsonValueNumber>((double)Resolution));
+		Params->SetArrayField(TEXT("resolution"), ResArr);
+
+		return Params;
+	}
+
+	/** Build capture_with_overlay params for a single mode. */
+	static TSharedPtr<FJsonObject> MakeOverlayParams(
+		const FString& Mode,
+		const FString& OutputPath,
+		const FString& AssetPath = TEXT("/Engine/BasicShapes/Cube"))
+	{
+		TSharedPtr<FJsonObject> Params = MakeShared<FJsonObject>();
+		Params->SetStringField(TEXT("asset_path"), AssetPath);
+		Params->SetStringField(TEXT("mode"), Mode);
+		Params->SetStringField(TEXT("output_path"), OutputPath);
+
+		TArray<TSharedPtr<FJsonValue>> ResArr;
+		ResArr.Add(MakeShared<FJsonValueNumber>(256.0));
+		ResArr.Add(MakeShared<FJsonValueNumber>(256.0));
+		Params->SetArrayField(TEXT("resolution"), ResArr);
+
+		return Params;
+	}
+}
+
+// ============================================================================
+// Test 6 — editor::capture_material_grid
+//
+// Loads up to 4 engine materials, asks for a 2x2 grid (auto-columns from
+// ceil(sqrt(4))=2). Asserts the action succeeds and the PNG exists on disk.
+// SKIPs gracefully if fewer than 2 engine materials are loadable.
+// ============================================================================
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMonolithEditorPreviewCaptureMaterialGridTest,
+	"Monolith.Editor.Preview.CaptureMaterialGrid",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FMonolithEditorPreviewCaptureMaterialGridTest::RunTest(const FString& /*Parameters*/)
+{
+	if (!FApp::CanEverRender())
+	{
+		AddInfo(TEXT("Skipped — FApp::CanEverRender() is false (headless / nullrhi)"));
+		return true;
+	}
+
+	// Collect up to 4 loadable engine materials.
+	static const TArray<const TCHAR*> Candidates = {
+		TEXT("/Engine/EngineMaterials/DefaultMaterial"),
+		TEXT("/Engine/BasicShapes/BasicShapeMaterial"),
+		TEXT("/Engine/EngineMaterials/WorldGridMaterial"),
+		TEXT("/Engine/EngineDebugMaterials/M_VertexColor"),
+		TEXT("/Engine/EngineMaterials/DefaultDecalMaterial")
+	};
+
+	TArray<FString> Resolved;
+	for (const TCHAR* Candidate : Candidates)
+	{
+		UObject* Probe = LoadObject<UObject>(nullptr, Candidate);
+		if (Probe)
+		{
+			Resolved.Add(Candidate);
+			if (Resolved.Num() >= 4)
+			{
+				break;
+			}
+		}
+	}
+
+	if (Resolved.Num() < 2)
+	{
+		AddInfo(TEXT("Skipped — fewer than 2 engine materials loadable for grid test."));
+		return true;
+	}
+
+	const FString OutputPath = MonolithEditorPreviewTests::GetTestOutputDir() / TEXT("material_grid.png");
+	MonolithEditorPreviewTests::CleanupPng(OutputPath);
+
+	TSharedPtr<FJsonObject> Params = MonolithEditorPreviewTests::MakeGridParams(Resolved, OutputPath);
+
+	FMonolithActionResult Result = FMonolithEditorActions::HandleCaptureMaterialGrid(Params);
+
+	TestTrue(TEXT("capture_material_grid returned success"), Result.bSuccess);
+	if (!Result.bSuccess)
+	{
+		AddError(FString::Printf(TEXT("Action failed: %s"), *Result.ErrorMessage));
+		MonolithEditorPreviewTests::CleanupPng(OutputPath);
+		return false;
+	}
+
+	TestTrue(TEXT("payload has output_file"), Result.Result.IsValid() &&
+		Result.Result->HasTypedField<EJson::String>(TEXT("output_file")));
+	TestTrue(TEXT("payload has material_count"), Result.Result.IsValid() &&
+		Result.Result->HasTypedField<EJson::Number>(TEXT("material_count")));
+	TestTrue(TEXT("payload has columns"), Result.Result.IsValid() &&
+		Result.Result->HasTypedField<EJson::Number>(TEXT("columns")));
+	TestTrue(TEXT("payload has rows"), Result.Result.IsValid() &&
+		Result.Result->HasTypedField<EJson::Number>(TEXT("rows")));
+
+	TestTrue(TEXT("Output PNG exists on disk"), FPaths::FileExists(OutputPath));
+	if (FPaths::FileExists(OutputPath))
+	{
+		const int64 FileSize = IFileManager::Get().FileSize(*OutputPath);
+		TestTrue(TEXT("Output PNG is non-empty (>= 1KB)"), FileSize >= 1024);
+	}
+
+	MonolithEditorPreviewTests::CleanupPng(OutputPath);
+	return true;
+}
+
+// ============================================================================
+// Tests 7–11 — editor::capture_with_overlay (one per supported mode)
+//
+// All five overlays mount /Engine/BasicShapes/Cube and assert PNG exists with
+// non-zero size. Pixel-content inspection is out of scope per plan §12.
+// ============================================================================
+
+namespace MonolithEditorPreviewTests
+{
+	/** Common smoke harness for the 5 overlay-mode sub-tests. */
+	static bool RunOverlayModeSmokeTest(
+		FAutomationTestBase& Test,
+		const FString& Mode,
+		const FString& OutputFileBaseName)
+	{
+		if (!FApp::CanEverRender())
+		{
+			Test.AddInfo(TEXT("Skipped — FApp::CanEverRender() is false (headless / nullrhi)"));
+			return true;
+		}
+
+		const FString OutputPath = MonolithEditorPreviewTests::GetTestOutputDir() / OutputFileBaseName;
+		MonolithEditorPreviewTests::CleanupPng(OutputPath);
+
+		TSharedPtr<FJsonObject> Params = MonolithEditorPreviewTests::MakeOverlayParams(Mode, OutputPath);
+
+		FMonolithActionResult Result = FMonolithEditorActions::HandleCaptureWithOverlay(Params);
+
+		Test.TestTrue(FString::Printf(TEXT("capture_with_overlay (%s) returned success"), *Mode), Result.bSuccess);
+		if (!Result.bSuccess)
+		{
+			Test.AddError(FString::Printf(TEXT("Action failed for mode '%s': %s"), *Mode, *Result.ErrorMessage));
+			MonolithEditorPreviewTests::CleanupPng(OutputPath);
+			return false;
+		}
+
+		Test.TestTrue(TEXT("payload has mode echoed back"), Result.Result.IsValid() &&
+			Result.Result->HasTypedField<EJson::String>(TEXT("mode")));
+		Test.TestTrue(TEXT("payload has output_file"), Result.Result.IsValid() &&
+			Result.Result->HasTypedField<EJson::String>(TEXT("output_file")));
+
+		Test.TestTrue(TEXT("Output PNG exists on disk"), FPaths::FileExists(OutputPath));
+		if (FPaths::FileExists(OutputPath))
+		{
+			const int64 FileSize = IFileManager::Get().FileSize(*OutputPath);
+			Test.TestTrue(TEXT("Output PNG is non-empty (>= 1KB)"), FileSize >= 1024);
+		}
+
+		MonolithEditorPreviewTests::CleanupPng(OutputPath);
+		return true;
+	}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMonolithEditorPreviewCaptureWithOverlayWireframeTest,
+	"Monolith.Editor.Preview.CaptureWithOverlay.Wireframe",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FMonolithEditorPreviewCaptureWithOverlayWireframeTest::RunTest(const FString& /*Parameters*/)
+{
+	return MonolithEditorPreviewTests::RunOverlayModeSmokeTest(
+		*this, TEXT("wireframe"), TEXT("overlay_wireframe.png"));
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMonolithEditorPreviewCaptureWithOverlayNormalsTest,
+	"Monolith.Editor.Preview.CaptureWithOverlay.Normals",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FMonolithEditorPreviewCaptureWithOverlayNormalsTest::RunTest(const FString& /*Parameters*/)
+{
+	return MonolithEditorPreviewTests::RunOverlayModeSmokeTest(
+		*this, TEXT("normals"), TEXT("overlay_normals.png"));
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMonolithEditorPreviewCaptureWithOverlayUVDensityTest,
+	"Monolith.Editor.Preview.CaptureWithOverlay.UVDensity",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FMonolithEditorPreviewCaptureWithOverlayUVDensityTest::RunTest(const FString& /*Parameters*/)
+{
+	return MonolithEditorPreviewTests::RunOverlayModeSmokeTest(
+		*this, TEXT("uv_density"), TEXT("overlay_uv_density.png"));
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMonolithEditorPreviewCaptureWithOverlayLightmapDensityTest,
+	"Monolith.Editor.Preview.CaptureWithOverlay.LightmapDensity",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FMonolithEditorPreviewCaptureWithOverlayLightmapDensityTest::RunTest(const FString& /*Parameters*/)
+{
+	return MonolithEditorPreviewTests::RunOverlayModeSmokeTest(
+		*this, TEXT("lightmap_density"), TEXT("overlay_lightmap_density.png"));
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMonolithEditorPreviewCaptureWithOverlayShaderComplexityTest,
+	"Monolith.Editor.Preview.CaptureWithOverlay.ShaderComplexity",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FMonolithEditorPreviewCaptureWithOverlayShaderComplexityTest::RunTest(const FString& /*Parameters*/)
+{
+	return MonolithEditorPreviewTests::RunOverlayModeSmokeTest(
+		*this, TEXT("shader_complexity"), TEXT("overlay_shader_complexity.png"));
+}
+
 #endif // WITH_DEV_AUTOMATION_TESTS
