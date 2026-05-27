@@ -14,7 +14,7 @@ Most MCP integrations for Unreal register every action as a separate tool. That 
 
 One plugin. One MCP endpoint. 23 tools instead of 1300+. The AI calls `monolith_discover()` and `monolith_guide()` when it needs to know what's available, and otherwise just hits `blueprint_query("create_asset", ...)`, `material_query("compile", ...)`, and so on.
 
-I use it daily on my own UE 5.7 horror project. It does what I need.
+I use it every day. It does what I need.
 
 ---
 
