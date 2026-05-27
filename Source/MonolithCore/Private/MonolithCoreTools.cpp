@@ -61,6 +61,10 @@ void FMonolithCoreTools::RegisterAll()
 			FMonolithActionHandler::CreateStatic(&FMonolithCoreTools::HandleDiscover),
 			Schema
 		);
+		// Survivor A (plan §3.A) — read-only + idempotent enumeration.
+		Registry.SetActionAnnotations(TEXT("monolith"), TEXT("discover"),
+			/*bReadOnly=*/true, /*bDestructive=*/false, /*bIdempotent=*/true,
+			TEXT("Discover Monolith actions"));
 	}
 
 	// monolith_status
@@ -70,6 +74,10 @@ void FMonolithCoreTools::RegisterAll()
 			TEXT("Get Monolith server health: version, uptime, port, registered action count, module status."),
 			FMonolithActionHandler::CreateStatic(&FMonolithCoreTools::HandleStatus)
 		);
+		// Survivor A (plan §3.A) — pure server-health probe; read-only + idempotent.
+		Registry.SetActionAnnotations(TEXT("monolith"), TEXT("status"),
+			/*bReadOnly=*/true, /*bDestructive=*/false, /*bIdempotent=*/true,
+			TEXT("Monolith server status"));
 	}
 
 	// monolith_update
@@ -87,6 +95,9 @@ void FMonolithCoreTools::RegisterAll()
 			FMonolithActionHandler::CreateStatic(&FMonolithCoreTools::HandleUpdate),
 			Schema
 		);
+		// Survivor A (plan §3.A) — DELIBERATELY UNANNOTATED. The 'install'
+		// action variant modifies plugin source on disk and is not safely
+		// read-only. Per plan §3.A: "DO NOT annotate monolith_update".
 	}
 
 	// monolith_reindex
@@ -96,6 +107,12 @@ void FMonolithCoreTools::RegisterAll()
 			TEXT("Re-index the Monolith project database. Incremental by default (delta only). Pass force=true for full wipe+rebuild."),
 			FMonolithActionHandler::CreateStatic(&FMonolithCoreTools::HandleReindex)
 		);
+		// Survivor A (plan §3.A) — destructive of cache state, but functionally
+		// idempotent (re-running yields the same on-disk index). Conservative
+		// honest values per plan guidance.
+		Registry.SetActionAnnotations(TEXT("monolith"), TEXT("reindex"),
+			/*bReadOnly=*/false, /*bDestructive=*/false, /*bIdempotent=*/true,
+			TEXT("Rebuild Monolith index"));
 	}
 
 	// monolith_guide — editorial cross-namespace workflow guide (separate tool file,

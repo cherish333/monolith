@@ -113,6 +113,16 @@ public:
 	TArray<FMonolithSourceChunk> SearchSourceFTSFiltered(const FString& Query, const FString& Scope, const FString& Module, const FString& PathFilter, int32 Limit);
 	TArray<FMonolithSourceSymbol> SearchSymbolsFTSFiltered(const FString& Query, const FString& Kind, const FString& Module, const FString& PathFilter, int32 Limit);
 
+	// --- FTS COUNT(*) helpers (Survivor E, plan §3.E) ---
+	// Issued ONLY on page 0 of cursor-paginated search_source so subsequent
+	// pages can thread the cached total. Each helper issues a single
+	// `SELECT COUNT(*) FROM <fts_table> WHERE <fts_table> MATCH ?` plus the
+	// same JOIN/WHERE filters used by SearchSymbolsFTSFiltered /
+	// SearchSourceFTSFiltered respectively. Dominant cost is ~50-200ms cold
+	// cache per audit; warm cache is sub-ms.
+	int32 CountSymbolsFTSFiltered(const FString& Query, const FString& Kind, const FString& Module, const FString& PathFilter);
+	int32 CountSourceFTSFiltered(const FString& Query, const FString& Scope, const FString& Module, const FString& PathFilter);
+
 	// --- FTS helper ---
 	static FString EscapeFTS(const FString& Query);
 

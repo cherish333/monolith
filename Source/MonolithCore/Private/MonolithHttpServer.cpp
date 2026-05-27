@@ -527,6 +527,28 @@ TSharedPtr<FJsonObject> FMonolithHttpServer::HandleToolsList(const TSharedPtr<FJ
 				}
 				CoreTool->SetObjectField(TEXT("inputSchema"), InputSchema);
 
+				// Survivor A (plan §3.A) — MCP-spec tool annotations. Only emit
+				// the `annotations` block when at least one hint is non-default;
+				// avoids bloating the wire with default-false annotations on every
+				// individually-registered top-level tool. Spec ref:
+				// modelcontextprotocol.io/specification/2025-06-18/server/tools
+				const bool bAnyHint = ActionInfo.bReadOnlyHint
+					|| ActionInfo.bDestructiveHint
+					|| ActionInfo.bIdempotentHint
+					|| !ActionInfo.Title.IsEmpty();
+				if (bAnyHint)
+				{
+					TSharedPtr<FJsonObject> Ann = MakeShared<FJsonObject>();
+					Ann->SetBoolField(TEXT("readOnlyHint"), ActionInfo.bReadOnlyHint);
+					Ann->SetBoolField(TEXT("destructiveHint"), ActionInfo.bDestructiveHint);
+					Ann->SetBoolField(TEXT("idempotentHint"), ActionInfo.bIdempotentHint);
+					if (!ActionInfo.Title.IsEmpty())
+					{
+						Ann->SetStringField(TEXT("title"), ActionInfo.Title);
+					}
+					CoreTool->SetObjectField(TEXT("annotations"), Ann);
+				}
+
 				ToolsArray.Add(MakeShared<FJsonValueObject>(CoreTool));
 			}
 		}
@@ -576,6 +598,26 @@ TSharedPtr<FJsonObject> FMonolithHttpServer::HandleToolsList(const TSharedPtr<FJ
 			InputSchema->SetArrayField(TEXT("required"), {MakeShared<FJsonValueString>(TEXT("action"))});
 
 			Tool->SetObjectField(TEXT("inputSchema"), InputSchema);
+
+			// Survivor A (plan §3.A) — MCP-spec dispatcher annotations. Pulled
+			// from the registry's per-namespace dispatcher map (set via
+			// FMonolithToolRegistry::SetDispatcherAnnotations at module init).
+			// Untagged dispatchers leave IsAnyNonDefault()==false → no
+			// `annotations` block on the wire.
+			const FMonolithDispatcherAnnotations DispatcherAnn = Registry.GetDispatcherAnnotations(Namespace);
+			if (DispatcherAnn.IsAnyNonDefault())
+			{
+				TSharedPtr<FJsonObject> Ann = MakeShared<FJsonObject>();
+				Ann->SetBoolField(TEXT("readOnlyHint"), DispatcherAnn.bReadOnlyHint);
+				Ann->SetBoolField(TEXT("destructiveHint"), DispatcherAnn.bDestructiveHint);
+				Ann->SetBoolField(TEXT("idempotentHint"), DispatcherAnn.bIdempotentHint);
+				if (!DispatcherAnn.Title.IsEmpty())
+				{
+					Ann->SetStringField(TEXT("title"), DispatcherAnn.Title);
+				}
+				Tool->SetObjectField(TEXT("annotations"), Ann);
+			}
+
 			ToolsArray.Add(MakeShared<FJsonValueObject>(Tool));
 		}
 	}

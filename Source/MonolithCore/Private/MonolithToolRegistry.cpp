@@ -1,7 +1,9 @@
 #include "MonolithToolRegistry.h"
 #include "MonolithJsonUtils.h"
 #include "MonolithParamSchema.h"
+#include "MonolithFuzzyMatch.h"
 #include "HAL/PlatformMisc.h"
+#include "Dom/JsonValue.h"
 
 // =============================================================================
 //  FMonolithParamSchema — K2 alias rewriting + K3 unknown-key detection
@@ -201,10 +203,93 @@ FMonolithActionResult FMonolithToolRegistry::ExecuteAction(
 
 	if (!RegAction)
 	{
-		return FMonolithActionResult::Error(
-			FString::Printf(TEXT("Unknown action: %s.%s — call monolith_discover(\"%s\") to enumerate valid actions in this namespace."), *Namespace, *Action, *Namespace),
-			FMonolithJsonUtils::ErrMethodNotFound
-		);
+		// Survivor C (plan §3.C) — fuzzy-match top-3 suggestions on Unknown
+		// action / Unknown namespace. CRITICAL: snapshot the relevant keys
+		// under RegistryLock, then DROP the lock before sweeping Levenshtein.
+		// Holding the lock during the O(N·|key|·|action|) sweep would block
+		// every concurrent tools/list and tools/call (plan §10 Threading).
+		const bool bKnownNamespace = NamespaceActions.Contains(Namespace);
+		TArray<FString> CandidateKeys;
+		FString FuzzyNeedle;
+		FString SuggestionKind; // "action" | "namespace" — drives JSON key in suggestions
+		if (bKnownNamespace)
+		{
+			// Action typo within a known namespace. Snapshot the bare action
+			// names for this namespace and Levenshtein against `Action`.
+			if (const TArray<FString>* NsKeys = NamespaceActions.Find(Namespace))
+			{
+				CandidateKeys.Reserve(NsKeys->Num());
+				for (const FString& FullKey : *NsKeys)
+				{
+					// FullKey is "namespace.action" — slice the action half.
+					int32 DotIdx = INDEX_NONE;
+					if (FullKey.FindChar(TEXT('.'), DotIdx))
+					{
+						CandidateKeys.Add(FullKey.Mid(DotIdx + 1));
+					}
+					else
+					{
+						CandidateKeys.Add(FullKey);
+					}
+				}
+			}
+			FuzzyNeedle = Action;
+			SuggestionKind = TEXT("action");
+		}
+		else
+		{
+			// Namespace typo. Snapshot all known namespace names.
+			NamespaceActions.GetKeys(CandidateKeys);
+			FuzzyNeedle = Namespace;
+			SuggestionKind = TEXT("namespace");
+		}
+
+		// Drop the lock BEFORE the Levenshtein sweep. The snapshot is now ours.
+		Lock.Unlock();
+
+		TArray<MonolithFuzzyMatchDetail::FFuzzyCandidate> Top3 =
+			MonolithFuzzyMatchDetail::ScoreFuzzyMatches(FuzzyNeedle, CandidateKeys, /*TopN=*/3);
+
+		// Build the suggestions JSON payload regardless of whether any matched —
+		// an empty array on the wire is still informative (the agent learns the
+		// needle is novel, not just misspelled).
+		TArray<TSharedPtr<FJsonValue>> SuggestionArray;
+		for (const MonolithFuzzyMatchDetail::FFuzzyCandidate& C : Top3)
+		{
+			TSharedPtr<FJsonObject> SObj = MakeShared<FJsonObject>();
+			SObj->SetStringField(SuggestionKind, C.Key);
+			SObj->SetNumberField(TEXT("score"), C.Score);
+			SuggestionArray.Add(MakeShared<FJsonValueObject>(SObj));
+		}
+
+		TSharedPtr<FJsonObject> ErrorDataObj = MakeShared<FJsonObject>();
+		ErrorDataObj->SetArrayField(TEXT("suggestions"), SuggestionArray);
+		ErrorDataObj->SetStringField(TEXT("kind"), SuggestionKind);
+
+		FString MsgSuffix;
+		if (Top3.Num() > 0)
+		{
+			TArray<FString> Names;
+			for (const auto& C : Top3) { Names.Add(C.Key); }
+			MsgSuffix = FString::Printf(TEXT(" Did you mean: %s?"), *FString::Join(Names, TEXT(", ")));
+		}
+
+		if (bKnownNamespace)
+		{
+			return FMonolithActionResult::Error(
+				FString::Printf(TEXT("Unknown action: %s.%s — call monolith_discover(\"%s\") to enumerate valid actions in this namespace.%s"),
+					*Namespace, *Action, *Namespace, *MsgSuffix),
+				FMonolithJsonUtils::ErrMethodNotFound
+			).WithErrorData(ErrorDataObj);
+		}
+		else
+		{
+			return FMonolithActionResult::Error(
+				FString::Printf(TEXT("Unknown namespace: %s — call monolith_discover() to enumerate valid namespaces.%s"),
+					*Namespace, *MsgSuffix),
+				FMonolithJsonUtils::ErrMethodNotFound
+			).WithErrorData(ErrorDataObj);
+		}
 	}
 
 	if (!RegAction->Handler.IsBound())
@@ -428,4 +513,41 @@ int32 FMonolithToolRegistry::GetActionCount() const
 {
 	FScopeLock Lock(&RegistryLock);
 	return Actions.Num();
+}
+
+void FMonolithToolRegistry::SetDispatcherAnnotations(
+	const FString& Namespace,
+	const FMonolithDispatcherAnnotations& Annotations)
+{
+	FScopeLock Lock(&RegistryLock);
+	DispatcherAnnotations.Add(Namespace, Annotations);
+}
+
+FMonolithDispatcherAnnotations FMonolithToolRegistry::GetDispatcherAnnotations(const FString& Namespace) const
+{
+	FScopeLock Lock(&RegistryLock);
+	if (const FMonolithDispatcherAnnotations* Found = DispatcherAnnotations.Find(Namespace))
+	{
+		return *Found;
+	}
+	return FMonolithDispatcherAnnotations{};
+}
+
+void FMonolithToolRegistry::SetActionAnnotations(
+	const FString& Namespace,
+	const FString& Action,
+	bool bReadOnly,
+	bool bDestructive,
+	bool bIdempotent,
+	const FString& Title)
+{
+	FScopeLock Lock(&RegistryLock);
+	FString Key = MakeKey(Namespace, Action);
+	if (FRegisteredAction* RegAction = Actions.Find(Key))
+	{
+		RegAction->Info.bReadOnlyHint = bReadOnly;
+		RegAction->Info.bDestructiveHint = bDestructive;
+		RegAction->Info.bIdempotentHint = bIdempotent;
+		RegAction->Info.Title = Title;
+	}
 }

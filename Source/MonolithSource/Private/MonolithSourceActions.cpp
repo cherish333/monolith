@@ -3,6 +3,8 @@
 #include "MonolithSourceSubsystem.h"
 #include "MonolithToolRegistry.h"
 #include "MonolithParamSchema.h"
+#include "MonolithJsonUtils.h"
+#include "MonolithCursorCodec.h"
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 #include "Misc/FileHelper.h"
@@ -54,7 +56,7 @@ void FMonolithSourceActions::RegisterAll()
 			.Build());
 
 	Registry.RegisterAction(TEXT("source"), TEXT("search_source"),
-		TEXT("Full-text search across Unreal Engine source code and shaders"),
+		TEXT("Full-text search across Unreal Engine source code and shaders. Supports cursor pagination — pass `cursor` from a prior response's `next_cursor` to fetch the next page."),
 		FMonolithActionHandler::CreateStatic(&FMonolithSourceActions::HandleSearchSource),
 		FParamSchemaBuilder()
 			.Required(TEXT("query"), TEXT("string"), TEXT("Search query"))
@@ -64,6 +66,9 @@ void FMonolithSourceActions::RegisterAll()
 			.Optional(TEXT("module"), TEXT("string"), TEXT("Filter to a specific module"))
 			.Optional(TEXT("path_filter"), TEXT("string"), TEXT("Filter by file path pattern"))
 			.Optional(TEXT("symbol_kind"), TEXT("string"), TEXT("Filter by symbol kind (class, function, enum, etc.)"))
+			// Survivor E (plan §3.E): opaque base64+JSON cursor from a prior
+			// response's `next_cursor`. Omit on the first call.
+			.Optional(TEXT("cursor"), TEXT("string"), TEXT("Opaque pagination cursor from a prior next_cursor (Survivor E)"))
 			.Build());
 
 	Registry.RegisterAction(TEXT("source"), TEXT("get_class_hierarchy"),
@@ -108,6 +113,19 @@ void FMonolithSourceActions::RegisterAll()
 		TEXT("Trigger incremental project-only C++ source indexing (loads existing engine symbols, indexes project Source/ and Plugins/)"),
 		FMonolithActionHandler::CreateStatic(&FMonolithSourceActions::HandleTriggerProjectReindex),
 		MakeShared<FJsonObject>());
+
+	// Survivor A (plan §3.A) — annotate the `source_query` namespace dispatcher
+	// as read-only + idempotent. The `trigger_reindex` / `trigger_project_reindex`
+	// actions are conservatively non-destructive (they kick a background sweep
+	// that yields identical results when re-run); every other source action is
+	// pure read. Annotating at the DISPATCHER level (not per-action) per plan
+	// §3.A — the dispatcher tool is what `tools/list` advertises.
+	FMonolithDispatcherAnnotations SourceAnnotations;
+	SourceAnnotations.bReadOnlyHint = true;
+	SourceAnnotations.bDestructiveHint = false;
+	SourceAnnotations.bIdempotentHint = true;
+	SourceAnnotations.Title = TEXT("Source-index query");
+	Registry.SetDispatcherAnnotations(TEXT("source"), SourceAnnotations);
 }
 
 // ============================================================================
@@ -648,29 +666,116 @@ FMonolithActionResult FMonolithSourceActions::HandleFindCallees(const TSharedPtr
 
 FMonolithActionResult FMonolithSourceActions::HandleSearchSource(const TSharedPtr<FJsonObject>& Params)
 {
+	// Survivor E (plan §3.E) — cursor pagination via rerun-slice.
+	//
+	// FTS5 rank instability rules out keyset cursors (see plan §8). Instead
+	// we rerun the full top-N query at `N = (PageIndex + 1) * Limit`, then
+	// slice [PageIndex * Limit, (PageIndex + 1) * Limit). Hard cap of 1000
+	// rows total — once the slice end exceeds 1000, no more pages.
+	//
+	// v1 design note: we use ONE symbol page + ONE source page. The source
+	// branch issues an interleaved query across N scopes (header/source/inline
+	// OR shader/shader_header OR "all"). Per-scope page tracking would let
+	// each scope walk independently, but the plan §3.E body explicitly
+	// chooses the simpler single-pair scheme for v1. The interleaved
+	// de-dup at the slice site continues to use the existing TSet<FString>
+	// keyed on (FileId, LineNumber).
+
 	FMonolithSourceDatabase* DB = GetDB();
 	if (!DB || !DB->IsOpen())
 	{
 		return FMonolithActionResult::Error(TEXT("Engine source DB not available."));
 	}
 
-	FString Query = Params->GetStringField(TEXT("query"));
-	FString Scope = Params->HasField(TEXT("scope")) ? Params->GetStringField(TEXT("scope")) : TEXT("all");
-	int32 Limit = Params->HasField(TEXT("limit")) ? static_cast<int32>(Params->GetNumberField(TEXT("limit"))) : 20;
-	FString Mode = Params->HasField(TEXT("mode")) ? Params->GetStringField(TEXT("mode")) : TEXT("fts");
-	FString Module = Params->HasField(TEXT("module")) ? Params->GetStringField(TEXT("module")) : TEXT("");
-	FString PathFilter = Params->HasField(TEXT("path_filter")) ? Params->GetStringField(TEXT("path_filter")) : TEXT("");
-	FString SymbolKind = Params->HasField(TEXT("symbol_kind")) ? Params->GetStringField(TEXT("symbol_kind")) : TEXT("");
+	const FString Query = Params->GetStringField(TEXT("query"));
+	const FString Scope = Params->HasField(TEXT("scope")) ? Params->GetStringField(TEXT("scope")) : TEXT("all");
+	const int32 RequestedLimit = Params->HasField(TEXT("limit")) ? static_cast<int32>(Params->GetNumberField(TEXT("limit"))) : 20;
+	const FString Mode = Params->HasField(TEXT("mode")) ? Params->GetStringField(TEXT("mode")) : TEXT("fts");
+	const FString Module = Params->HasField(TEXT("module")) ? Params->GetStringField(TEXT("module")) : TEXT("");
+	const FString PathFilter = Params->HasField(TEXT("path_filter")) ? Params->GetStringField(TEXT("path_filter")) : TEXT("");
+	const FString SymbolKind = Params->HasField(TEXT("symbol_kind")) ? Params->GetStringField(TEXT("symbol_kind")) : TEXT("");
+	const FString CursorIn = Params->HasField(TEXT("cursor")) ? Params->GetStringField(TEXT("cursor")) : TEXT("");
+
+	// Hard cap (plan §3.E): never page past row 1000. Cumulative cap.
+	// When caller asks for `limit > HARD_CAP_ROWS` (e.g. limit=2000), the
+	// FTS query is issued with N=1000 and the returned page is implicitly
+	// capped — N is clamped to HARD_CAP_ROWS below.
+	constexpr int32 HARD_CAP_ROWS = 1000;
+
+	// Minimum-1 guard. Caller may legitimately ask for limit > HARD_CAP_ROWS;
+	// the page slice will fall out short. No upper clamp on `Limit` itself
+	// (the row count is bounded by N clamp + slice arithmetic).
+	const int32 Limit = FMath::Max(1, RequestedLimit);
+
+	const uint32 CurrentHash = MonolithCursorCodec::ComputeQueryHash(
+		Query, Scope, Mode, Module, PathFilter, SymbolKind);
+
+	// Decode cursor (if any). Mismatch / corruption → clean INVALID_CURSOR.
+	int32 SymbolPage = 0;
+	int32 SourcePage = 0;
+	int32 CachedTotalEstimate = -1;
+	bool bHasCursor = false;
+
+	if (!CursorIn.IsEmpty())
+	{
+		MonolithCursorCodec::FCursorState State;
+		if (!MonolithCursorCodec::Decode(CursorIn, State))
+		{
+			TSharedPtr<FJsonObject> ErrData = MakeShared<FJsonObject>();
+			ErrData->SetStringField(TEXT("error_code"), TEXT("INVALID_CURSOR"));
+			return FMonolithActionResult::Error(
+				TEXT("Cursor decode failed; restart pagination without `cursor`."),
+				FMonolithJsonUtils::ErrInvalidParams
+			).WithErrorData(ErrData);
+		}
+		if (State.QueryHash != CurrentHash)
+		{
+			TSharedPtr<FJsonObject> ErrData = MakeShared<FJsonObject>();
+			ErrData->SetStringField(TEXT("error_code"), TEXT("INVALID_CURSOR"));
+			return FMonolithActionResult::Error(
+				TEXT("Cursor query mismatch; restart pagination without `cursor`."),
+				FMonolithJsonUtils::ErrInvalidParams
+			).WithErrorData(ErrData);
+		}
+		SymbolPage = State.SymbolPage;
+		SourcePage = State.SourcePage;
+		CachedTotalEstimate = State.CachedTotalEstimate;
+		bHasCursor = true;
+	}
+
+	const bool bIsPageZero = !bHasCursor;
+
+	// PageIndex shared by both symbol and source rerun (v1 single-pair design).
+	const int32 PageIndex = bHasCursor ? FMath::Max(SymbolPage, SourcePage) : 0;
+
+	// N = how many rows we ask the FTS query for, then slice down to the page.
+	// Clamp at HARD_CAP_ROWS — once we cross the cap, the next page would be empty.
+	const int32 N = FMath::Min((PageIndex + 1) * Limit, HARD_CAP_ROWS);
+	const int32 SliceStart = PageIndex * Limit;
+	const int32 SliceEnd = FMath::Min(SliceStart + Limit, HARD_CAP_ROWS);
+
+	// Sentinel: if SliceStart is already at/past the cap, return an empty
+	// page (terminal). This is the documented overflow path.
+	const bool bPastCap = SliceStart >= HARD_CAP_ROWS;
 
 	TArray<FString> Parts;
 
-	// Symbol FTS search
-	TArray<FMonolithSourceSymbol> SymResults = DB->SearchSymbolsFTSFiltered(Query, SymbolKind, Module, PathFilter, Limit);
-	if (SymResults.Num() > 0)
+	// ---------- Symbol FTS rerun-slice ----------
+	TArray<FMonolithSourceSymbol> SymResultsAll;
+	if (!bPastCap)
+	{
+		SymResultsAll = DB->SearchSymbolsFTSFiltered(Query, SymbolKind, Module, PathFilter, N);
+	}
+	const int32 SymSliceStart = FMath::Min(SliceStart, SymResultsAll.Num());
+	const int32 SymSliceEnd = FMath::Min(SliceEnd, SymResultsAll.Num());
+	const int32 SymRowsThisPage = FMath::Max(0, SymSliceEnd - SymSliceStart);
+
+	if (SymRowsThisPage > 0)
 	{
 		Parts.Add(TEXT("=== Symbol Matches ==="));
-		for (const auto& Sym : SymResults)
+		for (int32 i = SymSliceStart; i < SymSliceEnd; ++i)
 		{
+			const FMonolithSourceSymbol& Sym = SymResultsAll[i];
 			FString FilePath = DB->GetFilePath(Sym.FileId);
 			Parts.Add(FString::Printf(TEXT("  [%s] %s (%s:%d)"), *Sym.Kind, *Sym.QualifiedName, *ShortPath(FilePath), Sym.LineStart));
 			if (!Sym.Signature.IsEmpty())
@@ -680,7 +785,7 @@ FMonolithActionResult FMonolithSourceActions::HandleSearchSource(const TSharedPt
 		}
 	}
 
-	// Source FTS search — expand scope to file_type values
+	// ---------- Source FTS rerun-slice ----------
 	TArray<FString> Scopes;
 	if (Scope == TEXT("cpp"))
 	{
@@ -695,30 +800,48 @@ FMonolithActionResult FMonolithSourceActions::HandleSearchSource(const TSharedPt
 		Scopes = { TEXT("all") };
 	}
 
-	TArray<FMonolithSourceChunk> SourceResults;
-	for (const FString& S : Scopes)
+	// Build the full interleaved+de-duped source list at top-N, THEN slice.
+	// De-dup happens before slicing so page boundaries land on unique rows.
+	TArray<FMonolithSourceChunk> SourceMergedDeduped;
+	if (!bPastCap)
 	{
-		SourceResults.Append(DB->SearchSourceFTSFiltered(Query, S, Module, PathFilter, Limit));
+		TSet<FString> Seen;
+		for (const FString& S : Scopes)
+		{
+			TArray<FMonolithSourceChunk> ScopeBatch = DB->SearchSourceFTSFiltered(Query, S, Module, PathFilter, N);
+			for (const FMonolithSourceChunk& Match : ScopeBatch)
+			{
+				FString Key = FString::Printf(TEXT("%lld_%d"), Match.FileId, Match.LineNumber);
+				if (Seen.Contains(Key)) continue;
+				Seen.Add(Key);
+				SourceMergedDeduped.Add(Match);
+				if (SourceMergedDeduped.Num() >= N)
+				{
+					break;
+				}
+			}
+			if (SourceMergedDeduped.Num() >= N)
+			{
+				break;
+			}
+		}
 	}
 
-	if (SourceResults.Num() > 0)
+	const int32 SrcSliceStart = FMath::Min(SliceStart, SourceMergedDeduped.Num());
+	const int32 SrcSliceEnd = FMath::Min(SliceEnd, SourceMergedDeduped.Num());
+	const int32 SrcRowsThisPage = FMath::Max(0, SrcSliceEnd - SrcSliceStart);
+
+	if (SrcRowsThisPage > 0)
 	{
 		Parts.Add(TEXT("\n=== Source Line Matches ==="));
-		TSet<FString> Seen;
-		int32 Shown = 0;
-		for (const auto& Match : SourceResults)
+		for (int32 i = SrcSliceStart; i < SrcSliceEnd; ++i)
 		{
-			if (Shown >= Limit) break;
-			FString Key = FString::Printf(TEXT("%lld_%d"), Match.FileId, Match.LineNumber);
-			if (Seen.Contains(Key)) continue;
-			Seen.Add(Key);
-
+			const FMonolithSourceChunk& Match = SourceMergedDeduped[i];
 			FString FilePath = DB->GetFilePath(Match.FileId);
 			FString Text = Match.Text.TrimStartAndEnd();
 			if (Text.Len() > 120) Text = Text.Left(120) + TEXT("...");
 			Parts.Add(FString::Printf(TEXT("  %s:%d"), *ShortPath(FilePath), Match.LineNumber));
 			Parts.Add(FString::Printf(TEXT("    %s"), *Text));
-			Shown++;
 		}
 	}
 
@@ -733,6 +856,45 @@ FMonolithActionResult FMonolithSourceActions::HandleSearchSource(const TSharedPt
 	ContentItem->SetStringField(TEXT("text"), ResultText);
 	ContentArr.Add(MakeShared<FJsonValueObject>(ContentItem));
 	ResultObj->SetArrayField(TEXT("content"), ContentArr);
+
+	// ---------- Pagination envelope ----------
+	const int32 TotalRowsThisPage = SymRowsThisPage + SrcRowsThisPage;
+
+	// total_estimate is emitted on page 0 ONLY; threaded forward via the cursor.
+	if (bIsPageZero)
+	{
+		const int32 SymCount = DB->CountSymbolsFTSFiltered(Query, SymbolKind, Module, PathFilter);
+		// For source COUNT(*) we issue one count per scope and sum — this matches
+		// the rerun's union behavior. De-dup may slightly inflate the estimate
+		// vs the actual de-duped page count; documented as ESTIMATE, not exact.
+		int32 SrcCount = 0;
+		for (const FString& S : Scopes)
+		{
+			SrcCount += DB->CountSourceFTSFiltered(Query, S, Module, PathFilter);
+		}
+		CachedTotalEstimate = SymCount + SrcCount;
+		ResultObj->SetNumberField(TEXT("total_estimate"), CachedTotalEstimate);
+	}
+	// On pages 1+: omit total_estimate (caller has it from their cursor's tc field).
+
+	// Emit next_cursor unless:
+	//  - this page returned fewer than Limit rows (terminal), OR
+	//  - the next slice start would meet/exceed HARD_CAP_ROWS.
+	const bool bShortPage = TotalRowsThisPage < Limit;
+	const int32 NextSliceStart = SliceEnd; // == (PageIndex + 1) * Limit
+	const bool bCapReached = NextSliceStart >= HARD_CAP_ROWS;
+
+	if (!bShortPage && !bCapReached)
+	{
+		MonolithCursorCodec::FCursorState OutState;
+		OutState.QueryHash = CurrentHash;
+		OutState.SymbolPage = PageIndex + 1;
+		OutState.SourcePage = PageIndex + 1;
+		OutState.CachedTotalEstimate = CachedTotalEstimate;
+		ResultObj->SetStringField(TEXT("next_cursor"), MonolithCursorCodec::Encode(OutState));
+	}
+	// else: omit `next_cursor` — terminal page.
+
 	return FMonolithActionResult::Success(ResultObj);
 }
 
