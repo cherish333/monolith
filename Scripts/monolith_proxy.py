@@ -17,6 +17,7 @@ Requirements: Python 3.8+ (stdlib only, no pip install needed)
 # parse on Python 3.8/3.9 too (macOS ships 3.9 by default via Xcode).
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -25,6 +26,7 @@ import time
 import tempfile
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from io import TextIOWrapper
 from pathlib import Path
 
@@ -39,6 +41,17 @@ POLL_START_DELAY = 3.0
 # Track Monolith availability for list_changed notifications
 _monolith_was_up = None
 _stdout_lock = threading.Lock()
+
+# Call-log state (Phase 4 / survivor F)
+#
+# NOTE: Saved/Logs/MonolithCalls.jsonl is project-root-relative and excluded
+# from crash zip generation by UE's crash reporter (Saved/Logs/ tail capture
+# only includes editor logs, not arbitrary jsonl). If a crash collector pattern
+# elsewhere DOES sweep Saved/Logs/*, the user should add MonolithCalls.jsonl to
+# the exclusion list. Single-user local dev tool; no phone-home.
+_call_log_enabled = False           # resolved once at startup
+_call_log_handle = None             # binary append-mode file handle
+_call_log_lock = threading.Lock()
 
 CORE_QUERY_TOOLS = [
     "blueprint_query",
@@ -63,6 +76,161 @@ CORE_QUERY_TOOLS = [
 def _log(msg: str) -> None:
     """Log to stderr (visible in Claude Code debug mode, never interferes with stdio)."""
     print(f"[monolith-proxy] {msg}", file=sys.stderr, flush=True)
+
+
+# ----------------------------------------------------------------------------
+# JSONL call log (Phase 4 / survivor F)
+#
+# One line per upstream HTTP roundtrip:
+#   {"ts":"2026-05-27T18:14:56Z","namespace":"editor","action":"get_build_errors",
+#    "params_hash":"<40-char-sha1-hex>","duration_ms":42.5,"ok":true,
+#    "error_code":null,"result_bytes":1834}
+#
+# Path: <project-root>/Saved/Logs/MonolithCalls.jsonl
+# Opt-out: env var MONOLITH_CALL_LOG=0
+# Atomicity: open(..., "ab") + threading.Lock around write+flush is sufficient
+# for single-process emission. POSIX O_APPEND would give kernel-level atomicity
+# for writes < PIPE_BUF (~4KB), but the lock makes the choice moot for our
+# line sizes.
+# ----------------------------------------------------------------------------
+
+
+def _resolve_call_log_path() -> Path:
+    """Resolve <project-root>/Saved/Logs/MonolithCalls.jsonl.
+
+    Priority:
+      1. MONOLITH_PROJECT_ROOT env var (explicit override).
+      2. Current working directory (proxy CWD is the project root when launched
+         by Claude Code's MCP config).
+    """
+    root = os.environ.get("MONOLITH_PROJECT_ROOT") or os.getcwd()
+    logs_dir = Path(root) / "Saved" / "Logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    return logs_dir / "MonolithCalls.jsonl"
+
+
+def _init_call_log() -> None:
+    """Open the call-log file handle once at startup. Default-enabled."""
+    global _call_log_enabled, _call_log_handle
+
+    _call_log_enabled = os.environ.get("MONOLITH_CALL_LOG", "1") != "0"
+    if not _call_log_enabled:
+        _log("Call log disabled (MONOLITH_CALL_LOG=0)")
+        return
+
+    try:
+        path = _resolve_call_log_path()
+        # Append-binary mode; OS handles end-of-file positioning. We flush after
+        # each write so a crash leaves complete lines on disk.
+        _call_log_handle = open(path, "ab")
+        _log(f"Call log: {path}")
+    except OSError as e:
+        _log(f"Failed to open call log: {e} -- logging disabled")
+        _call_log_enabled = False
+        _call_log_handle = None
+
+
+def _canonical_json(value) -> str:
+    """sort_keys + tightest separators -- matches the cpp proxy."""
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _extract_namespace_action(msg: dict) -> tuple[str, str]:
+    """Mirror the cpp proxy's extraction logic for (namespace, action)."""
+    method = msg.get("method", "") or ""
+    if method != "tools/call":
+        return method, ""
+
+    params = msg.get("params") or {}
+    if not isinstance(params, dict):
+        return "tools/call", ""
+
+    name = params.get("name", "") or ""
+    if name.endswith("_query"):
+        ns = name[: -len("_query")]
+        args = params.get("arguments") or {}
+        action = args.get("action", "") if isinstance(args, dict) else ""
+        return ns, action or ""
+
+    if name.startswith("monolith_"):
+        return "monolith", name[len("monolith_"):]
+
+    return name, ""
+
+
+def _extract_params_for_hash(msg: dict):
+    """For tools/call, hash arguments; for other methods, hash the whole params."""
+    method = msg.get("method", "") or ""
+    params = msg.get("params") or {}
+    if not isinstance(params, dict):
+        return {}
+
+    if method == "tools/call":
+        args = params.get("arguments") or {}
+        return args if isinstance(args, dict) else {}
+    return params
+
+
+def _inspect_response(resp: str | None) -> tuple[bool, int | None, int]:
+    """Returns (ok, error_code, result_bytes)."""
+    if not resp:
+        return False, None, 0
+    try:
+        parsed = json.loads(resp)
+    except (json.JSONDecodeError, ValueError):
+        return False, None, len(resp.encode("utf-8")) if resp else 0
+
+    error = parsed.get("error") if isinstance(parsed, dict) else None
+    if isinstance(error, dict):
+        code = error.get("code")
+        error_code = int(code) if isinstance(code, int) else None
+        result = parsed.get("result")
+        if result is not None:
+            result_bytes = len(_canonical_json(result).encode("utf-8"))
+        else:
+            result_bytes = len(resp.encode("utf-8"))
+        return False, error_code, result_bytes
+
+    result = parsed.get("result") if isinstance(parsed, dict) else None
+    if result is not None:
+        result_bytes = len(_canonical_json(result).encode("utf-8"))
+    else:
+        result_bytes = len(resp.encode("utf-8"))
+    return True, None, result_bytes
+
+
+def _write_call_log_line(msg: dict, resp: str | None, duration_ms: float) -> None:
+    """Append one JSONL line describing an upstream HTTP roundtrip."""
+    if not _call_log_enabled or _call_log_handle is None:
+        return
+    try:
+        ns, action = _extract_namespace_action(msg)
+        params_for_hash = _extract_params_for_hash(msg)
+        canonical = _canonical_json(params_for_hash)
+        params_hash = hashlib.sha1(canonical.encode("utf-8")).hexdigest()
+
+        ok, error_code, result_bytes = _inspect_response(resp)
+
+        # Second-precision ISO-8601 UTC (matches cpp proxy)
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        line = {
+            "ts": ts,
+            "namespace": ns,
+            "action": action,
+            "params_hash": params_hash,
+            "duration_ms": round(duration_ms, 3),
+            "ok": ok,
+            "error_code": error_code,
+            "result_bytes": result_bytes,
+        }
+        payload = (json.dumps(line, separators=(",", ":")) + "\n").encode("utf-8")
+        with _call_log_lock:
+            _call_log_handle.write(payload)
+            _call_log_handle.flush()
+    except Exception as e:
+        # Never let logging crash the proxy.
+        _log(f"Call-log write failed: {e}")
 
 
 def _post_monolith(body: str, timeout: float = TIMEOUT) -> str | None:
@@ -375,7 +543,11 @@ def handle_ping(msg: dict) -> str:
 
 def handle_tools_list(msg: dict) -> str:
     """Forward tools/list to Monolith. Stable cached/seed list if down."""
+    t0 = time.perf_counter()
     resp = _post_monolith(json.dumps(msg))
+    duration_ms = (time.perf_counter() - t0) * 1000.0
+    _write_call_log_line(msg, resp, duration_ms)
+
     if resp:
         _write_tools_cache(resp)
         return resp
@@ -384,7 +556,11 @@ def handle_tools_list(msg: dict) -> str:
 
 def handle_tools_call(msg: dict) -> str:
     """Forward tools/call to Monolith. Graceful error if down."""
+    t0 = time.perf_counter()
     resp = _post_monolith(json.dumps(msg))
+    duration_ms = (time.perf_counter() - t0) * 1000.0
+    _write_call_log_line(msg, resp, duration_ms)
+
     if resp:
         return resp
     tool_name = msg.get("params", {}).get("name", "unknown")
@@ -401,6 +577,8 @@ def main() -> None:
     stdout = TextIOWrapper(sys.stdout.buffer, encoding="utf-8", newline="\n")
 
     _log(f"Started. Forwarding to {MONOLITH_URL}")
+
+    _init_call_log()
 
     # Start background health poller
     poller = threading.Thread(
@@ -446,7 +624,11 @@ def main() -> None:
 
         else:
             # Forward unknown methods to Monolith
+            t0 = time.perf_counter()
             resp = _post_monolith(json.dumps(msg))
+            duration_ms = (time.perf_counter() - t0) * 1000.0
+            _write_call_log_line(msg, resp, duration_ms)
+
             if resp:
                 response = resp
             elif msg_id is not None:
