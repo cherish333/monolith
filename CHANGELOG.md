@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **MCP LLM ergonomics — universal response-shaping params on every action (Phase 1.0, Survivor B).** Every registered action now accepts three opt-in universal params that reshape the JSON response post-dispatch: `_fields: string[]` (whitelist — keep only these top-level response keys), `_omit: string[]` (blacklist — drop these top-level keys, mutually exclusive with `_fields`; collision appends a warning and `_fields` wins), and `_compact_json: bool` (drop top-level keys whose value is `null` / `""` / `{}` / `[]`). Underscore prefix is mandatory — unprefixed `fields` collides with `MonolithBlueprintStructActions::create_struct_with_fields`. K3 strict-params allowlist co-admits the three keys at registry level (`MonolithToolRegistry.cpp` around line 115) so no per-action schema migration was required. **Top-level keys only in Phase 1** — JSONPath / JMESPath grammar is deferred (WISHLIST). The post-filter (`ApplyResponseShaping` in `MonolithCore/Public/MonolithJsonUtils.h`) appends mutual-exclusion warnings to the same `warnings[]` channel that K3 unknown-param soft-warns and Survivor D AssetPath rewrites populate.
+
+- **MCP LLM ergonomics — schema-tagged param kinds via `EMonolithParamKind` (Phase 1.0, Survivor D).** New enum on `FParamSchema` entries with four variants: `Other` (default — no path semantics, never rewritten), `AssetPath` (dispatcher rewrites `\` → `/` at dispatch time, never silent — emits a surfaced warning), `DiskPath` (native OS path; explicit opt-OUT for clarity, never rewritten), `GameplayTag` (`A.B.C` reserved; never rewritten in Phase 1). The enum is serialised onto the per-param schema JSON as a string field `"kind"`, emitted only when non-default to keep `tools/list` bytes lean. New `FParamSchemaBuilder` sugar overloads `RequiredAssetPath` / `OptionalAssetPath` / `RequiredDiskPath` / `OptionalDiskPath` opt a param into a non-`Other` kind. The `AssetPath` rewrite block in `FMonolithToolRegistry::ExecuteAction` runs AFTER K2 alias rewrite and BEFORE the K3 unknown-key check. **Back-compat preserved** — every existing `.Required(...)` / `.Optional(...)` call site defaults to `Kind == Other` and opts OUT of path normalisation. **Per-namespace param tagging audit is a follow-up (Phase 1.1+)** — ~929 occurrences across 30 `*Actions.cpp` files remain untagged; deferred and tracked in `Docs/plans/2026-05-27-mcp-llm-ergonomics.md` §3.D.
+
+### Changed
+
+- **Symmetric params-string unwrap on the `monolith_` branch of `HandleToolsCall`** — mirrors the pre-existing `_query` branch behaviour so meta-namespace tools (`monolith_discover`, `monolith_status`, `monolith_guide`, etc.) accept the same nested-`params` shape that domain tools already handled.
+
+- **Both proxies advertise the universal params on every tool's inputSchema.** `Tools/MonolithProxy/monolith_proxy.cpp` (native) and `Scripts/monolith_proxy.py` (Python fallback) now emit `_fields` / `_omit` / `_compact_json` on every tool descriptor returned from `tools/list`. **The native proxy requires a `build_proxy.bat` rebuild + Claude Code MCP reconnect** to engage end-to-end; the Python fallback picks up the change on next restart.
+
+### Internal
+
+- **+11 automation tests** under `Monolith.ResponseShaping.*` and `Monolith.ParamKind.*` — all passing. Cover whitelist / blacklist / mutual-exclusion / compact-drop / non-`AssetPath` pass-through / K3 strict-params interaction.
+
+- **No new MCP actions registered in Phase 1.0** — the response-shaping surface is universal post-dispatch and the param-kind enum is a schema-tag opt-in. Action count is unchanged from v0.16.0 baseline.
+
 ## [0.16.0] - 2026-05-27
 
 A small, focused release between the v0.15.0 ergonomics framework and the next major surface. Headline work: a five-action **preview & inspection surface** expansion in the `editor::` namespace (renders + structural-data reads for tech-art and AI agents), one MCP-introspection hint that points agents at the schema-discovery surface before they guess parameter names, and two component-persistence fixes from a community-reported regression.

@@ -90,6 +90,14 @@ Standard codes mirror the JSON-RPC 2.0 spec. Monolith server-defined codes live 
 | `ErrInternalError` | `-32603` | The server choked. Default for unspecified failures. |
 | `ErrOptionalDepUnavailable` | `-32010` | An optional sibling/marketplace plugin the action depends on is not present. The action exists in the registry; the call cannot be served. First consumer: the 10 EffectSurface action handlers when the optional EffectSurface provider is absent (see [`specs/SPEC_MonolithUI.md` § "Error Contract — Optional EffectSurface Provider Absence (-32010)"](specs/SPEC_MonolithUI.md#error-contract--optional-effectsurface-provider-absence--32010)). Reserved range `-32011..-32019` left open for future "optional dep" codes. |
 
+**`warnings[]` channel (Phase 1.0, 2026-05-27).** Successful responses may carry an optional top-level `warnings: string[]` array. The array is appended to (not replaced) by three independent sources before emit, and is omitted when empty:
+
+1. **K3 unknown-param soft-warn** — typo / not-in-schema param keys. Hard error only when `STRICT_PARAMS=1`. K3's per-action allowlist additionally admits the three universal response-shaping params `_fields` / `_omit` / `_compact_json` (Phase 1.0) plus the pre-existing `asset_path` legacy alias. See `MonolithToolRegistry.cpp` around line 115.
+2. **Survivor D AssetPath rewrite** — when a `Kind == AssetPath` param receives a backslash-bearing value, the dispatcher rewrites `\` → `/` and appends a notification. Never silent. See §14.2.
+3. **Survivor B `_fields` / `_omit` collision** — when both response-shaping whitelist and blacklist are non-empty, `_fields` wins and a warning is appended. See §14.1.
+
+All three sources emit free-text strings into the same array. No schema or envelope change — `FMonolithActionResult` shape is unchanged.
+
 ### Module Loading
 
 | Module | Loading Phase | Type |
@@ -652,6 +660,44 @@ External docs can deep-link to this section via `[SPEC_CORE §Pipelines](Plugins
 **Breaking shape change in `get_emitter_summary` (v0.14.11):** the legacy `event_handlers[]` array is removed. Callers reading `event_handlers[].source_emitter_id` migrate to `incoming_events[].source_emitter_id` (`full` only) or `consumed_events[]` for the canonicalised event-name list (`DeathEvent` / `LocationEvent` / `CollisionEvent`). All other existing fields preserved.
 
 Per-emitter `role_hint` enum values are heuristic (driven by emitter-name substring + module-graph topology) and are intended as AI-guidance hints rather than authoritative classifications. Trust them for orientation, not for compile-time correctness gates. (WISHLIST) richer renderer-aware classification (mesh-renderer + burst name → "shell_burst_visual") is deferred to a follow-up.
+
+### 14.1 Universal Response-Shaping Params (Phase 1.0, 2026-05-27)
+
+Distinct from §14's domain-specific `detail_level` knob, every MCP action in the registry now accepts three opt-in universal params that reshape the JSON response post-dispatch. They are appended to the K3 unknown-key allowlist at registry level (see `MonolithToolRegistry.cpp` around line 115) so no per-action schema edit was required. The post-filter is implemented by `ApplyResponseShaping` in `MonolithCore/Public/MonolithJsonUtils.h`.
+
+| Param | Type | Effect |
+|-------|------|--------|
+| `_fields` | `string[]` | Whitelist — keep ONLY these top-level response keys. Empty array is a no-op (does NOT strip everything). |
+| `_omit` | `string[]` | Blacklist — drop these top-level response keys. Mutually exclusive with `_fields` (collision appends a warning, `_fields` wins). |
+| `_compact_json` | `bool` | Drop top-level keys whose value is `null`, `""`, `{}`, or `[]`. |
+
+**Underscore prefix is mandatory.** The unprefixed `fields` token already collides with `MonolithBlueprintStructActions::create_struct_with_fields`, so the universal params reserve `_*` to stay collision-free across the action surface forever.
+
+**Top-level keys only in Phase 1.** JSONPath / JMESPath grammar and nested-traversal shaping are deferred — out of scope for this phase per the plan's §2 kill list. (WISHLIST) nested-path shaping.
+
+**Warnings channel.** When `_fields` + `_omit` are both non-empty, the post-filter appends a free-text entry to the same `warnings[]` array that K3 unknown-param soft-warns and Survivor D AssetPath rewrites already populate. See §JSON-RPC error catalogue note at §2 — the channel's semantic scope now covers three sources.
+
+### 14.2 Schema-Tagged Param Kinds (`EMonolithParamKind`, Phase 1.0, 2026-05-27)
+
+`FParamSchemaBuilder` (in `MonolithCore/Public/MonolithParamSchema.h`) now stamps an `EMonolithParamKind` enum on each declared param. The enum is serialised onto the per-param schema JSON as a string field `"kind"`, emitted only when non-default to keep `tools/list` bytes lean.
+
+| Kind | Wire string | Dispatcher behaviour |
+|------|-------------|----------------------|
+| `Other` (default) | (omitted) | No path semantics. Never rewritten. Existing `.Required` / `.Optional` calls keep this default. |
+| `AssetPath` | `"AssetPath"` | `/Game/...` style paths. Dispatcher rewrites `\` → `/` at dispatch time and appends a surfaced warning to `warnings[]`. Never silent. |
+| `DiskPath` | `"DiskPath"` | Native OS path. Explicit opt-OUT for clarity. Never rewritten. |
+| `GameplayTag` | `"GameplayTag"` | `A.B.C` tag string. Reserved; never rewritten in Phase 1. |
+
+**Builder overloads.** Four sugar methods opt a param into a non-`Other` kind without touching the legacy `Required` / `Optional` signatures:
+
+- `RequiredAssetPath(Name, Description)` / `OptionalAssetPath(Name, Description)`
+- `RequiredDiskPath(Name, Description)` / `OptionalDiskPath(Name, Description)`
+
+All four bind `Type = "string"` and `Default = ""`. Use the non-sugar overloads when a non-string type or explicit default is required.
+
+**Dispatch ordering.** The `AssetPath` rewrite block in `FMonolithToolRegistry::ExecuteAction` runs AFTER K2 alias rewrite (so the rewrite sees the canonical key) and BEFORE the K3 unknown-key check. Only `Kind == AssetPath` params are rewritten; `DiskPath` / `GameplayTag` / `Other` all pass through untouched. Warnings funnel into the same `warnings[]` channel as §14.1's response-shaping warnings and the K3 unknown-param soft-warns.
+
+**Per-namespace param tagging (WISHLIST, Phase 1.1+).** Of ~929 `.Required(...)` / `.Optional(...)` occurrences across 30 `*Actions.cpp` files, none have been migrated to `RequiredAssetPath` / `OptionalAssetPath` yet — back-compat is preserved (untagged params default to `Kind == Other` and opt OUT of any path normalisation). The per-namespace audit pass to retrofit `asset_path` / `wbp_path` / `material_path` / etc. to `AssetPath`-kind is deferred to a Phase 1.1+ workstream and tracked in `Docs/plans/2026-05-27-mcp-llm-ergonomics.md` §3.D.
 
 ---
 
