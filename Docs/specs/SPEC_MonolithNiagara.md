@@ -2,7 +2,7 @@
 
 **Parent:** [SPEC_CORE.md](../SPEC_CORE.md)
 **Engine:** Unreal Engine 5.7+
-**Version:** 0.14.7 (Beta)
+**Version:** 0.16.0 (Beta)
 
 ---
 
@@ -14,7 +14,7 @@
 
 | Class | Responsibility |
 |-------|---------------|
-| `FMonolithNiagaraModule` | Registers 109 Niagara actions (108 baseline in `MonolithNiagaraActions.cpp` + 1 layout in `MonolithNiagaraLayoutActions.cpp`) |
+| `FMonolithNiagaraModule` | Registers 118 Niagara actions (108 baseline in `MonolithNiagaraActions.cpp` + 1 layout in `MonolithNiagaraLayoutActions.cpp` + 9 timing actions in `MonolithNiagaraTimingActions.cpp`) |
 | `FMonolithNiagaraActions` | Static handlers + extensive private helpers |
 | `FMonolithNiagaraLayoutActions` | `auto_layout` Blueprint Assist bridge for Niagara graphs |
 | `MonolithNiagaraHelpers` | 6 reimplemented NiagaraEditor functions (non-exported APIs) |
@@ -30,7 +30,7 @@ These exist because Epic's `FNiagaraStackGraphUtilities` functions lack `NIAGARA
 5. `GetParametersForContext` — System user store params
 6. `GetStackFunctionInputs` — Full input enumeration via engine's `FNiagaraStackGraphUtilities::GetStackFunctionInputs` with `FCompileConstantResolver`. Returns all input types (floats, vectors, colors, data interfaces, enums, bools) — not just static switch pins
 
-### Actions (109 — namespace: "niagara")
+### Actions (118 — namespace: "niagara")
 
 > **Audit note (2026-04-26):** detailed per-category tables below sum to roughly 96 — the remainder are post-design-doc additions (NPC, effect types, scalability, layout, advanced query helpers) that have not yet been threaded into the per-category tables. The header count is the source-of-truth.
 
@@ -152,6 +152,24 @@ These exist because Epic's `FNiagaraStackGraphUtilities` functions lack `NIAGARA
 | `get_simulation_stages` | Get all simulation stages on an emitter |
 | `set_simulation_stage_property` | Set a property on a simulation stage |
 | `remove_simulation_stage` | Remove a simulation stage from an emitter |
+
+**Temporal Control (9 — added 2026-05-28, Phases 1-4 of `plans/2026-05-28-niagara-timing-actions.md`)**
+
+The temporal-control surface collapses the existing scattered timing edits (per-property `set_system_property` + `set_simulation_stage_property` + `set_module_input_value` against `EmitterState` / `InitializeParticle`) into composite, intent-named writers. Design rationale: `plans/2026-05-28-niagara-timing-actions-design.md`. Plan: `plans/2026-05-28-niagara-timing-actions.md`.
+
+System-level reads + writes target `UNiagaraSystem` UPROPERTYs directly. Emitter-loop writes dispatch internally to `set_static_switch_value` (Loop Behavior, UseLoopDelay) and `set_module_input_value` (Loop Duration / Delay / Count) against the emitter's `EmitterState` module — stateless emitters early-out with a hint. Sim-stage aliases reuse the `stage_index` / `stage_name` selector convention from PR #65's `set_simulation_stage_property`. `set_particle_lifetime` resolves to Direct mode (min only) or Random mode (min + max) on the `InitializeParticle` module.
+
+| Action | Description |
+|--------|-------------|
+| `get_system_timing` | Bundled read of `WarmupTime`, `WarmupTickCount`, `WarmupTickDelta`, `bFixedTickDelta`, `FixedTickDeltaTime`, `bRequireCurrentFrameData`. One call replaces six `get_system_property` round-trips |
+| `set_warmup_profile` | Composite write of `warmup_time` + `warmup_tick_delta`. Calls `UNiagaraSystem::SetWarmupTime` + `SetWarmupTickDelta` (the exposed setters internally call `ResolveWarmupTickCount`). Response returns the engine-resolved `(WarmupTime, WarmupTickCount, WarmupTickDelta)` triple so callers observe the snap |
+| `set_fixed_tick_delta` | Toggle `bFixedTickDelta` with optional `fixed_delta_time` value (sets `FixedTickDeltaTime` when supplied) |
+| `set_require_current_frame_data` | Toggle `bRequireCurrentFrameData` |
+| `set_emitter_loop_profile` | Composite write of EmitterState loop topology: `loop_behavior` (Once / Infinite / Multiple), `loop_duration`, `loop_delay`, `loop_count`, `loop_delay_enabled`. Internally dispatches `set_static_switch_value` (Loop Behavior, UseLoopDelay) + `set_module_input_value` (Loop Duration, Loop Delay, Loop Count). Stateless emitters return a hint and no-op |
+| `get_emitter_timing_summary` | Read aggregator: loop topology + `sim_stages[]` (name, `NumIterations`, `ExecuteBehavior`) + `InitializeParticle` lifetime fields, in one call. Optional `emitter` filter; omit for all emitters |
+| `set_sim_stage_iteration_count` | Alias over `set_simulation_stage_property` with `property=NumIterations`. Reuses `stage_index` / `stage_name` selectors. Internally formats the int as the FNiagaraParameterBindingWithValue struct-literal `(Value=N)` |
+| `set_sim_stage_execute_behavior` | Alias for `set_simulation_stage_property` with `property=ExecuteBehavior`. Accepts `Always` / `OnSimulationReset` / `NotOnSimulationReset` |
+| `set_particle_lifetime` | Convenience write to the `InitializeParticle` module. `min` only → Direct mode with constant `Lifetime`. `min` + `max` → Random mode with `Lifetime Min` + `Lifetime Max` |
 
 **Module Outputs (1)**
 | Action | Description |
