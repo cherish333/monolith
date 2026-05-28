@@ -2,7 +2,7 @@
 
 **Version:** v0.15.0 · **Last updated:** 2026-05-23
 
-**In-tree action total: 1344** registered across **19 in-tree namespaces** (all active by default; 45 town-gen actions are experimental and disabled until you flip `bEnableProceduralTownGen=true`, which lifts the registry to 1389). The `ui` namespace re-exports 4 GAS UI binding actions as aliases, which are included in that headline figure. The five `monolith_*` meta-tools (`discover`, `status`, `update`, `reindex`, `guide`) plus the `bulk_fill_query` and `describe_query` framework dispatchers bring the MCP tool count to 23. This total EXCLUDES sibling-plugin actions (`MonolithISX`, `MonolithSteamBridge`, `MonolithSubstance`, `MonolithClaudeDesignBridge`) — they ship in their own repos and are not in the public release zip.
+**In-tree action total: 1358** registered across **19 in-tree namespaces** (all active by default; 45 town-gen actions are experimental and disabled until you flip `bEnableProceduralTownGen=true`, which lifts the registry to 1403). The `ui` namespace re-exports 4 GAS UI binding actions as aliases, which are included in that headline figure. The five `monolith_*` meta-tools (`discover`, `status`, `update`, `reindex`, `guide`) plus the `bulk_fill_query` and `describe_query` framework dispatchers bring the MCP tool count to 23. This total EXCLUDES sibling-plugin actions (`MonolithISX`, `MonolithSteamBridge`, `MonolithSubstance`, `MonolithClaudeDesignBridge`) — they ship in their own repos and are not in the public release zip.
 
 Live editor introspection on a fully loaded project (with sibling plugins present) can report additional namespaces beyond the in-tree Monolith surface. Those actions ship in their owning sibling repositories and are documented separately — see [§Sibling Plugins](#sibling-plugins).
 
@@ -22,7 +22,7 @@ Live editor introspection on a fully loaded project (with sibling plugins presen
 | [blueprint](#blueprint) | 111 | Blueprint read/write, variable/component/graph CRUD, node ops, compile, auto-layout, spawn actors, dataset read/edit pack (DataTable/CurveTable/StringTable + `seed_data_asset`), cross-class property access, parent-function overrides |
 | [material](#material) | 63 | Material graph editing, inspection, CRUD, material functions, PBR pipeline |
 | [animation](#animation) | 125 | Curves, bone tracks, sync markers, root motion, compression, blend spaces, ABPs (incl. custom anim-graph nodes), montages, skeletons, PoseSearch, IKRig, Control Rig |
-| [niagara](#niagara) | 109 | Niagara VFX (emitters, modules, params, renderers, HLSL, dynamic inputs, event handlers, sim stages, effect types, event-aware summaries + validate_system event-chain reasoning) |
+| [niagara](#niagara) | 119 | Niagara VFX (emitters, modules, params, renderers, HLSL, dynamic inputs, event handlers, sim stages, effect types, event-aware summaries + validate_system event-chain reasoning, temporal-control composite writers + read aggregators, stateless-emitter factory) |
 | [editor](#editor) | 29 | Live Coding builds, compile output capture, editor logs, scene capture, texture import, map creation, module status, automation test list/run, Python escape-hatch, persistent-level swap |
 | [config](#config) | 6 | INI config inspection and search |
 | [project](#project) | 7 | Project-wide asset index (SQLite + FTS5) |
@@ -37,7 +37,7 @@ Live editor introspection on a fully loaded project (with sibling plugins presen
 | [level_sequence](#level_sequence) | 8 | Level Sequence inspection: binding inventory (legacy + UE 5.7 custom bindings), Director Blueprint functions/variables, event-track bindings, cross-sequence reverse lookup |
 | [bulk_fill](#bulk_fill) | 2 | Reflection-walker bulk property fill across 12 per-namespace adapters (`apply`, `list_namespaces`) |
 | [describe](#describe) | 3 | Read-only schema introspection for the same 12 adapters (`schema`, `list_targets`, `action_schema`) |
-| **In-tree subtotal** | **1344** | (all default-active; +45 experimental town gen → 1389 when registered) |
+| **In-tree subtotal** | **1358** | (all default-active; +45 experimental town gen → 1403 when registered) |
 | [Sibling plugins](#sibling-plugins) | varies | Separate plugins, separate distribution |
 
 ---
@@ -378,7 +378,7 @@ See `Plugins/Monolith/Docs/specs/SPEC_MonolithAnimation.md` for the deep dive.
 
 ## niagara
 
-Niagara VFX system editing — emitters, modules, params, renderers, HLSL, dynamic inputs, event handlers, sim stages, NPC, effect types. **109 actions** (108 baseline + 1 layout).
+Niagara VFX system editing — emitters, modules, params, renderers, HLSL, dynamic inputs, event handlers, sim stages, NPC, effect types, temporal control, stateless-emitter factory. **119 actions** (108 baseline + 1 layout + 9 temporal-control + 1 stateless-emitter factory).
 
 > For full param schemas, call `monolith_discover("niagara")` at runtime.
 
@@ -399,6 +399,11 @@ Niagara VFX system editing — emitters, modules, params, renderers, HLSL, dynam
 | Data interfaces | 4 | `get_di_functions`, `get_compiled_gpu_hlsl`, `configure_data_interface`, `get_di_properties` |
 | Compile / preview | 4 | `request_compile`, `preview_system`, `diff_systems`, `get_scalability_settings`, `set_scalability_settings` |
 | Curves / spec | 5 | `configure_curve_keys`, `import_system_spec`, `export_system_spec`, `batch_execute`, `auto_layout` |
+| Temporal control (system) | 4 | `get_system_timing` (bundled read of `WarmupTime` / `WarmupTickCount` / `WarmupTickDelta` / `bFixedTickDelta` / `FixedTickDeltaTime` / `bRequireCurrentFrameData`), `set_warmup_profile` (composite write returning the engine-resolved triple after `ResolveWarmupTickCount` snap), `set_fixed_tick_delta`, `set_require_current_frame_data` |
+| Temporal control (emitter) | 2 | `set_emitter_loop_profile` (composite write of EmitterState loop topology — `loop_behavior` / `loop_duration` / `loop_delay` / `loop_count` / `loop_delay_enabled`; optional `loop_duration_mode` for stateless; native dispatch to `UNiagaraStatelessEmitter` standalone assets), `get_emitter_timing_summary` (read aggregator: loop topology + `sim_stages[]` + `InitializeParticle` lifetime fields; stateless branch returns `stateless: true` with `null` lifetime + empty `sim_stages`) |
+| Temporal control (sim stage) | 2 | `set_sim_stage_iteration_count`, `set_sim_stage_execute_behavior` (both alias atop `set_simulation_stage_property` with PR #65's `stage_index` / `stage_name` selector convention) |
+| Temporal control (particle) | 1 | `set_particle_lifetime` (`min` only → Direct mode constant `Lifetime`; `min` + `max` → Random mode `Lifetime Min` / `Lifetime Max`) |
+| Stateless emitter factory | 1 | `create_stateless_emitter` (standalone `UNiagaraStatelessEmitter` / Lightweight Emitter asset; pairs with the stateless-aware branches of `set_emitter_loop_profile` + `get_emitter_timing_summary`) |
 
 See `Plugins/Monolith/Docs/specs/SPEC_MonolithNiagara.md`.
 

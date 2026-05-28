@@ -62,6 +62,19 @@ All three are editor-only, render-thread-enqueue style, and return `{success, ou
 
 Prefer the inspect actions over capture when downstream logic needs to branch on the data (e.g. "if this is ORM-packed, route channel R to AO; if not, treat the slot as standalone Roughness"). Prefer capture when a human or a vision model needs to look at the pixels.
 
+**Recipe 7 — Tuning Niagara timing without hand-walking the module stack.** Authoring a system's warmup, loop topology, sim-stage iteration counts, and particle lifetime used to mean per-property `set_system_property` / `set_static_switch_value` / `set_module_input_value` round-trips against `EmitterState` and `InitializeParticle`. The temporal-control surface collapses that into intent-named composite writers.
+1. `niagara.get_system_timing` — bundled read of `WarmupTime` / `WarmupTickCount` / `WarmupTickDelta` / `bFixedTickDelta` / `FixedTickDeltaTime` / `bRequireCurrentFrameData` in one call. Use this to inspect before you write — and to observe the engine-resolved triple after `set_warmup_profile`, since `UNiagaraSystem::SetWarmupTime` snaps `WarmupTickCount` via `ResolveWarmupTickCount`.
+2. `niagara.set_warmup_profile` — composite write that dispatches `SetWarmupTime` + `SetWarmupTickDelta` and returns the engine-resolved triple. Pair with `set_fixed_tick_delta` / `set_require_current_frame_data` for the rest of the system-level timing knobs.
+3. `niagara.set_emitter_loop_profile` — composite write of EmitterState loop topology (`loop_behavior` / `loop_duration` / `loop_delay` / `loop_count` / `loop_delay_enabled`). For standalone `UNiagaraStatelessEmitter` (Lightweight Emitter) assets, pass the optional `loop_duration_mode` (`"Fixed"` / `"Infinite"`); the action detects stateless assets via class-name match and dispatches into the reflection-based write path against the protected `EmitterState` `FNiagaraEmitterStateData`.
+4. `niagara.set_sim_stage_iteration_count` / `niagara.set_sim_stage_execute_behavior` — sim-stage aliases over `set_simulation_stage_property` using PR #65's `stage_index` / `stage_name` selector.
+5. `niagara.set_particle_lifetime` — convenience write to `InitializeParticle`. `min` only → Direct mode constant `Lifetime`; `min` + `max` → Random mode `Lifetime Min` + `Lifetime Max`.
+6. **Verify:** `niagara_query("get_emitter_timing_summary", ...)` — read aggregator returning loop topology + `sim_stages[]` + `InitializeParticle` lifetime fields. On standalone stateless assets it returns `stateless: true` with `null` lifetime fields and `sim_stages: []`.
+
+**Recipe 8 — Authoring a Lightweight (stateless) emitter from scratch.** `UNiagaraStatelessEmitter` lives outside the System wrapper and uses Internal/Stateless/ headers most modules can't link to. `niagara.create_stateless_emitter` factors that out.
+1. `niagara.create_stateless_emitter` — author the standalone asset at `save_path`. Uses `FindObject<UClass>(nullptr, "/Script/Niagara.NiagaraStatelessEmitter")` + type-erased `NewObject` so callers don't need a hard module dep on Niagara internals.
+2. `niagara.set_emitter_loop_profile` — same action as the stateful path; pass `loop_duration_mode` (`"Fixed"` / `"Infinite"`) to set the stateless-only knob. Stateful systems emit a warning if `loop_duration_mode` is supplied because the stateful `EmitterState` module has no equivalent input.
+3. **Verify:** `niagara_query("get_emitter_timing_summary", {asset_path: "/Game/.../SLE_Foo"})` returns `stateless: true` and the topology you set.
+
 ## decisions
 
 When two tools overlap, pick by intent:

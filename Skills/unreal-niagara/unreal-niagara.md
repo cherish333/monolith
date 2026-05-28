@@ -439,7 +439,7 @@ When creating fire+light effects, do NOT put the Light Renderer on a GPU emitter
 
 ## Rules
 
-- Use `monolith_discover("niagara")` to see per-action param schemas — there are 117 actions
+- Use `monolith_discover("niagara")` to see per-action param schemas — there are 119 actions
 - The primary asset param is `asset_path`, NOT `system` or `asset`
 - Module actions require `module_node` (a GUID) — get it from `get_ordered_modules`
 - Module stages: `Emitter Spawn`, `Emitter Update`, `Particle Spawn`, `Particle Update`, `Render`
