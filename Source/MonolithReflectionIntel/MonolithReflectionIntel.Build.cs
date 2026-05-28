@@ -1,9 +1,14 @@
 // SPDX-License-Identifier: MIT
-// MonolithReflectionIntel — Phase 1 of Reflection Intelligence (v0.17.0).
-// Hosts the deterministic markdown decision-record indexer and `decision_query`
-// namespace adapter. No optional / sibling plugin deps in Phase 1, so no
-// conditional gating; the module loads unconditionally for all consumers.
-// Plan: Plugins/Monolith/Docs/plans/2026-05-28-reflection-intelligence.md (Phase 1).
+// MonolithReflectionIntel — Phases 1–3a of Reflection Intelligence (v0.17.0).
+// Hosts:
+//   Phase 1 — markdown decision-record indexer + `decision_query` namespace.
+//   Phase 2 — git co-change / hotspot / conditional-gate indexers + `risk_query`.
+//   Phase 3a — UHT-artefact reflection reader + IAssetRegistry asset-graph
+//              joiner + `cppreflect_query` namespace (5 actions). NO tree-sitter
+//              in Phase 3a — Phase 3b (deferred) will add the 2 native-tag
+//              tables + `list_native_tags` action via tree-sitter vendoring.
+// No optional / sibling plugin deps; the module loads unconditionally.
+// Plan: Plugins/Monolith/Docs/plans/2026-05-28-reflection-intelligence.md.
 
 using UnrealBuildTool;
 
@@ -30,7 +35,12 @@ public class MonolithReflectionIntel : ModuleRules
 			"DeveloperSettings",
 			"Json",
 			"JsonUtilities",
-			"Projects"
+			"Projects",
+			// Phase 3a additions — IAssetRegistry / FAssetData / FAssetIdentifier.
+			// Verified UE 5.7 module name = "AssetRegistry"
+			// (C:/Program Files (x86)/UE_5.7/Engine/Source/Runtime/AssetRegistry/AssetRegistry.Build.cs).
+			// We do NOT depend on AssetTools — Phase 3a only READS the registry.
+			"AssetRegistry"
 		});
 	}
 }

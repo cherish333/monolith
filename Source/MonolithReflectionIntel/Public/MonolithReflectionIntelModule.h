@@ -60,6 +60,20 @@ public:
 	static bool RunRiskIndexersOnce(FString& OutStatus);
 
 	/**
+	 * Phase 3a (v0.17.0) — run the cppreflect indexer pair on demand.
+	 *   1. FUHTArtefactReader — sweeps Intermediate/Build/<...>/UHT/*.gen.cpp
+	 *      (richer than .generated.h) and populates reflect_uclasses /
+	 *      reflect_uproperties / reflect_ufunctions / reflect_uinterfaces /
+	 *      reflect_uinterface_impls.
+	 *   2. FAssetGraphJoiner — cross-joins those rows against IAssetRegistry
+	 *      to produce cpp_asset_edges.
+	 * Invoked lazily by `cppreflect_query` action handlers when
+	 * `reflect_uclasses` is absent, and re-fired on hot-reload. Wipe-and-
+	 * rewrite semantics in one transaction; tolerates missing UHT root.
+	 */
+	static bool RunCppReflectIndexersOnce(FString& OutStatus);
+
+	/**
 	 * Lazily open (or return) the cached ReadOnly handle on EngineSource.db.
 	 * Owned by this module instance (TUniquePtr); torn down in ShutdownModule
 	 * so the SQLite handle + file lock release cleanly on editor exit / Live
@@ -81,6 +95,11 @@ public:
 	bool HasAttemptedRiskBootstrap() const { return bRiskBootstrapAttempted; }
 	void MarkRiskBootstrapAttempted()       { bRiskBootstrapAttempted = true; }
 
+	/** Phase 3a cppreflect-bootstrap-latch accessors. Same shape as decision
+	 *  and risk latches — re-armed on module reload via StartupModule(). */
+	bool HasAttemptedCppReflectBootstrap() const { return bCppReflectBootstrapAttempted; }
+	void MarkCppReflectBootstrapAttempted()       { bCppReflectBootstrapAttempted = true; }
+
 	/** Close + drop the cached query DB handle. Called from the lazy-bootstrap
 	 *  path in FDecisionQueryAdapter::GetRawDB before invoking the indexer
 	 *  (which opens its own RW handle on the same file). */
@@ -90,6 +109,7 @@ private:
 	void RegisterDecisionActions();
 	void RegisterRiskActions();
 	void RegisterSourceAuditActions();
+	void RegisterCppReflectActions();
 	void OnReloadComplete(EReloadCompleteReason Reason);
 
 	FDelegateHandle ReloadCompleteHandle;
@@ -110,4 +130,10 @@ private:
 	 *  decision latch. The risk indexer is more expensive (spawns `git log`)
 	 *  so we ALSO guard against second-call mid-session via this flag. */
 	bool bRiskBootstrapAttempted = false;
+
+	/** Phase 3a cppreflect-bootstrap latch. Re-armed on module reload. The
+	 *  UHT-artefact sweep can scan thousands of files; this guard prevents
+	 *  duplicate work when multiple cppreflect_query actions race the lazy
+	 *  bootstrap path in the same session. */
+	bool bCppReflectBootstrapAttempted = false;
 };

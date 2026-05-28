@@ -22,6 +22,9 @@
 #include "Risk/FConditionalGateIndexer.h"
 #include "Risk/FRiskQueryAdapter.h"
 #include "SourceAudit/FModuleDepRealityAdapter.h"
+#include "CppReflect/FUHTArtefactReader.h"
+#include "CppReflect/FAssetGraphJoiner.h"
+#include "CppReflect/FCppReflectQueryAdapter.h"
 #include "MonolithReflectionIntelSettings.h"
 
 #include "HAL/PlatformFileManager.h"
@@ -51,15 +54,18 @@ namespace
 void FMonolithReflectionIntelModule::StartupModule()
 {
 	// Explicit re-arm of the lazy-bootstrap latches on every module load. A
-	// fresh module instance always starts with both latches cleared so that
-	// Live Coding reloads re-attempt bootstrap if a prior attempt failed.
+	// fresh module instance always starts with all three latches cleared so
+	// that Live Coding reloads re-attempt bootstrap if a prior attempt failed.
 	bDecisionBootstrapAttempted = false;
 	bRiskBootstrapAttempted = false;
+	bCppReflectBootstrapAttempted = false;
 
 	RegisterDecisionActions();
 	// Phase 2 (v0.17.0) — risk_query namespace + source_query audit action.
 	RegisterRiskActions();
 	RegisterSourceAuditActions();
+	// Phase 3a (v0.17.0) — cppreflect_query namespace (5 actions).
+	RegisterCppReflectActions();
 
 	// Bind hot-reload hook so the decision corpus refreshes after Live Coding /
 	// UBT rebuilds. The handler opens the DB ReadWrite only briefly (the
@@ -73,13 +79,15 @@ void FMonolithReflectionIntelModule::StartupModule()
 	// NO eager bootstrap on StartupModule — the source subsystem's WAL handle
 	// may already be open on EngineSource.db at this point and our writer would
 	// race. All indexer bootstrap is LAZY:
-	//   - Decision: driven on first decision_query call.
-	//   - Risk:     driven on first risk_query call.
-	//   - All:      driven on hot-reload via OnReloadComplete.
+	//   - Decision:    driven on first decision_query call.
+	//   - Risk:        driven on first risk_query call.
+	//   - CppReflect:  driven on first cppreflect_query call.
+	//   - All:         driven on hot-reload via OnReloadComplete.
 
 	UE_LOG(LogMonolithReflectionIntel, Log,
 		TEXT("Monolith — ReflectionIntel module loaded (decision_query: 5 actions, "
-		     "risk_query: 5 actions, source_query: +1 audit action)"));
+		     "risk_query: 5 actions, source_query: +1 audit action, "
+		     "cppreflect_query: 5 actions)"));
 }
 
 void FMonolithReflectionIntelModule::ShutdownModule()
@@ -101,6 +109,8 @@ void FMonolithReflectionIntelModule::ShutdownModule()
 	FMonolithToolRegistry::Get().UnregisterNamespace(TEXT("decision"));
 	// Phase 2 — risk_query is fully owned by this module so unregister wholesale.
 	FMonolithToolRegistry::Get().UnregisterNamespace(TEXT("risk"));
+	// Phase 3a — cppreflect_query is fully owned by this module.
+	FMonolithToolRegistry::Get().UnregisterNamespace(TEXT("cppreflect"));
 	// NOTE: we do NOT unregister the `source` namespace here — MonolithSource
 	// owns the lion's share of source_query actions. Our one audit action
 	// would also be unregistered with the namespace-wide call. The risk is
@@ -172,6 +182,11 @@ void FMonolithReflectionIntelModule::RegisterSourceAuditActions()
 	FModuleDepRealityAdapter::RegisterActions(FMonolithToolRegistry::Get());
 }
 
+void FMonolithReflectionIntelModule::RegisterCppReflectActions()
+{
+	FCppReflectQueryAdapter::RegisterActions(FMonolithToolRegistry::Get());
+}
+
 void FMonolithReflectionIntelModule::OnReloadComplete(EReloadCompleteReason /*Reason*/)
 {
 	// Fire-and-log; never block the reload signal. Failure to refresh the
@@ -185,6 +200,12 @@ void FMonolithReflectionIntelModule::OnReloadComplete(EReloadCompleteReason /*Re
 	// activity tends to spike around the commits the reload reflects.
 	FString RiskStatus;
 	RunRiskIndexersOnce(RiskStatus);
+
+	// Phase 3a — UHT artefacts are exactly what a Live Coding rebuild
+	// regenerates, so this is the single signal that means "reflection
+	// edges may be stale". Refresh after every reload.
+	FString CppReflectStatus;
+	RunCppReflectIndexersOnce(CppReflectStatus);
 }
 
 bool FMonolithReflectionIntelModule::RunDecisionIndexerOnce(FString& OutStatus)
@@ -327,6 +348,76 @@ bool FMonolithReflectionIntelModule::RunRiskIndexersOnce(FString& OutStatus)
 		*GitStatus, *HotspotStatus, *GateStatus);
 	UE_LOG(LogMonolithReflectionIntel, Log, TEXT("%s"), *OutStatus);
 	return bGitOk && bHotspotOk && bGateOk;
+}
+
+bool FMonolithReflectionIntelModule::RunCppReflectIndexersOnce(FString& OutStatus)
+{
+	// No settings gate in Phase 3a — the UHT-artefact reader is cheap when no
+	// artefacts exist on disk (graceful "0 rows" return). Phase 3b will wrap
+	// the source-driven tree-sitter pass behind bIndexEnginePluginReflection.
+
+	const FString DbPath = GetEngineSourceDbPathStatic();
+	IPlatformFile& Pf = FPlatformFileManager::Get().GetPlatformFile();
+	if (!Pf.FileExists(*DbPath))
+	{
+		OutStatus = FString::Printf(
+			TEXT("RunCppReflectIndexersOnce: EngineSource.db not present at '%s' — bootstrap with source.trigger_reindex"),
+			*DbPath);
+		UE_LOG(LogMonolithReflectionIntel, Verbose, TEXT("%s"), *OutStatus);
+		return false;
+	}
+
+	FSQLiteDatabase Db;
+	if (!Db.Open(*DbPath, ESQLiteDatabaseOpenMode::ReadWrite))
+	{
+		OutStatus = FString::Printf(TEXT("RunCppReflectIndexersOnce: failed to open '%s'"), *DbPath);
+		UE_LOG(LogMonolithReflectionIntel, Warning, TEXT("%s"), *OutStatus);
+		return false;
+	}
+
+	// Same DELETE-journal discipline as Phase 1 + Phase 2 — opening a second
+	// RW handle on a SQLite DB the source subsystem may have left in WAL mode
+	// is the documented silent-failure pattern.
+	if (!Db.Execute(TEXT("PRAGMA journal_mode=DELETE;")))
+	{
+		UE_LOG(LogMonolithReflectionIntel, Warning,
+			TEXT("RunCppReflectIndexersOnce: PRAGMA journal_mode=DELETE failed on '%s' (continuing)"),
+			*DbPath);
+	}
+
+	// Resolve UHT artefact roots from settings. Empty = auto-resolve to
+	// ProjectIntermediateDir / Build inside FUHTArtefactReader::Run.
+	const UMonolithReflectionIntelSettings* Settings = UMonolithReflectionIntelSettings::Get();
+	TArray<FString> ArtefactRoots;
+	bool bIncludeEnginePlugins = false;
+	if (Settings)
+	{
+		bIncludeEnginePlugins = Settings->bIndexEnginePluginReflection;
+		if (!Settings->UHTArtefactRoot.IsEmpty())
+		{
+			ArtefactRoots.Add(Settings->UHTArtefactRoot);
+		}
+	}
+
+	// Run both indexers sequentially. Each opens its own internal transaction
+	// so we do not need to wrap them in an outer BEGIN/COMMIT — but ordering
+	// matters: FUHTArtefactReader populates reflect_uclasses before
+	// FAssetGraphJoiner reads it.
+	FString UhtStatus;
+	FUHTArtefactReader UhtReader;
+	const bool bUhtOk = UhtReader.Run(Db, ArtefactRoots, bIncludeEnginePlugins, UhtStatus);
+
+	FString JoinerStatus;
+	FAssetGraphJoiner Joiner;
+	const bool bJoinerOk = Joiner.Run(Db, JoinerStatus);
+
+	Db.Close();
+
+	OutStatus = FString::Printf(
+		TEXT("RunCppReflectIndexersOnce: uht=%s | asset_graph=%s"),
+		*UhtStatus, *JoinerStatus);
+	UE_LOG(LogMonolithReflectionIntel, Log, TEXT("%s"), *OutStatus);
+	return bUhtOk && bJoinerOk;
 }
 
 #undef LOCTEXT_NAMESPACE

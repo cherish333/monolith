@@ -77,6 +77,34 @@ public:
 	int32 MaxCommitFileCount = 20;
 
 	// ----------------------------------------------------------------
+	// CppReflect (Phase 3a — v0.17.0). UHT-artefact + IAssetRegistry only.
+	// Phase 3b (deferred) adds tree-sitter for source-driven UCLASS sweeps
+	// and the 2 native-tag tables; until then this section ships partial.
+	// ----------------------------------------------------------------
+
+	/**
+	 * Include engine-plugin UHT artefacts in the scan. Default OFF — engine
+	 * reflection footprint is large (~488K LOC); we mine project + Monolith
+	 * plugins only unless the operator opts in. WISHLIST extension for
+	 * Phase 3b: gate engine-plugin reflection behind a separate setting per
+	 * design-spec risk row.
+	 */
+	UPROPERTY(EditAnywhere, config, Category="CppReflect")
+	bool bIndexEnginePluginReflection = false;
+
+	/**
+	 * Override the UHT artefact root. Empty = auto-resolve via
+	 * FPaths::ProjectIntermediateDir() / "Build" / "<Platform>" / ... at
+	 * indexer runtime. Project-relative paths supported; absolute paths win.
+	 *
+	 * Tagged with v0.17.0 ergonomics EMonolithParamKind::DiskPath spirit —
+	 * raw FString here, but MCP-surfaced params on the related actions are
+	 * DiskPath-rewritten automatically.
+	 */
+	UPROPERTY(EditAnywhere, config, Category="CppReflect")
+	FString UHTArtefactRoot;
+
+	// ----------------------------------------------------------------
 	// UDeveloperSettings overrides
 	// ----------------------------------------------------------------
 

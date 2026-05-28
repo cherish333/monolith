@@ -2,7 +2,7 @@
 
 **Parent:** [SPEC_CORE.md](../SPEC_CORE.md)
 **Engine:** Unreal Engine 5.7+
-**Version:** 0.17.0 — 11 actions shipped across Phases 1–2 (5 decision + 5 risk + 1 source-namespace module-dep audit)
+**Version:** 0.17.0 — 16 actions shipped across Phases 1–3a (5 decision + 5 risk + 1 source-namespace module-dep audit + 5 cppreflect)
 
 ---
 
@@ -10,7 +10,7 @@
 
 `MonolithReflectionIntel` is a deterministic, $0-LLM intelligence layer that mines high-signal facts out of the project's own artefacts (markdown, git history, C++, AssetRegistry) and exposes them as MCP query actions. It exists to give AI agents structured answers to questions the project itself already knows the answer to — without spending tokens re-deriving them from raw source.
 
-Phases 1 and 2 fold into the same v0.17.0 release. Phase 1 ships the **Decision Intelligence** slice — architectural decision records mined from the project's markdown corpora (specs, plans, CHANGELOG, `.claude/rules/`) and served through the `decision_query` namespace (5 actions). Phase 2 ships the **Risk Intelligence** slice — git-log mining + conditional-gate inventory served through a new `risk_query` namespace (5 actions), plus a **Module-Dep Reality Audit** that registers a single audit action onto the existing `source_query` namespace. The remaining two phases are planned but not yet implemented.
+Phases 1, 2, and 3a fold into the same v0.17.0 release. Phase 1 ships the **Decision Intelligence** slice — architectural decision records mined from the project's markdown corpora (specs, plans, CHANGELOG, `.claude/rules/`) and served through the `decision_query` namespace (5 actions). Phase 2 ships the **Risk Intelligence** slice — git-log mining + conditional-gate inventory served through a new `risk_query` namespace (5 actions), plus a **Module-Dep Reality Audit** that registers a single audit action onto the existing `source_query` namespace. Phase 3a ships the **CppReflect Intelligence** slice — UE 5.7 reflection-edge queries served through a new `cppreflect_query` namespace (5 actions), driven by direct reads of UHT artefacts (`Intermediate/Build/.../UHT/*.gen.cpp`) cross-joined with `IAssetRegistry`. Phase 3b (tree-sitter integration for native gameplay-tag declaration tracking) is deferred. Phase 4 is planned but not yet implemented.
 
 ### Roadmap
 
@@ -18,10 +18,11 @@ Phases 1 and 2 fold into the same v0.17.0 release. Phase 1 ships the **Decision 
 |-------|--------|---------|-----------|
 | 1 — Decision Intelligence | **shipped v0.17.0** | `decision_query` (5 actions) | Markdown heuristic harvest |
 | 2 — Risk Intelligence | **shipped v0.17.0** | `risk_query` (5 actions) + `source_query("audit_module_dep_reality")` (1 audit action) | Git log subprocess + LOC sweep + regex over `#if WITH_*` / `bHas*` + Build.cs parsing against `EngineSource.db` symbol resolution |
-| 3 — CppReflect Intelligence | `(WISHLIST)` | `cppreflect_query` + cpp↔asset edges | tree-sitter-unreal-cpp + UHT artefacts + `IAssetRegistry` |
-| 4 — Network Intelligence | `(WISHLIST)` | `network_query` + audit actions + `pipeline_query("pr_review")` composer | Composes Phases 1+2+3 |
+| 3a — CppReflect Intelligence | **shipped v0.17.0** | `cppreflect_query` (5 actions) + cpp↔asset edges | UHT artefact regex sweep over `Intermediate/Build/.../UHT/*.gen.cpp` + `IAssetRegistry` asset-graph joiner — NO tree-sitter dependency |
+| 3b — Native Tag Tracking | `(WISHLIST)` | `cppreflect_query("list_native_tags")` (1 action) + 2 tag tables | tree-sitter-unreal-cpp on `.cpp` / `.h` for native `UE_DEFINE_GAMEPLAY_TAG_*` / `extern FGameplayTag` mining |
+| 4 — Network Intelligence | `(WISHLIST)` | `network_query` + audit actions + `pipeline_query("pr_review")` composer | Composes Phases 1+2+3a |
 
-The phases are independent (Phase 2 does not depend on Phase 1; Phase 4 depends on Phase 3 reflection-edge tables for `network_query` and the audit actions). Each phase ships as its own point release, except Phases 1 + 2 which co-shipped in v0.17.0.
+The phases are independent (Phase 2 does not depend on Phase 1; Phase 3a does not depend on Phase 2; Phase 4 depends on Phase 3a reflection-edge tables for `network_query` and the audit actions). Phases 1 + 2 + 3a co-shipped in v0.17.0. Phase 3b is deferred — the deferral rationale is in §5b below.
 
 ---
 
@@ -29,9 +30,9 @@ The phases are independent (Phase 2 does not depend on Phase 1; Phase 4 depends 
 
 **Type:** `Editor`
 **Loading phase:** `Default`
-**Public namespaces owned by this module:** `decision` (5 actions, Phase 1) + `risk` (5 actions, Phase 2). Phase 2 additionally registers one audit action onto the **existing** `source` namespace owned by `MonolithSource` (`source_query("audit_module_dep_reality")`); the audit handler lives in `MonolithReflectionIntel` but is registered against the source dispatcher for caller ergonomics — agents already discover `source_query` first.
+**Public namespaces owned by this module:** `decision` (5 actions, Phase 1) + `risk` (5 actions, Phase 2) + `cppreflect` (5 actions, Phase 3a). Phase 2 additionally registers one audit action onto the **existing** `source` namespace owned by `MonolithSource` (`source_query("audit_module_dep_reality")`); the audit handler lives in `MonolithReflectionIntel` but is registered against the source dispatcher for caller ergonomics — agents already discover `source_query` first.
 
-`MonolithReflectionIntel` is a self-contained editor module. Phase 1 owns one indexer worker (`FDecisionRecordIndexer`), one query adapter (`FDecisionQueryAdapter`), one settings UCLASS (`UMonolithReflectionIntelSettings`), and a SQLite schema fragment (`MonolithDecisionSchema` namespace). Phase 2 adds three indexer workers (`FGitChurnIndexer`, `FGitCoChangeIndexer`, `FConditionalGateIndexer`), two query adapters (`FRiskQueryAdapter`, `FModuleDepRealityAdapter`), and a second SQLite schema fragment (`MonolithRiskSchema` namespace) sharing `EngineSource.db`.
+`MonolithReflectionIntel` is a self-contained editor module. Phase 1 owns one indexer worker (`FDecisionRecordIndexer`), one query adapter (`FDecisionQueryAdapter`), one settings UCLASS (`UMonolithReflectionIntelSettings`), and a SQLite schema fragment (`MonolithDecisionSchema` namespace). Phase 2 adds three indexer workers (`FGitChurnIndexer`, `FGitCoChangeIndexer`, `FConditionalGateIndexer`), two query adapters (`FRiskQueryAdapter`, `FModuleDepRealityAdapter`), and a second SQLite schema fragment (`MonolithRiskSchema` namespace) sharing `EngineSource.db`. Phase 3a adds one indexer worker (`FCppReflectIndexer` — UHT-artefact regex sweep + `IAssetRegistry` asset-graph joiner), one query adapter (`FCppReflectQueryAdapter`), and a third SQLite schema fragment (`MonolithCppReflectSchema` namespace) sharing the same `EngineSource.db`.
 
 ### Lazy bootstrap
 
@@ -572,19 +573,227 @@ Annotations: `readOnlyHint: true`, `destructiveHint: false`, `idempotentHint: tr
 
 ---
 
-## 5. CppReflect Intelligence (Phase 3 — WISHLIST)
+## 5. CppReflect Intelligence (Phase 3a — SHIPPED v0.17.0)
 
-**Planned namespace:** `cppreflect_query` + cpp↔asset edge tables.
+### 5.1 Purpose
 
-**Substrate:** `tree-sitter-unreal-cpp` for header parsing + UHT artefacts (`Intermediate/Build/.../Inc/.../*.generated.h`) for the canonical reflected surface + `IAssetRegistry` for asset cross-references.
+The CppReflect slice answers the two highest-frequency reflection-edge questions an agent asks while navigating an unfamiliar UE codebase:
 
-**Planned action surface (illustrative):**
+- **"What UPROPERTY / UFUNCTION / interface surface does this UCLASS declare?"** — Phase 3a serves this from canonical UHT artefacts, not from the live UClass reflection (`UClass*` reflection is fine for a running editor but unhelpful when an agent is reading a class definition for the first time and wants the *as-declared* surface including specifiers).
+- **"Which Blueprint / asset implementations exist for this UINTERFACE, and what assets reference this C++ class?"** — Phase 3a serves this by joining the UHT-derived class graph against `IAssetRegistry`'s asset-dependency table, surfacing a single deterministic table (`cpp_asset_edges`) that bridges the two graphs.
 
-- `cppreflect_query("get_uclass", class)` — full UPROPERTY / UFUNCTION / interface inventory for a UCLASS.
-- `cppreflect_query("list_uproperties", class)` — paginated UPROPERTY list. SHOULD use cursor pagination.
-- `cppreflect_query("find_interface_impls", interface)` — every UCLASS implementing the given UINTERFACE.
+All five actions are read-only. No tree-sitter dependency, no vendored ThirdParty, no parser.c blob in the release zip. Phase 3a is a deterministic regex sweep over UHT-generated `.gen.cpp` files plus a single `IAssetRegistry` walk.
 
-These tables are the prerequisite substrate for Phase 4's `network_query` and the seven audit actions.
+### 5.2 Substrate
+
+Two substrates, joined at index time:
+
+| Substrate | Mining method | Output |
+|-----------|---------------|--------|
+| UHT artefacts | Regex sweep over `Intermediate/Build/Win64/.../Inc/<Module>/UHT/*.gen.cpp` via `IFileManager::IterateDirectoryRecursively` | Reflected UCLASS / UPROPERTY / UFUNCTION / UINTERFACE inventory + interface-implementation edges |
+| IAssetRegistry | `IAssetRegistry::Get().GetDependencies` for every `/Script/<Module>` package the registry knows about | Asset → C++ class edges, joined by class name |
+
+The UHT artefact root resolves through `UMonolithReflectionIntelSettings::UHTArtefactRoot` (default: auto-discover via `FPaths::ProjectIntermediateDir() / TEXT("Build")`). Engine-plugin reflection is included only when `bIndexEnginePluginReflection = true` (default `false`) — the Leviathan / Monolith focus is project + project-plugin reflection; engine-side surface area dwarfs the project's at ~6 orders of magnitude and floods queries with low-signal hits.
+
+### 5.3 SQLite schema
+
+Six new tables live inside the shared `EngineSource.db` file under the `reflect_` / `cpp_asset_` prefixes so they coexist with the Phase 1 `decision_*` and Phase 2 `git_*` / `risk_*` / `reflect_conditional_gates` tables.
+
+```sql
+CREATE TABLE IF NOT EXISTS reflect_uclasses (
+    class_name       TEXT NOT NULL,
+    module_name      TEXT NOT NULL,
+    parent_class     TEXT,
+    class_specifiers TEXT,                  -- raw specifier list (e.g. "BlueprintType,Blueprintable,Abstract")
+    source_path      TEXT NOT NULL,         -- UHT ModuleRelativePath (see §5.7)
+    source_line      INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (class_name, module_name)
+);
+
+CREATE TABLE IF NOT EXISTS reflect_uproperties (
+    class_name           TEXT NOT NULL,
+    module_name          TEXT NOT NULL,
+    property_name        TEXT NOT NULL,
+    property_type        TEXT NOT NULL,
+    blueprint_visibility TEXT,              -- 'BlueprintReadWrite' | 'BlueprintReadOnly' | '' — Phase 3b populates fully
+    specifiers           TEXT,              -- raw specifier list — Phase 3b populates fully
+    source_path          TEXT NOT NULL,
+    source_line          INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (class_name, module_name, property_name)
+);
+
+CREATE TABLE IF NOT EXISTS reflect_ufunctions (
+    class_name      TEXT NOT NULL,
+    module_name     TEXT NOT NULL,
+    function_name   TEXT NOT NULL,
+    function_flags  INTEGER NOT NULL DEFAULT 0,  -- raw EFunctionFlags bitfield from UHT
+    return_type     TEXT,
+    params_json     TEXT,                          -- compact JSON: [{name,type}, ...]
+    source_path     TEXT NOT NULL,
+    source_line     INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (class_name, module_name, function_name)
+);
+
+CREATE TABLE IF NOT EXISTS reflect_uinterfaces (
+    interface_name   TEXT NOT NULL,
+    module_name      TEXT NOT NULL,
+    source_path      TEXT NOT NULL,
+    source_line      INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (interface_name, module_name)
+);
+
+CREATE TABLE IF NOT EXISTS reflect_uinterface_impls (
+    interface_name   TEXT NOT NULL,
+    impl_class_name  TEXT NOT NULL,
+    impl_module_name TEXT NOT NULL,
+    PRIMARY KEY (interface_name, impl_class_name, impl_module_name)
+);
+
+CREATE TABLE IF NOT EXISTS cpp_asset_edges (
+    cpp_class       TEXT NOT NULL,
+    cpp_module      TEXT NOT NULL,
+    asset_path      TEXT NOT NULL,
+    edge_kind       TEXT NOT NULL,          -- 'package_dep' (Phase 3a coarse) — Phase 3b may add 'subclass_of' / 'native_default'
+    PRIMARY KEY (cpp_class, asset_path)
+);
+
+CREATE INDEX IF NOT EXISTS idx_reflect_uclasses_parent       ON reflect_uclasses(parent_class);
+CREATE INDEX IF NOT EXISTS idx_reflect_uclasses_module       ON reflect_uclasses(module_name);
+CREATE INDEX IF NOT EXISTS idx_reflect_uproperties_class     ON reflect_uproperties(class_name, module_name);
+CREATE INDEX IF NOT EXISTS idx_reflect_ufunctions_class      ON reflect_ufunctions(class_name, module_name);
+CREATE INDEX IF NOT EXISTS idx_reflect_uinterface_impls_face ON reflect_uinterface_impls(interface_name);
+CREATE INDEX IF NOT EXISTS idx_cpp_asset_edges_class         ON cpp_asset_edges(cpp_class);
+CREATE INDEX IF NOT EXISTS idx_cpp_asset_edges_asset         ON cpp_asset_edges(asset_path);
+```
+
+All tables follow Phase 1 wipe-and-rewrite semantics — `Run()` truncates and rewrites each in a single `BEGIN TRANSACTION ... COMMIT` block. DDL canonical source: `Plugins/Monolith/Source/MonolithReflectionIntel/Private/CppReflectSchema.cpp`.
+
+### 5.4 UHT regex patterns
+
+The artefact reader is driven by eight regex patterns derived from real-world `.gen.cpp` inspection. Naming below matches the C++ pattern constants:
+
+| Pattern | Captures | Purpose |
+|---------|----------|---------|
+| `BeginClassPattern` | class name | Anchors the per-class block — every `Z_Construct_UClass_<Name>` call boundary |
+| `ClassParentPattern` | parent class | Pulls the `SuperStruct` / `ClassWithin` assignment line |
+| `ClassSpecifiersPattern` | raw specifier list | Captures the per-class `MetaDataMap` entries used to surface BlueprintType / Blueprintable / Abstract |
+| `PropInfoPattern` | property name, property type, owning class | Walks the `FPropertyParamsBase`-derived emission |
+| `PropMetaPattern` | property name, metadata key, value | Pulls the per-property metadata block (BlueprintVisibility / Category / etc.) — Phase 3a stores the empty string when no match; Phase 3b populates fully |
+| `FuncInfoPattern` | three-capture validator (function name, owning class, params-block start) | Anchors per-function emission; the three-capture form rejects false-positive matches inside templated lambdas |
+| `FuncParamPattern` | param name, param type | Walks the per-function parameter block following a `FuncInfoPattern` match |
+| `InterfaceImplPattern` | interface name, implementing class | Pulls `IMPLEMENTS_INTERFACE` / `UClass::ImplementsInterface` emission lines |
+
+Patterns are constexpr `FRegexPattern` instances; the reader iterates files via `FFileHelper::LoadFileToStringArray` so per-file memory stays bounded.
+
+### 5.5 Action surface
+
+Five actions register under `cppreflect` from `FCppReflectQueryAdapter::RegisterActions`. All five carry `readOnlyHint: true`, `destructiveHint: false`, `idempotentHint: true` on the dispatcher annotations. All five participate in v0.17.0 universal response shaping (`_fields` / `_omit` / `_compact_json`).
+
+#### `cppreflect_query("get_uclass", params)`
+
+Fetch the UHT-derived UCLASS record — parent class, specifiers, source path, line.
+
+| Param | Type | EMonolithParamKind | Required | Default | Notes |
+|-------|------|---------------------|----------|---------|-------|
+| `class_name` | string | `Other` | yes | — | Bare class name. Module ambiguity resolved via the optional `module_name` filter. |
+| `module_name` | string | `Other` | no | `""` | Disambiguates classes that share a name across modules. |
+
+**Response:** `{ "uclass": <row-or-null> }` — row includes `class_name`, `module_name`, `parent_class`, `class_specifiers`, `source_path`, `source_line`.
+
+#### `cppreflect_query("list_uproperties", params)`
+
+Enumerate the UPROPERTY surface for a UCLASS. Cursor-paginated.
+
+| Param | Type | EMonolithParamKind | Required | Default | Notes |
+|-------|------|---------------------|----------|---------|-------|
+| `class_name` | string | `Other` | yes | — | Bare class name. |
+| `module_name` | string | `Other` | no | `""` | Optional disambiguator. |
+| `limit` | integer | `Other` | no | `50` | Hard cap `200`. |
+| `cursor` | string | `Other` | no | `""` | Opaque base64+JSON cursor. |
+
+**Response:** `{ "properties": [ { "property_name", "property_type", "blueprint_visibility", "specifiers", "source_path", "source_line" } ], "total_estimate": N, "next_cursor": "<opaque>" }`. `blueprint_visibility` and `specifiers` are empty strings in Phase 3a — see §5.7.
+
+#### `cppreflect_query("list_ufunctions", params)`
+
+Enumerate the UFUNCTION surface for a UCLASS. Cursor-paginated.
+
+| Param | Type | EMonolithParamKind | Required | Default | Notes |
+|-------|------|---------------------|----------|---------|-------|
+| `class_name` | string | `Other` | yes | — | Bare class name. |
+| `module_name` | string | `Other` | no | `""` | Optional disambiguator. |
+| `limit` | integer | `Other` | no | `50` | Hard cap `200`. |
+| `cursor` | string | `Other` | no | `""` | Opaque base64+JSON cursor. |
+
+**Response:** `{ "functions": [ { "function_name", "function_flags", "return_type", "params_json", "source_path", "source_line" } ], "total_estimate": N, "next_cursor": "<opaque>" }`. `function_flags` is the raw `EFunctionFlags` bitfield as emitted by UHT — callers translate to symbolic names if needed.
+
+#### `cppreflect_query("find_interface_impls", params)`
+
+List every UCLASS that implements the given UINTERFACE.
+
+| Param | Type | EMonolithParamKind | Required | Default |
+|-------|------|---------------------|----------|---------|
+| `interface_name` | string | `Other` | yes | — |
+| `limit` | integer | `Other` | no | `100` |
+| `cursor` | string | `Other` | no | `""` |
+
+**Response:** `{ "interface_name": "<name>", "implementations": [ { "impl_class_name", "impl_module_name" } ], "total_estimate": N, "next_cursor": "<opaque>" }`. Blueprint implementations are NOT in this set — `reflect_uinterface_impls` is C++ only. Use the asset graph (`cpp_asset_edges`) for the BP side.
+
+#### `cppreflect_query("find_class_specifier", params)`
+
+Find every UCLASS carrying a given specifier (`BlueprintType`, `Blueprintable`, `Abstract`, `Deprecated`, etc.) — substring match against `reflect_uclasses.class_specifiers`. Cursor-paginated.
+
+| Param | Type | EMonolithParamKind | Required | Default | Notes |
+|-------|------|---------------------|----------|---------|-------|
+| `specifier` | string | `Other` | yes | — | Substring match — `"BlueprintType"` matches both `BlueprintType` and `MinimalAPI,BlueprintType,...`. |
+| `module_filter` | string | `Other` | no | `""` | Optional module-name substring. |
+| `limit` | integer | `Other` | no | `100` | Hard cap `500`. |
+| `cursor` | string | `Other` | no | `""` | Opaque base64+JSON cursor. |
+
+**Response:** `{ "classes": [ { "class_name", "module_name", "parent_class", "class_specifiers", "source_path", "source_line" } ], "total_estimate": N, "next_cursor": "<opaque>" }`.
+
+### 5.6 Bootstrap pattern
+
+Lazy on first call — `FCppReflectQueryAdapter::GetRawDB` checks for `reflect_uclasses` and triggers `FMonolithReflectionIntelModule::RunCppReflectIndexerOnce` on absence. The indexer opens a brief ReadWrite handle, ensures the six tables, writes rows, closes; the adapter reopens ReadOnly. `FCoreUObjectDelegates::ReloadCompleteDelegate` is bound at `StartupModule` (shared with the Phase 1 + Phase 2 hot-reload refresh) so UBT-driven hot-reload re-runs the indexer automatically.
+
+Both the indexer's ReadWrite handle and the adapter's ReadOnly handle open `EngineSource.db` with `PRAGMA journal_mode=DELETE` — the WAL-silent-fail trap from `Docs/references/UE57Gotchas.md` applies. Concurrent readers coexist safely; the brief ReadWrite overlap during initial indexing is non-contentious.
+
+### 5.7 Known limitations
+
+These shape the caller contract — agents querying the surface must treat the four fields below as Phase 3a-coarse:
+
+- **`source_path` is UHT's ModuleRelativePath**, not the canonical project-relative path the Phase 1+2 tables use. UHT emits paths as `<Module>/<Relative>` with forward slashes; mapping to `Source/<Module>/<Relative>` is the caller's job for now. The mapping is unambiguous within a single module but the schema stores UHT's form verbatim for traceability.
+- **`source_line` is `0` everywhere.** UHT's `.gen.cpp` output does NOT carry source line numbers — UHT discards the original-header line during code generation. Anyone needing per-line precision pairs Phase 3a with a `source_query("search_source", "<symbol>")` round-trip; the source-indexer carries the real line.
+- **`cpp_asset_edges.edge_kind` is coarse.** Phase 3a populates one edge per `(asset_path, cpp_class)` pair where the asset's own class belongs to a `/Script/<Module>` package the asset depends on. The edge is `'package_dep'` — coarser than "this asset's parent class is `cpp_class`" or "this asset's CDO references `cpp_class`". Phase 3b may add `'subclass_of'` / `'native_default'` once tree-sitter lands.
+- **`reflect_uproperties.blueprint_visibility` and `.specifiers` are empty strings.** Phase 3a's `PropMetaPattern` reads the per-property metadata block but the canonicalisation into BlueprintReadWrite / BlueprintReadOnly / specifier lists is deferred to Phase 3b. Callers needing exact per-property visibility must round-trip through `blueprint_query("get_cdo_properties")` against a live UClass.
+
+### 5.8 Test coverage
+
+Four automation tests under `Monolith.ReflectionIntel.CppReflect.*` (`EditorContext | EngineFilter` flags):
+
+| Test | Asserts |
+|------|---------|
+| `CppReflectSchemaBootstrap` | Empty-artefact-root `Run()` succeeds; all 6 Phase 3a tables exist after the call. |
+| `UClassFixtureExtraction` | `sample.gen.cpp.fixture` produces expected `reflect_uclasses` row count + parent-class linkage. |
+| `InterfaceImplResolution` | `IMPLEMENTS_INTERFACE` lines in fixture produce expected `reflect_uinterface_impls` rows; `find_interface_impls` round-trips them. |
+| `AssetGraphJoin` | Fixture asset-registry stub with two `/Script/<Module>` package dependencies produces 2 `cpp_asset_edges` rows. |
+
+Fixture corpus under `Source/MonolithReflectionIntel/Private/Tests/Fixtures/CppReflectCorpus/` (`sample.gen.cpp.fixture` + a minimal asset-registry stub). Disposable test DBs at `FPaths::AutomationTransientDir()`; the real `EngineSource.db` is never touched.
+
+Run via `editor_query("run_automation_tests", "Monolith.ReflectionIntel.CppReflect")`.
+
+---
+
+## 5b. CppReflect Intelligence Phase 3b — Native Tag Tracking (WISHLIST)
+
+Phase 3b would add native gameplay-tag declaration tracking on top of the Phase 3a substrate:
+
+- **2 new SQLite tables:**
+  - `reflect_native_tag_decls` — every `UE_DEFINE_GAMEPLAY_TAG_*` / `UE_DEFINE_GAMEPLAY_TAG_COMMENT` declaration site (tag name, file, line, comment).
+  - `reflect_native_tag_externs` — every `UE_DECLARE_GAMEPLAY_TAG_EXTERN` consumption site (tag name, file, line).
+- **1 new action:** `cppreflect_query("list_native_tags", params)` — query the cross-reference, filter by tag-name substring, paginated.
+- **Phase 3b would also backfill** `reflect_uproperties.blueprint_visibility` / `.specifiers` (today empty in Phase 3a) and upgrade `cpp_asset_edges.edge_kind` to differentiate `subclass_of` / `native_default` from the current coarse `package_dep`.
+
+**Deferral rationale.** Tree-sitter integration on Windows requires vendoring `tree-sitter-cpp` (parser.c is ~1.1M lines after grammar generation) into `Plugins/Monolith/Source/ThirdParty/`. The release-zip footprint cost is ~50MB — material against the current Monolith release-zip baseline (~12MB) and a non-trivial fraction of a Steam-build .pak budget. Phase 3a's UHT + IAssetRegistry substrate already serves "reflected surface" and "asset ↔ C++ class" queries without parser.c; native-tag tracking is the one workflow that genuinely needs source-level parsing (UHT does not emit native-tag metadata). The cost / benefit ratio favours deferring until either (a) a separate workflow justifies the parser dependency or (b) UE 5.8+ exposes native-tag declaration sites through a reflection-friendly API.
 
 ---
 
@@ -592,7 +801,7 @@ These tables are the prerequisite substrate for Phase 4's `network_query` and th
 
 **Planned namespace:** `network_query` + seven audit actions across `material_query` / `niagara_query` / `animation_query` / `source_query` + `pipeline_query("release_readiness")` + `pipeline_query("pr_review")` composers.
 
-**Substrate:** Phases 1+2+3 composed — decision corpus + risk scores + reflection edges.
+**Substrate:** Phases 1 + 2 + 3a composed — decision corpus + risk scores + reflection edges. Phase 3b's native-tag tables would extend the substrate further if it ships.
 
 **Planned action surface (illustrative):**
 
@@ -600,8 +809,8 @@ These tables are the prerequisite substrate for Phase 4's `network_query` and th
 - `material_query("audit_orphan_materials", path_prefix)` — materials with no usage edges in the asset graph.
 - `niagara_query("audit_orphan_emitters", path_prefix)` — emitters with no system parents.
 - `animation_query("audit_thread_safety", anim_bp)` — AnimBP math nodes touched from `BlueprintThreadSafeUpdateAnimation`.
-- `pipeline_query("pr_review", changed_files[])` — composer bundling `risk_query("get_hotspot_score")` + `risk_query("get_cochange_pairs")` + `decision_query` lookups + `source_query("audit_module_dep_reality")` into a single PR-review payload. **Deferred to Phase 4** per the Phase 2 design spec — composer-side validation needs the cppreflect tables from Phase 3 to ground type-impact predictions.
-- `pipeline_query("release_readiness")` — bundles all audits + Phase 1-3 reads into a single release-gate payload.
+- `pipeline_query("pr_review", changed_files[])` — composer bundling `risk_query("get_hotspot_score")` + `risk_query("get_cochange_pairs")` + `decision_query` lookups + `source_query("audit_module_dep_reality")` + `cppreflect_query("get_uclass" / "list_uproperties" / "list_ufunctions")` into a single PR-review payload. **Deferred to Phase 4** — composer-side validation now has the Phase 3a cppreflect tables available to ground type-impact predictions; the remaining gate is the per-domain audit-action design (`material_query("audit_orphan_materials")` et al.).
+- `pipeline_query("release_readiness")` — bundles all audits + Phase 1 / 2 / 3a reads into a single release-gate payload.
 
 ---
 
@@ -612,15 +821,17 @@ These tables are the prerequisite substrate for Phase 4's `network_query` and th
 | Deps | Type |
 |------|------|
 | `Core`, `CoreUObject`, `Engine` | `PublicDependencyModuleNames` |
-| `MonolithCore`, `SQLiteCore`, `DeveloperSettings`, `Json`, `JsonUtilities`, `Projects` | `PrivateDependencyModuleNames` |
+| `MonolithCore`, `SQLiteCore`, `DeveloperSettings`, `Json`, `JsonUtilities`, `Projects`, `AssetRegistry` | `PrivateDependencyModuleNames` |
 
 `DeveloperSettings` is its own module (NOT part of `Engine`) — required for the `UDeveloperSettings`-derived `UMonolithReflectionIntelSettings`. Documented in `.claude/rules/scoped/cpp-code.md` § Module Dependencies; LNK2019 trap if omitted.
 
-**Build.cs unchanged from Phase 1 → Phase 2.** Phase 2 adds git-log subprocess invocation (which uses `FPlatformProcess::CreateProc` from `Core`, already linked) and regex sweeps (`FRegexPattern` from `Core`). The module-dep audit's resolver reuses the existing `Core`/`CoreUObject` reflection surface. No new module deps required.
+**Build.cs unchanged from Phase 1 → Phase 2.** Phase 2 adds git-log subprocess invocation (which uses `FPlatformProcess::CreateProc` from `Core`, already linked) and regex sweeps (`FRegexPattern` from `Core`). The module-dep audit's resolver reuses the existing `Core`/`CoreUObject` reflection surface. No new module deps required for Phase 2.
 
-**No dependency on `MonolithSource`** — both adapters open their own ReadOnly handles on `EngineSource.db` rather than sharing the source subsystem's in-memory handle. The Phase 2 module-dep audit reads the source-indexer's existing symbol tables but opens its own ReadOnly handle for the same reason as Phase 1 (no `GetRawDatabase()` accessor on `FMonolithSourceDatabase` as of v0.17.0).
+**Phase 3a adds one dep: `AssetRegistry`.** The Phase 3a cppreflect indexer joins the UHT class graph against `IAssetRegistry::Get().GetDependencies` to populate `cpp_asset_edges`. The UHT artefact reader itself uses only `Core` (`FRegexPattern`, `FFileHelper`, `IFileManager`) — no new dep needed there. `AssetRegistry` is the only Phase 3a addition to `PrivateDependencyModuleNames`.
 
-No conditional-gate `WITH_*` macros — the module loads unconditionally and contributes 11 actions (5 `decision` + 5 `risk` + 1 `source` audit) to every install.
+**No dependency on `MonolithSource`** — all three adapters open their own ReadOnly handles on `EngineSource.db` rather than sharing the source subsystem's in-memory handle. The Phase 2 module-dep audit and Phase 3a cppreflect indexer read the source-indexer's existing symbol tables but open their own ReadOnly handles for the same reason as Phase 1 (no `GetRawDatabase()` accessor on `FMonolithSourceDatabase` as of v0.17.0).
+
+No conditional-gate `WITH_*` macros — the module loads unconditionally and contributes 16 actions (5 `decision` + 5 `risk` + 1 `source` audit + 5 `cppreflect`) to every install.
 
 ---
 
@@ -639,6 +850,8 @@ No conditional-gate `WITH_*` macros — the module loads unconditionally and con
 | `MaxCoChangeWindowCommits` | `50` | Risk | Maximum commit history window per repo to walk for co-change pair detection. Clamped `[10, 500]`. Larger windows produce more pair density at the cost of indexer runtime. |
 | `MaxCommitFileCount` | `50` | Risk | Per-commit file-touch cap. Commits touching more than this many files contribute zero co-change pairs (suppresses tree-wide refactor / initial-import noise). Clamped `[5, 500]`. |
 | `GitMiningNoiseFilter` | `["Saved/*", "Intermediate/*", "Binaries/*", "*.uasset", "*.umap"]` | Risk | File-pattern blacklist applied to git-log output before pair / churn aggregation. Patterns are glob-style; an entry matches any file whose project-relative path matches the glob. |
+| `bIndexEnginePluginReflection` | `false` | CppReflect | Include engine-plugin UHT artefacts in the Phase 3a sweep. Default `false` keeps Phase 3a scoped to project + project-plugin reflection — engine-side surface area floods low-signal hits. Setting `true` walks every UHT artefact directory under the engine, multiplying index time and DB size. |
+| `UHTArtefactRoot` | `""` (auto-discover) | CppReflect | Override the UHT artefact root. Empty string resolves to `FPaths::ProjectIntermediateDir() / TEXT("Build")` and walks every `Win64/.../Inc/<Module>/UHT/` subtree. Set explicitly only when running against a non-standard intermediate layout (CI mirrors, packaged-only builds with a separated `Intermediate/`). |
 
 `UMonolithReflectionIntelSettings::Get()` returns the cached CDO — cheap, allocation-free.
 
@@ -650,8 +863,9 @@ No conditional-gate `WITH_*` macros — the module loads unconditionally and con
 
 - **Phase 1 indexer (`FDecisionRecordIndexer::Run`)** runs on whatever thread invoked `FMonolithReflectionIntelModule::RunDecisionIndexerOnce`. In practice that is the game thread (first-call adapter path) or whichever thread fired `FCoreUObjectDelegates::ReloadCompleteDelegate` (Live Coding fires this on the game thread). The indexer is single-threaded by construction; SQLite ops use a single `FSQLiteDatabase` handle that lives only for the duration of `Run`.
 - **Phase 2 indexers (`FGitChurnIndexer`, `FGitCoChangeIndexer`, `FConditionalGateIndexer`)** are scheduled on background threads via `FRunnableThread` after first-call detection — `MonolithReflectionIntelModule.cpp` posts the work to a background runnable and the calling action returns immediately if the table is missing. **However:** the lazy-bootstrap subprocess that fires `git log` during first-ever-call indexing currently runs on the game thread inline. This is a documented trade-off — first-call latency on a fresh install (~200ms on Leviathan-scale repos) is acceptable for the simpler control flow. Subsequent reindex invocations run fully on the background thread.
-- **Adapter handlers (`FDecisionQueryAdapter::*`, `FRiskQueryAdapter::*`, `FModuleDepRealityAdapter::*`)** run on the game thread under `FMonolithToolRegistry::ExecuteAction`. All eleven handlers are pure read paths against cached ReadOnly handles — no mutation, no async work, no `ParallelFor`.
-- The cached ReadOnly `FSQLiteDatabase*` in each adapter's `GetRawDB` is file-scope static. Phase 1+2 adapter usage is game-thread-only, so the caches are not lock-protected. If the adapter surface ever fans out to background threads, add an `FCriticalSection` around each cache check/replace.
+- **Phase 3a indexer (`FCppReflectIndexer::Run`)** runs on a background thread during the indexer pass — UHT artefact discovery + regex sweep + `IAssetRegistry::GetDependencies` join all happen off the game thread. The brief ReadWrite SQLite handle that wipes-and-rewrites the six Phase 3a tables follows the same `BEGIN TRANSACTION ... COMMIT` discipline as Phases 1 + 2. `IAssetRegistry::Get()` is thread-safe for the read API used (`GetDependencies`); module loading is verified done before the indexer kicks off.
+- **Adapter handlers (`FDecisionQueryAdapter::*`, `FRiskQueryAdapter::*`, `FModuleDepRealityAdapter::*`, `FCppReflectQueryAdapter::*`)** run on the game thread under `FMonolithToolRegistry::ExecuteAction`. All sixteen handlers are pure read paths against cached ReadOnly handles — no mutation, no async work, no `ParallelFor`.
+- The cached ReadOnly `FSQLiteDatabase*` in each adapter's `GetRawDB` is file-scope static. Phase 1 / 2 / 3a adapter usage is game-thread-only, so the caches are not lock-protected. If the adapter surface ever fans out to background threads, add an `FCriticalSection` around each cache check/replace.
 - No render-thread work. No `UPROPERTY(Replicated)`. No `Server`/`Client`/`NetMulticast` UFUNCTIONs. Editor-only by design.
 
 ---
@@ -659,7 +873,7 @@ No conditional-gate `WITH_*` macros — the module loads unconditionally and con
 ## 10. Cross-References
 
 - **Parent spec:** [`SPEC_CORE.md`](../SPEC_CORE.md) — see §3 Module Reference and §12 Action Count Summary
-- **MCP reference:** `Docs/references/MCP.md` — `decision_query` row + `risk_query` row + `source_query("audit_module_dep_reality")` entry
+- **MCP reference:** `Docs/references/MCP.md` — `decision_query` row + `risk_query` row + `cppreflect_query` row + `source_query("audit_module_dep_reality")` entry
 - **C++ conventions:** `.claude/rules/scoped/cpp-code.md` — module dep gotchas (`DeveloperSettings`, `FindFilesRecursive` 6th-param, SQLite WAL trap)
 - **API verification log:** `Docs/references/UE57Gotchas.md`
 - **Bug class motivating the module-dep audit:** the `UPROPERTY` referencing a foreign-module type without that module being in `Build.cs` — surfaces as a confusing LNK2019 against UHT-generated `Z_Construct_*_NoRegister` symbols.
