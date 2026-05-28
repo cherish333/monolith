@@ -51,6 +51,15 @@ public:
 	static bool RunDecisionIndexerOnce(FString& OutStatus);
 
 	/**
+	 * Phase 2 (v0.17.0) — run the risk indexer suite (FGitCoChangeIndexer +
+	 * FHotspotScorer + FConditionalGateIndexer) once on demand. Invoked
+	 * lazily by `risk_query` action handlers when `risk_hotspot_scores` is
+	 * absent, and bound to FCoreUObjectDelegates::ReloadCompleteDelegate for
+	 * hot-reload refresh. Wipes + rewrites each Phase 2 table in one pass.
+	 */
+	static bool RunRiskIndexersOnce(FString& OutStatus);
+
+	/**
 	 * Lazily open (or return) the cached ReadOnly handle on EngineSource.db.
 	 * Owned by this module instance (TUniquePtr); torn down in ShutdownModule
 	 * so the SQLite handle + file lock release cleanly on editor exit / Live
@@ -67,6 +76,11 @@ public:
 	bool HasAttemptedBootstrap() const { return bDecisionBootstrapAttempted; }
 	void MarkBootstrapAttempted()       { bDecisionBootstrapAttempted = true; }
 
+	/** Phase 2 risk-bootstrap-latch accessors. Mirror the Phase 1 decision
+	 *  pattern so module reload re-arms the risk indexer too. */
+	bool HasAttemptedRiskBootstrap() const { return bRiskBootstrapAttempted; }
+	void MarkRiskBootstrapAttempted()       { bRiskBootstrapAttempted = true; }
+
 	/** Close + drop the cached query DB handle. Called from the lazy-bootstrap
 	 *  path in FDecisionQueryAdapter::GetRawDB before invoking the indexer
 	 *  (which opens its own RW handle on the same file). */
@@ -74,6 +88,8 @@ public:
 
 private:
 	void RegisterDecisionActions();
+	void RegisterRiskActions();
+	void RegisterSourceAuditActions();
 	void OnReloadComplete(EReloadCompleteReason Reason);
 
 	FDelegateHandle ReloadCompleteHandle;
@@ -89,4 +105,9 @@ private:
 	 *  Re-arms automatically on module reload because the module instance is
 	 *  reconstructed on hot-reload. */
 	bool bDecisionBootstrapAttempted = false;
+
+	/** Phase 2 risk-bootstrap latch. Re-armed on module reload like the
+	 *  decision latch. The risk indexer is more expensive (spawns `git log`)
+	 *  so we ALSO guard against second-call mid-session via this flag. */
+	bool bRiskBootstrapAttempted = false;
 };

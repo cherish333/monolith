@@ -14,8 +14,9 @@
 
 /**
  * Editor Preferences > Plugins > Monolith Reflection Intel.
- * Phase 1 surfaces the markdown decision-mining toggles. Phase 2 risk-mining
- * toggles ship stubbed `(WISHLIST)` so the schema is stable from day one.
+ * Phase 1 surfaces the markdown decision-mining toggles.
+ * Phase 2 (v0.17.0) adds risk-mining toggles — git co-change window, noise
+ * filter, mass-commit file-count gate.
  */
 UCLASS(config=MonolithSettings, defaultconfig, meta=(DisplayName="Monolith Reflection Intel"))
 class MONOLITHREFLECTIONINTEL_API UMonolithReflectionIntelSettings : public UDeveloperSettings
@@ -49,16 +50,31 @@ public:
 	TArray<FString> DecisionMarkdownRoots;
 
 	// ----------------------------------------------------------------
-	// Risk Mining (Phase 2 — v0.18 — WISHLIST stubs, currently no-op)
+	// Risk Mining (Phase 2 — v0.17.0)
 	// ----------------------------------------------------------------
 
-	/** (WISHLIST) Phase 2 — enable git co-change mining. Default true once Phase 2 lands. */
+	/** Enable git co-change + hotspot + conditional-gate mining at index time. */
 	UPROPERTY(EditAnywhere, config, Category="Risk")
-	bool bEnableGitCoChangeMining = false;
+	bool bEnableGitCoChangeMining = true;
 
-	/** (WISHLIST) Phase 2 — co-change window size in commits. */
-	UPROPERTY(EditAnywhere, config, Category="Risk", meta=(ClampMin="10", ClampMax="500"))
-	int32 MaxCoChangeWindowCommits = 50;
+	/** Co-change window size in commits — passed to `git log --max-count=N`. */
+	UPROPERTY(EditAnywhere, config, Category="Risk", meta=(ClampMin="10", ClampMax="2000"))
+	int32 MaxCoChangeWindowCommits = 200;
+
+	/**
+	 * File-path substrings whose hits are excluded from co-change pair
+	 * counting. Default suppresses CHANGELOG / .uplugin / plan-doc thrash that
+	 * otherwise dominates Monolith's nested-git history.
+	 */
+	UPROPERTY(EditAnywhere, config, Category="Risk")
+	TArray<FString> GitMiningNoiseFilter;
+
+	/**
+	 * Skip commits touching more than N files. Mass-format / mass-rename /
+	 * release commits otherwise poison co-change weights. Design-spec Q6.
+	 */
+	UPROPERTY(EditAnywhere, config, Category="Risk", meta=(ClampMin="5", ClampMax="200"))
+	int32 MaxCommitFileCount = 20;
 
 	// ----------------------------------------------------------------
 	// UDeveloperSettings overrides

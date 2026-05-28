@@ -17,6 +17,11 @@
 #include "MonolithReflectionIntelModule.h"
 #include "Decision/FDecisionRecordIndexer.h"
 #include "Decision/FDecisionQueryAdapter.h"
+#include "Risk/FGitCoChangeIndexer.h"
+#include "Risk/FHotspotScorer.h"
+#include "Risk/FConditionalGateIndexer.h"
+#include "Risk/FRiskQueryAdapter.h"
+#include "SourceAudit/FModuleDepRealityAdapter.h"
 #include "MonolithReflectionIntelSettings.h"
 
 #include "HAL/PlatformFileManager.h"
@@ -45,12 +50,16 @@ namespace
 
 void FMonolithReflectionIntelModule::StartupModule()
 {
-	// Explicit re-arm of the lazy-bootstrap latch on every module load. A fresh
-	// module instance always starts with the latch cleared so that Live Coding
-	// reloads re-attempt bootstrap if a prior attempt failed.
+	// Explicit re-arm of the lazy-bootstrap latches on every module load. A
+	// fresh module instance always starts with both latches cleared so that
+	// Live Coding reloads re-attempt bootstrap if a prior attempt failed.
 	bDecisionBootstrapAttempted = false;
+	bRiskBootstrapAttempted = false;
 
 	RegisterDecisionActions();
+	// Phase 2 (v0.17.0) — risk_query namespace + source_query audit action.
+	RegisterRiskActions();
+	RegisterSourceAuditActions();
 
 	// Bind hot-reload hook so the decision corpus refreshes after Live Coding /
 	// UBT rebuilds. The handler opens the DB ReadWrite only briefly (the
@@ -63,15 +72,14 @@ void FMonolithReflectionIntelModule::StartupModule()
 
 	// NO eager bootstrap on StartupModule — the source subsystem's WAL handle
 	// may already be open on EngineSource.db at this point and our writer would
-	// race. Decision-indexer bootstrap is LAZY:
-	//   - Driven on first decision_query call (adapter checks table presence)
-	//   - Driven on hot-reload via OnReloadComplete
-	// First-run users see "decision tables empty" from list_decisions until
-	// they either edit a source file (Live Coding) or call list_decisions
-	// after running source.trigger_reindex (which fires ReloadCompleteDelegate).
+	// race. All indexer bootstrap is LAZY:
+	//   - Decision: driven on first decision_query call.
+	//   - Risk:     driven on first risk_query call.
+	//   - All:      driven on hot-reload via OnReloadComplete.
 
 	UE_LOG(LogMonolithReflectionIntel, Log,
-		TEXT("Monolith — ReflectionIntel module loaded (decision_query: 5 actions)"));
+		TEXT("Monolith — ReflectionIntel module loaded (decision_query: 5 actions, "
+		     "risk_query: 5 actions, source_query: +1 audit action)"));
 }
 
 void FMonolithReflectionIntelModule::ShutdownModule()
@@ -91,6 +99,14 @@ void FMonolithReflectionIntelModule::ShutdownModule()
 	ResetCachedQueryDb();
 
 	FMonolithToolRegistry::Get().UnregisterNamespace(TEXT("decision"));
+	// Phase 2 — risk_query is fully owned by this module so unregister wholesale.
+	FMonolithToolRegistry::Get().UnregisterNamespace(TEXT("risk"));
+	// NOTE: we do NOT unregister the `source` namespace here — MonolithSource
+	// owns the lion's share of source_query actions. Our one audit action
+	// would also be unregistered with the namespace-wide call. The risk is
+	// minimal: Phase 2 ships with MonolithSource loaded before us (the
+	// `MonolithCore` dep chain enforces order) so shutdown-time leaks are
+	// bounded to a single action entry per process exit.
 }
 
 FSQLiteDatabase* FMonolithReflectionIntelModule::GetOrOpenCachedQueryDb()
@@ -146,12 +162,29 @@ void FMonolithReflectionIntelModule::RegisterDecisionActions()
 	FDecisionQueryAdapter::RegisterActions(FMonolithToolRegistry::Get());
 }
 
+void FMonolithReflectionIntelModule::RegisterRiskActions()
+{
+	FRiskQueryAdapter::RegisterActions(FMonolithToolRegistry::Get());
+}
+
+void FMonolithReflectionIntelModule::RegisterSourceAuditActions()
+{
+	FModuleDepRealityAdapter::RegisterActions(FMonolithToolRegistry::Get());
+}
+
 void FMonolithReflectionIntelModule::OnReloadComplete(EReloadCompleteReason /*Reason*/)
 {
 	// Fire-and-log; never block the reload signal. Failure to refresh the
 	// decision corpus is non-fatal — query handlers still return last-known data.
-	FString Status;
-	RunDecisionIndexerOnce(Status);
+	FString DecisionStatus;
+	RunDecisionIndexerOnce(DecisionStatus);
+
+	// Phase 2 — also re-run risk indexers on hot-reload. The risk indexer is
+	// more expensive (spawns `git log`), but a Live Coding rebuild typically
+	// reflects code changes that warrant re-scoring complexity AND co-change
+	// activity tends to spike around the commits the reload reflects.
+	FString RiskStatus;
+	RunRiskIndexersOnce(RiskStatus);
 }
 
 bool FMonolithReflectionIntelModule::RunDecisionIndexerOnce(FString& OutStatus)
@@ -208,6 +241,92 @@ bool FMonolithReflectionIntelModule::RunDecisionIndexerOnce(FString& OutStatus)
 	const bool bOk = Indexer.Run(Db, Roots, OutStatus);
 	Db.Close();
 	return bOk;
+}
+
+bool FMonolithReflectionIntelModule::RunRiskIndexersOnce(FString& OutStatus)
+{
+	const UMonolithReflectionIntelSettings* Settings = UMonolithReflectionIntelSettings::Get();
+	if (!Settings || !Settings->bEnableGitCoChangeMining)
+	{
+		OutStatus = TEXT("RunRiskIndexersOnce: skipped (bEnableGitCoChangeMining=false)");
+		return false;
+	}
+
+	const FString DbPath = GetEngineSourceDbPathStatic();
+	IPlatformFile& Pf = FPlatformFileManager::Get().GetPlatformFile();
+	if (!Pf.FileExists(*DbPath))
+	{
+		OutStatus = FString::Printf(
+			TEXT("RunRiskIndexersOnce: EngineSource.db not present at '%s' — bootstrap with source.trigger_reindex"),
+			*DbPath);
+		UE_LOG(LogMonolithReflectionIntel, Verbose, TEXT("%s"), *OutStatus);
+		return false;
+	}
+
+	FSQLiteDatabase Db;
+	if (!Db.Open(*DbPath, ESQLiteDatabaseOpenMode::ReadWrite))
+	{
+		OutStatus = FString::Printf(TEXT("RunRiskIndexersOnce: failed to open '%s'"), *DbPath);
+		UE_LOG(LogMonolithReflectionIntel, Warning, TEXT("%s"), *OutStatus);
+		return false;
+	}
+
+	// Same DELETE-journal discipline as the decision indexer — opening a
+	// second RW handle on a SQLite DB the source subsystem may have left in
+	// WAL mode is the documented silent-failure pattern. Cite the project rule.
+	if (!Db.Execute(TEXT("PRAGMA journal_mode=DELETE;")))
+	{
+		UE_LOG(LogMonolithReflectionIntel, Warning,
+			TEXT("RunRiskIndexersOnce: PRAGMA journal_mode=DELETE failed on '%s' (continuing)"),
+			*DbPath);
+	}
+
+	// Resolve git repo roots. Phase 2 mines NESTED git repos only — the
+	// project's outer working tree is tracked by Diversion, not git, and lacks
+	// a `.git` directory; FGitCoChangeIndexer silently skips it. Standard
+	// nested repos under Leviathan today: Monolith plugin, Resonance plugin.
+	// Future-siblings (`MonolithSteamBridge`, `MonolithISX`, etc.) live under
+	// `Plugins/` so we add them by default — the indexer skips any without
+	// `.git/`.
+	TArray<FString> GitRoots;
+	GitRoots.Add(TEXT("Plugins/Monolith"));
+	GitRoots.Add(TEXT("Plugins/Resonance"));
+	GitRoots.Add(TEXT("Plugins/MonolithSteamBridge"));
+	GitRoots.Add(TEXT("Plugins/MonolithISX"));
+	GitRoots.Add(TEXT("Plugins/MonolithSubstance"));
+	GitRoots.Add(TEXT("Plugins/MonolithClaudeDesignBridge"));
+
+	const int32 MaxWindow = Settings->MaxCoChangeWindowCommits > 0
+		? Settings->MaxCoChangeWindowCommits : 200;
+	const int32 MaxFiles = Settings->MaxCommitFileCount > 0
+		? Settings->MaxCommitFileCount : 20;
+
+	FString GitStatus;
+	FGitCoChangeIndexer GitIndexer;
+	const bool bGitOk = GitIndexer.Run(Db, GitRoots, MaxWindow,
+		Settings->GitMiningNoiseFilter, MaxFiles, GitStatus);
+
+	FString HotspotStatus;
+	FHotspotScorer HotspotScorer;
+	const bool bHotspotOk = HotspotScorer.Run(Db, HotspotStatus);
+
+	// Conditional gates — scan project Source/ + Plugins/<plugin>/Source/.
+	// We do NOT scan the Plugins/Monolith folder root — only its Source/ —
+	// because `.uplugin` / `.uproject` files are not C++.
+	TArray<FString> GateRoots;
+	GateRoots.Add(TEXT("Source"));
+	GateRoots.Add(TEXT("Plugins"));
+	FString GateStatus;
+	FConditionalGateIndexer GateIndexer;
+	const bool bGateOk = GateIndexer.Run(Db, GateRoots, GateStatus);
+
+	Db.Close();
+
+	OutStatus = FString::Printf(
+		TEXT("RunRiskIndexersOnce: git=%s | hotspot=%s | gates=%s"),
+		*GitStatus, *HotspotStatus, *GateStatus);
+	UE_LOG(LogMonolithReflectionIntel, Log, TEXT("%s"), *OutStatus);
+	return bGitOk && bHotspotOk && bGateOk;
 }
 
 #undef LOCTEXT_NAMESPACE
