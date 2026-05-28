@@ -34,8 +34,10 @@
 #include "MonolithReflectionIntelSettings.h"
 
 #include "HAL/PlatformFileManager.h"
+#include "HAL/PlatformTime.h"
 #include "Interfaces/IPluginManager.h"
 #include "Misc/Paths.h"
+#include "Modules/ModuleManager.h"
 #include "MonolithToolRegistry.h"
 #include "SQLiteDatabase.h"
 #include "UObject/UObjectGlobals.h"
@@ -54,6 +56,17 @@ namespace
 			return Plugin->GetBaseDir() / TEXT("Saved") / TEXT("EngineSource.db");
 		}
 		return FPaths::ProjectPluginsDir() / TEXT("Monolith") / TEXT("Saved") / TEXT("EngineSource.db");
+	}
+
+	/**
+	 * Resolve the live FMonolithReflectionIntelModule instance from inside a
+	 * static runner. Returns nullptr if the module is unloaded — caller MUST
+	 * tolerate this (the runners log + fall through to their best-effort path).
+	 */
+	FMonolithReflectionIntelModule* GetReflectionIntelModulePtr()
+	{
+		return FModuleManager::GetModulePtr<FMonolithReflectionIntelModule>(
+			TEXT("MonolithReflectionIntel"));
 	}
 }
 
@@ -252,10 +265,44 @@ void FMonolithReflectionIntelModule::OnReloadComplete(EReloadCompleteReason /*Re
 
 bool FMonolithReflectionIntelModule::RunDecisionIndexerOnce(FString& OutStatus)
 {
+	// Latch policy (post-fix): the adapter sets bDecisionBootstrapAttempted = true
+	// BEFORE calling this runner. On any TRANSIENT failure path below we CLEAR
+	// the latch so the next adapter call retries — see header comment block on
+	// bDecisionBootstrapAttempted. On full success we leave it set (true).
+	// A retry-throttle (DecisionLastFailureTime + RetryCooldownSeconds) prevents
+	// log spam when the DB is wedged across a burst of adapter calls.
+	FMonolithReflectionIntelModule* Self = GetReflectionIntelModulePtr();
+
+	// Throttle: if a prior call failed within the cooldown window, fast-return
+	// without re-opening SQLite. We MUST clear the latch even during throttle
+	// because the adapter sets it before calling us — leaving it set during
+	// throttle would cause the NEXT adapter call (post-cooldown) to skip the
+	// bootstrap entirely (HasAttempted=true → adapter returns DB without
+	// retrying), re-creating the very latch-on-failure bug we are fixing.
+	if (Self && Self->DecisionLastFailureTime > 0.0)
+	{
+		const double Now = FPlatformTime::Seconds();
+		const double Elapsed = Now - Self->DecisionLastFailureTime;
+		if (Elapsed < RetryCooldownSeconds)
+		{
+			OutStatus = FString::Printf(
+				TEXT("RunDecisionIndexerOnce: throttled (last failure %.1fs ago, cooldown %.1fs)"),
+				Elapsed, RetryCooldownSeconds);
+			Self->bDecisionBootstrapAttempted = false;
+			return false;
+		}
+		// Cooldown expired — fall through and try again. Reset the timer so a
+		// further failure starts a fresh window.
+		Self->DecisionLastFailureTime = 0.0;
+	}
+
 	const UMonolithReflectionIntelSettings* Settings = UMonolithReflectionIntelSettings::Get();
 	if (!Settings || !Settings->bEnableDecisionMining)
 	{
 		OutStatus = TEXT("RunDecisionIndexerOnce: skipped (bEnableDecisionMining=false)");
+		// Settings-disable is NOT a transient failure — it's a deliberate user
+		// choice. Leave the latch set (the adapter set it) so we don't re-evaluate
+		// the no-op every call. Do NOT mark LastFailureTime.
 		return false;
 	}
 
@@ -267,14 +314,31 @@ bool FMonolithReflectionIntelModule::RunDecisionIndexerOnce(FString& OutStatus)
 			TEXT("RunDecisionIndexerOnce: EngineSource.db not present at '%s' — bootstrap with source.trigger_reindex"),
 			*DbPath);
 		UE_LOG(LogMonolithReflectionIntel, Verbose, TEXT("%s"), *OutStatus);
+		// File-missing is TRANSIENT — source.trigger_reindex may create it later.
+		// Clear the latch so the next adapter call retries.
+		if (Self)
+		{
+			Self->bDecisionBootstrapAttempted = false;
+			Self->DecisionLastFailureTime = FPlatformTime::Seconds();
+		}
 		return false;
 	}
 
 	FSQLiteDatabase Db;
 	if (!Db.Open(*DbPath, ESQLiteDatabaseOpenMode::ReadWrite))
 	{
-		OutStatus = FString::Printf(TEXT("RunDecisionIndexerOnce: failed to open '%s'"), *DbPath);
+		OutStatus = FString::Printf(
+			TEXT("RunDecisionIndexerOnce: RW open failed on '%s' (likely WAL+ReadOnly conflict; will retry on next call after MonolithSource normalizes file state)"),
+			*DbPath);
 		UE_LOG(LogMonolithReflectionIntel, Warning, TEXT("%s"), *OutStatus);
+		// RW open failure is TRANSIENT — MonolithSource's writer may flip the
+		// DB to a state we can open later. Clear the latch so a follow-up call
+		// (post-cooldown) retries.
+		if (Self)
+		{
+			Self->bDecisionBootstrapAttempted = false;
+			Self->DecisionLastFailureTime = FPlatformTime::Seconds();
+		}
 		return false;
 	}
 
@@ -284,12 +348,13 @@ bool FMonolithReflectionIntelModule::RunDecisionIndexerOnce(FString& OutStatus)
 	// in .claude/rules/scoped/cpp-code.md § "Known Pitfalls" (WAL + ReadOnly
 	// silent failure on Windows). Mirrors the pattern at
 	// MonolithSourceDatabase.cpp:124. Tolerate failure (warn + continue) per
-	// project convention — other indexers also tolerate this PRAGMA result.
+	// project convention — the indexer may still complete its work.
 	if (!Db.Execute(TEXT("PRAGMA journal_mode=DELETE;")))
 	{
 		UE_LOG(LogMonolithReflectionIntel, Warning,
 			TEXT("RunDecisionIndexerOnce: PRAGMA journal_mode=DELETE failed on '%s' (continuing)"),
 			*DbPath);
+		// Do NOT bail and do NOT mark failure — the indexer may still succeed.
 	}
 
 	TArray<FString> Roots = Settings->DecisionMarkdownRoots;
@@ -303,15 +368,54 @@ bool FMonolithReflectionIntelModule::RunDecisionIndexerOnce(FString& OutStatus)
 	FDecisionRecordIndexer Indexer;
 	const bool bOk = Indexer.Run(Db, Roots, OutStatus);
 	Db.Close();
+
+	if (Self)
+	{
+		if (bOk)
+		{
+			// Success — latch stays set, clear any prior failure timestamp.
+			Self->bDecisionBootstrapAttempted = true;
+			Self->DecisionLastFailureTime = 0.0;
+		}
+		else
+		{
+			UE_LOG(LogMonolithReflectionIntel, Warning,
+				TEXT("RunDecisionIndexerOnce: indexer reported failure; will retry after cooldown — %s"),
+				*OutStatus);
+			Self->bDecisionBootstrapAttempted = false;
+			Self->DecisionLastFailureTime = FPlatformTime::Seconds();
+		}
+	}
 	return bOk;
 }
 
 bool FMonolithReflectionIntelModule::RunRiskIndexersOnce(FString& OutStatus)
 {
+	// See RunDecisionIndexerOnce for latch-policy rationale. Same shape applied
+	// across all four Phase-N runners.
+	FMonolithReflectionIntelModule* Self = GetReflectionIntelModulePtr();
+
+	if (Self && Self->RiskLastFailureTime > 0.0)
+	{
+		const double Now = FPlatformTime::Seconds();
+		const double Elapsed = Now - Self->RiskLastFailureTime;
+		if (Elapsed < RetryCooldownSeconds)
+		{
+			OutStatus = FString::Printf(
+				TEXT("RunRiskIndexersOnce: throttled (last failure %.1fs ago, cooldown %.1fs)"),
+				Elapsed, RetryCooldownSeconds);
+			// Clear latch during throttle — see decision-runner comment for why.
+			Self->bRiskBootstrapAttempted = false;
+			return false;
+		}
+		Self->RiskLastFailureTime = 0.0;
+	}
+
 	const UMonolithReflectionIntelSettings* Settings = UMonolithReflectionIntelSettings::Get();
 	if (!Settings || !Settings->bEnableGitCoChangeMining)
 	{
 		OutStatus = TEXT("RunRiskIndexersOnce: skipped (bEnableGitCoChangeMining=false)");
+		// Settings-disable: not transient, leave latch set, no LastFailureTime.
 		return false;
 	}
 
@@ -323,14 +427,26 @@ bool FMonolithReflectionIntelModule::RunRiskIndexersOnce(FString& OutStatus)
 			TEXT("RunRiskIndexersOnce: EngineSource.db not present at '%s' — bootstrap with source.trigger_reindex"),
 			*DbPath);
 		UE_LOG(LogMonolithReflectionIntel, Verbose, TEXT("%s"), *OutStatus);
+		if (Self)
+		{
+			Self->bRiskBootstrapAttempted = false;
+			Self->RiskLastFailureTime = FPlatformTime::Seconds();
+		}
 		return false;
 	}
 
 	FSQLiteDatabase Db;
 	if (!Db.Open(*DbPath, ESQLiteDatabaseOpenMode::ReadWrite))
 	{
-		OutStatus = FString::Printf(TEXT("RunRiskIndexersOnce: failed to open '%s'"), *DbPath);
+		OutStatus = FString::Printf(
+			TEXT("RunRiskIndexersOnce: RW open failed on '%s' (likely WAL+ReadOnly conflict; will retry on next call after MonolithSource normalizes file state)"),
+			*DbPath);
 		UE_LOG(LogMonolithReflectionIntel, Warning, TEXT("%s"), *OutStatus);
+		if (Self)
+		{
+			Self->bRiskBootstrapAttempted = false;
+			Self->RiskLastFailureTime = FPlatformTime::Seconds();
+		}
 		return false;
 	}
 
@@ -342,6 +458,7 @@ bool FMonolithReflectionIntelModule::RunRiskIndexersOnce(FString& OutStatus)
 		UE_LOG(LogMonolithReflectionIntel, Warning,
 			TEXT("RunRiskIndexersOnce: PRAGMA journal_mode=DELETE failed on '%s' (continuing)"),
 			*DbPath);
+		// Continue — the indexer suite may still succeed.
 	}
 
 	// Resolve git repo roots. Phase 2 mines NESTED git repos only — the
@@ -389,7 +506,24 @@ bool FMonolithReflectionIntelModule::RunRiskIndexersOnce(FString& OutStatus)
 		TEXT("RunRiskIndexersOnce: git=%s | hotspot=%s | gates=%s"),
 		*GitStatus, *HotspotStatus, *GateStatus);
 	UE_LOG(LogMonolithReflectionIntel, Log, TEXT("%s"), *OutStatus);
-	return bGitOk && bHotspotOk && bGateOk;
+
+	const bool bAllOk = bGitOk && bHotspotOk && bGateOk;
+	if (Self)
+	{
+		if (bAllOk)
+		{
+			Self->bRiskBootstrapAttempted = true;
+			Self->RiskLastFailureTime = 0.0;
+		}
+		else
+		{
+			UE_LOG(LogMonolithReflectionIntel, Warning,
+				TEXT("RunRiskIndexersOnce: at least one sub-indexer failed; will retry after cooldown"));
+			Self->bRiskBootstrapAttempted = false;
+			Self->RiskLastFailureTime = FPlatformTime::Seconds();
+		}
+	}
+	return bAllOk;
 }
 
 bool FMonolithReflectionIntelModule::RunCppReflectIndexersOnce(FString& OutStatus)
@@ -397,6 +531,25 @@ bool FMonolithReflectionIntelModule::RunCppReflectIndexersOnce(FString& OutStatu
 	// No settings gate in Phase 3a — the UHT-artefact reader is cheap when no
 	// artefacts exist on disk (graceful "0 rows" return). Phase 3b will wrap
 	// the source-driven tree-sitter pass behind bIndexEnginePluginReflection.
+
+	// See RunDecisionIndexerOnce for latch-policy rationale.
+	FMonolithReflectionIntelModule* Self = GetReflectionIntelModulePtr();
+
+	if (Self && Self->CppReflectLastFailureTime > 0.0)
+	{
+		const double Now = FPlatformTime::Seconds();
+		const double Elapsed = Now - Self->CppReflectLastFailureTime;
+		if (Elapsed < RetryCooldownSeconds)
+		{
+			OutStatus = FString::Printf(
+				TEXT("RunCppReflectIndexersOnce: throttled (last failure %.1fs ago, cooldown %.1fs)"),
+				Elapsed, RetryCooldownSeconds);
+			// Clear latch during throttle — see decision-runner comment for why.
+			Self->bCppReflectBootstrapAttempted = false;
+			return false;
+		}
+		Self->CppReflectLastFailureTime = 0.0;
+	}
 
 	const FString DbPath = GetEngineSourceDbPathStatic();
 	IPlatformFile& Pf = FPlatformFileManager::Get().GetPlatformFile();
@@ -406,14 +559,26 @@ bool FMonolithReflectionIntelModule::RunCppReflectIndexersOnce(FString& OutStatu
 			TEXT("RunCppReflectIndexersOnce: EngineSource.db not present at '%s' — bootstrap with source.trigger_reindex"),
 			*DbPath);
 		UE_LOG(LogMonolithReflectionIntel, Verbose, TEXT("%s"), *OutStatus);
+		if (Self)
+		{
+			Self->bCppReflectBootstrapAttempted = false;
+			Self->CppReflectLastFailureTime = FPlatformTime::Seconds();
+		}
 		return false;
 	}
 
 	FSQLiteDatabase Db;
 	if (!Db.Open(*DbPath, ESQLiteDatabaseOpenMode::ReadWrite))
 	{
-		OutStatus = FString::Printf(TEXT("RunCppReflectIndexersOnce: failed to open '%s'"), *DbPath);
+		OutStatus = FString::Printf(
+			TEXT("RunCppReflectIndexersOnce: RW open failed on '%s' (likely WAL+ReadOnly conflict; will retry on next call after MonolithSource normalizes file state)"),
+			*DbPath);
 		UE_LOG(LogMonolithReflectionIntel, Warning, TEXT("%s"), *OutStatus);
+		if (Self)
+		{
+			Self->bCppReflectBootstrapAttempted = false;
+			Self->CppReflectLastFailureTime = FPlatformTime::Seconds();
+		}
 		return false;
 	}
 
@@ -425,6 +590,7 @@ bool FMonolithReflectionIntelModule::RunCppReflectIndexersOnce(FString& OutStatu
 		UE_LOG(LogMonolithReflectionIntel, Warning,
 			TEXT("RunCppReflectIndexersOnce: PRAGMA journal_mode=DELETE failed on '%s' (continuing)"),
 			*DbPath);
+		// Continue — the indexers may still succeed.
 	}
 
 	// Resolve UHT artefact roots from settings. Empty = auto-resolve to
@@ -459,7 +625,24 @@ bool FMonolithReflectionIntelModule::RunCppReflectIndexersOnce(FString& OutStatu
 		TEXT("RunCppReflectIndexersOnce: uht=%s | asset_graph=%s"),
 		*UhtStatus, *JoinerStatus);
 	UE_LOG(LogMonolithReflectionIntel, Log, TEXT("%s"), *OutStatus);
-	return bUhtOk && bJoinerOk;
+
+	const bool bAllOk = bUhtOk && bJoinerOk;
+	if (Self)
+	{
+		if (bAllOk)
+		{
+			Self->bCppReflectBootstrapAttempted = true;
+			Self->CppReflectLastFailureTime = 0.0;
+		}
+		else
+		{
+			UE_LOG(LogMonolithReflectionIntel, Warning,
+				TEXT("RunCppReflectIndexersOnce: at least one sub-indexer failed; will retry after cooldown"));
+			Self->bCppReflectBootstrapAttempted = false;
+			Self->CppReflectLastFailureTime = FPlatformTime::Seconds();
+		}
+	}
+	return bAllOk;
 }
 
 bool FMonolithReflectionIntelModule::RunNetworkIndexerOnce(FString& OutStatus)
@@ -471,6 +654,25 @@ bool FMonolithReflectionIntelModule::RunNetworkIndexerOnce(FString& OutStatus)
 	// runs the indexer here so the action surface stays consistent across
 	// build configurations.
 
+	// See RunDecisionIndexerOnce for latch-policy rationale.
+	FMonolithReflectionIntelModule* Self = GetReflectionIntelModulePtr();
+
+	if (Self && Self->NetworkLastFailureTime > 0.0)
+	{
+		const double Now = FPlatformTime::Seconds();
+		const double Elapsed = Now - Self->NetworkLastFailureTime;
+		if (Elapsed < RetryCooldownSeconds)
+		{
+			OutStatus = FString::Printf(
+				TEXT("RunNetworkIndexerOnce: throttled (last failure %.1fs ago, cooldown %.1fs)"),
+				Elapsed, RetryCooldownSeconds);
+			// Clear latch during throttle — see decision-runner comment for why.
+			Self->bNetworkBootstrapAttempted = false;
+			return false;
+		}
+		Self->NetworkLastFailureTime = 0.0;
+	}
+
 	const FString DbPath = GetEngineSourceDbPathStatic();
 	IPlatformFile& Pf = FPlatformFileManager::Get().GetPlatformFile();
 	if (!Pf.FileExists(*DbPath))
@@ -479,14 +681,26 @@ bool FMonolithReflectionIntelModule::RunNetworkIndexerOnce(FString& OutStatus)
 			TEXT("RunNetworkIndexerOnce: EngineSource.db not present at '%s' — bootstrap with source.trigger_reindex"),
 			*DbPath);
 		UE_LOG(LogMonolithReflectionIntel, Verbose, TEXT("%s"), *OutStatus);
+		if (Self)
+		{
+			Self->bNetworkBootstrapAttempted = false;
+			Self->NetworkLastFailureTime = FPlatformTime::Seconds();
+		}
 		return false;
 	}
 
 	FSQLiteDatabase Db;
 	if (!Db.Open(*DbPath, ESQLiteDatabaseOpenMode::ReadWrite))
 	{
-		OutStatus = FString::Printf(TEXT("RunNetworkIndexerOnce: failed to open '%s'"), *DbPath);
+		OutStatus = FString::Printf(
+			TEXT("RunNetworkIndexerOnce: RW open failed on '%s' (likely WAL+ReadOnly conflict; will retry on next call after MonolithSource normalizes file state)"),
+			*DbPath);
 		UE_LOG(LogMonolithReflectionIntel, Warning, TEXT("%s"), *OutStatus);
+		if (Self)
+		{
+			Self->bNetworkBootstrapAttempted = false;
+			Self->NetworkLastFailureTime = FPlatformTime::Seconds();
+		}
 		return false;
 	}
 
@@ -498,6 +712,7 @@ bool FMonolithReflectionIntelModule::RunNetworkIndexerOnce(FString& OutStatus)
 		UE_LOG(LogMonolithReflectionIntel, Warning,
 			TEXT("RunNetworkIndexerOnce: PRAGMA journal_mode=DELETE failed on '%s' (continuing)"),
 			*DbPath);
+		// Continue — the indexer may still succeed.
 	}
 
 	// Resolve UHT artefact roots from settings — same shape as the Phase 3a
@@ -518,6 +733,23 @@ bool FMonolithReflectionIntelModule::RunNetworkIndexerOnce(FString& OutStatus)
 	FNetworkRepIndexer Indexer;
 	const bool bOk = Indexer.Run(Db, ArtefactRoots, bIncludeEnginePlugins, OutStatus);
 	Db.Close();
+
+	if (Self)
+	{
+		if (bOk)
+		{
+			Self->bNetworkBootstrapAttempted = true;
+			Self->NetworkLastFailureTime = 0.0;
+		}
+		else
+		{
+			UE_LOG(LogMonolithReflectionIntel, Warning,
+				TEXT("RunNetworkIndexerOnce: indexer reported failure; will retry after cooldown — %s"),
+				*OutStatus);
+			Self->bNetworkBootstrapAttempted = false;
+			Self->NetworkLastFailureTime = FPlatformTime::Seconds();
+		}
+	}
 	return bOk;
 }
 

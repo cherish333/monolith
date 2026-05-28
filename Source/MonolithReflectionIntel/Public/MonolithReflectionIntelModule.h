@@ -147,24 +147,51 @@ private:
 
 	/** Replaces the prior function-static `bAttemptedBootstrap` in the adapter.
 	 *  Re-arms automatically on module reload because the module instance is
-	 *  reconstructed on hot-reload. */
+	 *  reconstructed on hot-reload.
+	 *
+	 *  IMPORTANT: the adapter sets this to TRUE before calling the runner. The
+	 *  runner CLEARS it on transient failure (file-missing, RW-open-failed,
+	 *  indexer-failed) so subsequent adapter calls retry. The runner re-sets
+	 *  it on success (no-op since the adapter already set it). Net effect:
+	 *  the latch is only canonically true after at least one successful
+	 *  bootstrap. */
 	bool bDecisionBootstrapAttempted = false;
 
 	/** Phase 2 risk-bootstrap latch. Re-armed on module reload like the
 	 *  decision latch. The risk indexer is more expensive (spawns `git log`)
-	 *  so we ALSO guard against second-call mid-session via this flag. */
+	 *  so we ALSO guard against second-call mid-session via this flag.
+	 *  Cleared on failure inside RunRiskIndexersOnce — see decision-latch
+	 *  comment above. */
 	bool bRiskBootstrapAttempted = false;
 
 	/** Phase 3a cppreflect-bootstrap latch. Re-armed on module reload. The
 	 *  UHT-artefact sweep can scan thousands of files; this guard prevents
 	 *  duplicate work when multiple cppreflect_query actions race the lazy
-	 *  bootstrap path in the same session. */
+	 *  bootstrap path in the same session. Cleared on failure inside
+	 *  RunCppReflectIndexersOnce. */
 	bool bCppReflectBootstrapAttempted = false;
 
 	/** Phase 4a network-bootstrap latch. Re-armed on module reload. The
 	 *  network indexer sweeps the same UHT corpus Phase 3a does; the per-
 	 *  action lazy bootstrap path in FNetworkQueryAdapter is fronted by this
 	 *  latch to avoid duplicate work when multiple network_query actions
-	 *  race the bootstrap. */
+	 *  race the bootstrap. Cleared on failure inside RunNetworkIndexerOnce. */
 	bool bNetworkBootstrapAttempted = false;
+
+	/** Per-phase retry-throttle timestamps (FPlatformTime::Seconds() basis).
+	 *  When a runner fails it records the failure time; subsequent calls
+	 *  within RetryCooldownSeconds fast-return without re-opening SQLite
+	 *  (prevents `disk I/O error` log spam when the DB is wedged). Reset to
+	 *  0.0 on first success so the next failure-cycle starts a fresh cooldown. */
+	double DecisionLastFailureTime    = 0.0;
+	double RiskLastFailureTime        = 0.0;
+	double CppReflectLastFailureTime  = 0.0;
+	double NetworkLastFailureTime     = 0.0;
+
+	/** Cooldown window for the retry-throttle. 5 seconds chosen so a burst of
+	 *  back-to-back adapter calls (one per query action in a session ramp-up)
+	 *  doesn't spam 28+ failed SQLite opens — but a follow-up call a few
+	 *  seconds later (e.g., after source.trigger_reindex completes and the
+	 *  user retries) is still served promptly. */
+	static constexpr double RetryCooldownSeconds = 5.0;
 };

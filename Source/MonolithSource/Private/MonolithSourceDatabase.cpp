@@ -120,8 +120,21 @@ bool FMonolithSourceDatabase::Open(const FString& DbPath)
 		return false;
 	}
 
-	// Force DELETE journal mode — WAL breaks ReadOnly on Windows
-	Database->Execute(TEXT("PRAGMA journal_mode=DELETE;"));
+	// Force DELETE journal mode on EVERY open. Cross-process readers
+	// (e.g. MonolithReflectionIntel's cached ReadOnly handle) cannot replay
+	// a -wal/-shm sidecar on Windows and fail with SQLITE_IOERR
+	// ("disk I/O error"). Persisting DELETE mode eliminates the WAL files
+	// entirely; defensive idempotency on every open so we re-flip even if
+	// a prior session crashed mid-WAL or another process flipped it back.
+	// See .claude/rules/scoped/cpp-code.md § "Known Pitfalls":
+	// "SQLite WAL + ReadOnly: silent failure on Windows. Open ReadWrite,
+	// force journal_mode=DELETE".
+	if (!Database->Execute(TEXT("PRAGMA journal_mode=DELETE;")))
+	{
+		UE_LOG(LogMonolithSource, Warning,
+			TEXT("Open: PRAGMA journal_mode=DELETE failed on '%s' (continuing — ReadOnly handles may hit SQLITE_IOERR)"),
+			*DbPath);
+	}
 
 	UE_LOG(LogMonolithSource, Log, TEXT("Engine source DB opened: %s"), *DbPath);
 	return true;
@@ -899,8 +912,21 @@ bool FMonolithSourceDatabase::OpenForWriting(const FString& DbPath)
 		return false;
 	}
 
-	// Belt-and-suspenders: force DELETE journal mode (WAL breaks ReadOnly on Windows, per lesson learned)
-	Database->Execute(TEXT("PRAGMA journal_mode=DELETE;"));
+	// Force DELETE journal mode on the writer handle. This is the AUTHORITATIVE
+	// flip — once it lands the DB persists in DELETE mode at rest, so the next
+	// MonolithReflectionIntel ReadOnly open succeeds (WAL + cross-process
+	// ReadOnly on Windows = SQLITE_IOERR). Check the return value so we surface
+	// the failure mode that previously presented as silent — Reflection
+	// Intelligence "disk I/O error" x28 with MonolithSource logging clean.
+	// See .claude/rules/scoped/cpp-code.md § "Known Pitfalls":
+	// "SQLite WAL + ReadOnly: silent failure on Windows. Open ReadWrite,
+	// force journal_mode=DELETE".
+	if (!Database->Execute(TEXT("PRAGMA journal_mode=DELETE;")))
+	{
+		UE_LOG(LogMonolithSource, Warning,
+			TEXT("OpenForWriting: PRAGMA journal_mode=DELETE failed on '%s' (continuing — ReadOnly handles may hit SQLITE_IOERR)"),
+			*DbPath);
+	}
 	Database->Execute(TEXT("PRAGMA synchronous=NORMAL;"));
 	Database->Execute(TEXT("PRAGMA cache_size=-64000;"));   // 64 MB page cache
 
