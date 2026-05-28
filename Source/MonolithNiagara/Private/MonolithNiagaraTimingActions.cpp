@@ -6,6 +6,9 @@
 #include "MonolithToolRegistry.h"
 
 #include "NiagaraSystem.h"
+#include "NiagaraEmitter.h"
+#include "NiagaraEmitterHandle.h"
+#include "NiagaraSimulationStageBase.h"
 #include "Editor.h"
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
@@ -91,17 +94,24 @@ void FMonolithNiagaraTimingActions::RegisterActions(FMonolithToolRegistry& Regis
 			.Build());
 
 	Registry.RegisterAction(TEXT("niagara"), TEXT("set_emitter_loop_profile"),
-		TEXT("**Phase 0 stub.** Composite write of EmitterState loop inputs (LoopBehavior, LoopDuration, LoopDelay, LoopCount, bLoopDelayEnabled). Not yet implemented."),
+		TEXT("Composite write of EmitterState module loop inputs (LoopBehavior, LoopDuration, LoopDelay, LoopCount, bLoopDelayEnabled). Dispatches per-field through set_module_input_value against the canonical module_name=\"EmitterState\". Stateful (UNiagaraEmitter) emitters only — stateless (UNiagaraStatelessEmitter) errors with a hint. Non-fatal coherence issues (e.g. loop_count supplied with loop_behavior='Infinite') return a warnings array; the request still succeeds. Provide at least one of the five payload fields."),
 		FMonolithActionHandler::CreateStatic(&HandleSetEmitterLoopProfile),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset"))
+			.Required(TEXT("emitter"), TEXT("string"), TEXT("Emitter handle id/name (same convention as set_module_input_value)"))
+			.Optional(TEXT("loop_behavior"), TEXT("string"), TEXT("ENiagaraLoopBehavior name: 'Once' | 'Multiple' | 'Infinite'"))
+			.Optional(TEXT("loop_duration"), TEXT("number"), TEXT("Loop duration in seconds"))
+			.Optional(TEXT("loop_delay"), TEXT("number"), TEXT("Delay in seconds before each loop (requires loop_delay_enabled=true to apply)"))
+			.Optional(TEXT("loop_count"), TEXT("integer"), TEXT("Number of loops (only meaningful when loop_behavior='Multiple')"))
+			.Optional(TEXT("loop_delay_enabled"), TEXT("bool"), TEXT("Enables the LoopDelay input"))
 			.Build());
 
 	Registry.RegisterAction(TEXT("niagara"), TEXT("get_emitter_timing_summary"),
-		TEXT("**Phase 0 stub.** Aggregated read of emitter timing (loop config, sim stages, particle lifetime bounds). Not yet implemented."),
+		TEXT("Aggregated read of emitter timing: EmitterState loop inputs (behavior/duration/delay/count/delay_enabled), simulation-stage list (name/num_iterations/execute_behavior), and Initialize Particle Lifetime min/max. Returns null for any field that cannot be read (missing module, missing input) — partial data is acceptable. Omit 'emitter' to aggregate across all emitters."),
 		FMonolithActionHandler::CreateStatic(&HandleGetEmitterTimingSummary),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset"))
+			.Optional(TEXT("emitter"), TEXT("string"), TEXT("Emitter handle id/name (omit to aggregate all emitters)"))
 			.Build());
 
 	Registry.RegisterAction(TEXT("niagara"), TEXT("set_sim_stage_iteration_count"),
@@ -323,17 +333,531 @@ FMonolithActionResult FMonolithNiagaraTimingActions::HandleSetRequireCurrentFram
 }
 
 // ============================================================================
-//  Phase 2-4 — stubs (untouched by Phase 1)
+//  Phase 3 — EmitterState routing helpers + composite write + read aggregator
 // ============================================================================
+//
+// Strategy: dispatch through niagara::set_module_input_value (the same registry
+// path Phase 2 uses for sim-stage aliases). The canonical handler at
+// MonolithNiagaraActions.cpp:3506 accepts module_name="EmitterState" through
+// FindModuleNode's name-fallback (MonolithNiagaraActions.cpp:1481 —
+// `N->GetFunctionName() == NodeGuidStr`), so we do NOT need a private
+// FindEmitterStateModule walker. Single source of truth, no duplicated
+// override-pin / type-resolution / DefaultValue-set machinery.
+//
+// Stateless-emitter detection: FNiagaraEmitterHandle stores stateless emitters
+// in a separate StatelessEmitter slot (NiagaraEmitterHandle.h:91 +174),
+// accessible via Handle.GetStatelessEmitter(). The forward-declared return
+// type means a pointer null-check needs no Internal/Stateless/ header include
+// (hazard §7 of the plan — sidestepped).
+//
+
+namespace MonolithNiagaraTimingLocal
+{
+	// EmitterState canonical module name (Q2 of the design spec — accepted risk
+	// of 5.8+ rename, one-line code-change recovery).
+	static const TCHAR* const EmitterStateModuleName = TEXT("EmitterState");
+
+	// Build the JSON envelope set_module_input_value expects:
+	//   { asset_path, emitter, module_name: "EmitterState", input_name, value }
+	// and dispatch via the public registry. Mirrors the Phase 2 sim-stage
+	// alias pattern exactly.
+	static FMonolithActionResult DispatchEmitterStateInput(
+		const FString& SystemPath,
+		const FString& Emitter,
+		const FString& InputName,
+		const TSharedPtr<FJsonValue>& Value)
+	{
+		if (!Value.IsValid())
+			return FMonolithActionResult::Error(TEXT("Internal: emitter-state alias passed null value"));
+
+		TSharedPtr<FJsonObject> Envelope = MakeShared<FJsonObject>();
+		Envelope->SetStringField(TEXT("asset_path"), SystemPath);
+		Envelope->SetStringField(TEXT("emitter"), Emitter);
+		Envelope->SetStringField(TEXT("module_node"), EmitterStateModuleName);
+		Envelope->SetStringField(TEXT("input"), InputName);
+		Envelope->SetField(TEXT("value"), Value);
+
+		return FMonolithToolRegistry::Get().ExecuteAction(
+			TEXT("niagara"), TEXT("set_module_input_value"), Envelope);
+	}
+
+	// Read companion — dispatch get_module_input_value for the EmitterState
+	// module. Returns the inner Result JSON if successful (which carries the
+	// `value` string from the override-pin DefaultValue), or nullptr on miss.
+	// Aggregator policy = partial data acceptable, so the caller should null-
+	// out the field on miss rather than fail the whole action.
+	static TSharedPtr<FJsonObject> DispatchGetEmitterStateInput(
+		const FString& SystemPath,
+		const FString& Emitter,
+		const FString& InputName)
+	{
+		TSharedPtr<FJsonObject> Envelope = MakeShared<FJsonObject>();
+		Envelope->SetStringField(TEXT("asset_path"), SystemPath);
+		Envelope->SetStringField(TEXT("emitter"), Emitter);
+		Envelope->SetStringField(TEXT("module_node"), EmitterStateModuleName);
+		Envelope->SetStringField(TEXT("input"), InputName);
+
+		FMonolithActionResult R = FMonolithToolRegistry::Get().ExecuteAction(
+			TEXT("niagara"), TEXT("get_module_input_value"), Envelope);
+		if (R.bSuccess && R.Result.IsValid())
+		{
+			return R.Result;
+		}
+		return nullptr;
+	}
+
+	// Static-switch write companion — dispatches niagara::set_static_switch_value
+	// for EmitterState's switches ("Loop Behavior", "UseLoopDelay"). Values are
+	// passed as raw strings (the upstream handler accepts enum-name passthrough
+	// for ENiagara_EmitterStateOptions and "true"/"false" for NiagaraBool).
+	static FMonolithActionResult DispatchEmitterStateSwitch(
+		const FString& SystemPath,
+		const FString& Emitter,
+		const FString& SwitchName,
+		const FString& ValueStr)
+	{
+		TSharedPtr<FJsonObject> Envelope = MakeShared<FJsonObject>();
+		Envelope->SetStringField(TEXT("asset_path"), SystemPath);
+		Envelope->SetStringField(TEXT("emitter"), Emitter);
+		Envelope->SetStringField(TEXT("module_node"), EmitterStateModuleName);
+		Envelope->SetStringField(TEXT("input"), SwitchName);
+		Envelope->SetStringField(TEXT("value"), ValueStr);
+
+		return FMonolithToolRegistry::Get().ExecuteAction(
+			TEXT("niagara"), TEXT("set_static_switch_value"), Envelope);
+	}
+
+	// Static-switch read companion — dispatches niagara::get_static_switch_value
+	// for EmitterState's switches. Returns the inner Result JSON or nullptr on miss.
+	static TSharedPtr<FJsonObject> DispatchGetEmitterStateSwitch(
+		const FString& SystemPath,
+		const FString& Emitter,
+		const FString& SwitchName)
+	{
+		TSharedPtr<FJsonObject> Envelope = MakeShared<FJsonObject>();
+		Envelope->SetStringField(TEXT("asset_path"), SystemPath);
+		Envelope->SetStringField(TEXT("emitter"), Emitter);
+		Envelope->SetStringField(TEXT("module_node"), EmitterStateModuleName);
+		Envelope->SetStringField(TEXT("input"), SwitchName);
+
+		FMonolithActionResult R = FMonolithToolRegistry::Get().ExecuteAction(
+			TEXT("niagara"), TEXT("get_static_switch_value"), Envelope);
+		if (R.bSuccess && R.Result.IsValid())
+		{
+			return R.Result;
+		}
+		return nullptr;
+	}
+
+	// Convert a JSON loop_behavior string (Once/Multiple/Infinite, case-insensitive)
+	// to its canonical enum-name form for ImportText. Returns empty on miss.
+	static FString CanonicalizeLoopBehavior(const FString& Input)
+	{
+		const FString Lower = Input.ToLower();
+		if (Lower == TEXT("once"))     return TEXT("Once");
+		if (Lower == TEXT("multiple")) return TEXT("Multiple");
+		if (Lower == TEXT("infinite")) return TEXT("Infinite");
+		return FString();
+	}
+
+	// Pull a string `value` field out of a get_module_input_value response.
+	// HandleGetModuleInputValue (MonolithNiagaraActions.cpp:6991-7022) writes
+	// the override-pin DefaultValue (or "(default)" sentinel) into `value`.
+	static bool TryGetSummaryString(const TSharedPtr<FJsonObject>& InputResp, FString& OutValue)
+	{
+		if (!InputResp.IsValid()) return false;
+		const FString Raw = InputResp->GetStringField(TEXT("value"));
+		if (Raw.IsEmpty() || Raw == TEXT("(default)")) return false;
+		OutValue = Raw;
+		return true;
+	}
+
+	// Same, but as a double (parse helper for numeric inputs).
+	static bool TryGetSummaryDouble(const TSharedPtr<FJsonObject>& InputResp, double& OutValue)
+	{
+		FString S;
+		if (!TryGetSummaryString(InputResp, S)) return false;
+		OutValue = FCString::Atod(*S);
+		return true;
+	}
+
+	static bool TryGetSummaryInt(const TSharedPtr<FJsonObject>& InputResp, int32& OutValue)
+	{
+		FString S;
+		if (!TryGetSummaryString(InputResp, S)) return false;
+		OutValue = FCString::Atoi(*S);
+		return true;
+	}
+
+	static bool TryGetSummaryBool(const TSharedPtr<FJsonObject>& InputResp, bool& OutValue)
+	{
+		FString S;
+		if (!TryGetSummaryString(InputResp, S)) return false;
+		OutValue = S.ToBool();
+		return true;
+	}
+} // namespace MonolithNiagaraTimingLocal
 
 FMonolithActionResult FMonolithNiagaraTimingActions::HandleSetEmitterLoopProfile(const TSharedPtr<FJsonObject>& Params)
 {
-	return FMonolithActionResult::Error(TEXT("not implemented"));
+	using namespace MonolithNiagaraTimingLocal;
+
+	const FString SystemPath = GetAssetPath(Params);
+	if (SystemPath.IsEmpty())
+		return FMonolithActionResult::Error(TEXT("Missing required field: asset_path"));
+
+	FString Emitter;
+	if (!Params->TryGetStringField(TEXT("emitter"), Emitter) || Emitter.IsEmpty())
+		return FMonolithActionResult::Error(TEXT("Missing required field: emitter (string)"));
+
+	// Collect optional payload fields up-front so we can early-reject "no fields supplied".
+	const TSharedPtr<FJsonValue> BehaviorJV       = Params->TryGetField(TEXT("loop_behavior"));
+	const TSharedPtr<FJsonValue> DurationJV       = Params->TryGetField(TEXT("loop_duration"));
+	const TSharedPtr<FJsonValue> DelayJV          = Params->TryGetField(TEXT("loop_delay"));
+	const TSharedPtr<FJsonValue> CountJV          = Params->TryGetField(TEXT("loop_count"));
+	const TSharedPtr<FJsonValue> DelayEnabledJV   = Params->TryGetField(TEXT("loop_delay_enabled"));
+
+	const bool bAnyField =
+		(BehaviorJV.IsValid()     && BehaviorJV->Type     == EJson::String)  ||
+		(DurationJV.IsValid()     && DurationJV->Type     == EJson::Number)  ||
+		(DelayJV.IsValid()        && DelayJV->Type        == EJson::Number)  ||
+		(CountJV.IsValid()        && CountJV->Type        == EJson::Number)  ||
+		(DelayEnabledJV.IsValid() && DelayEnabledJV->Type == EJson::Boolean);
+	if (!bAnyField)
+		return FMonolithActionResult::Error(TEXT("Must supply at least one of: loop_behavior, loop_duration, loop_delay, loop_count, loop_delay_enabled"));
+
+	UNiagaraSystem* System = LoadSystem(SystemPath);
+	if (!System) return FMonolithActionResult::Error(TEXT("Failed to load system"));
+
+	// Resolve emitter handle. Use the public list_emitters / set_module_input_value
+	// emitter-resolution contract (string id or name) — we can't reuse
+	// FMonolithNiagaraActions::FindEmitterHandleIndex (private static), so we
+	// inline a small lookup against the same matchers.
+	int32 EIdx = INDEX_NONE;
+	const TArray<FNiagaraEmitterHandle>& Handles = System->GetEmitterHandles();
+	for (int32 i = 0; i < Handles.Num(); ++i)
+	{
+		const FNiagaraEmitterHandle& H = Handles[i];
+		if (H.GetName().ToString().Equals(Emitter, ESearchCase::IgnoreCase) ||
+			H.GetIdName().ToString().Equals(Emitter, ESearchCase::IgnoreCase) ||
+			H.GetId().ToString().Equals(Emitter, ESearchCase::IgnoreCase))
+		{
+			EIdx = i;
+			break;
+		}
+	}
+	if (EIdx == INDEX_NONE)
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Emitter '%s' not found. Use list_emitters to get valid emitter names or GUIDs."), *Emitter));
+
+	// Stateless emitter early-out — checked via FNiagaraEmitterHandle::GetStatelessEmitter()
+	// (forward-declared return type means no Internal/Stateless/ header needed).
+	if (Handles[EIdx].GetStatelessEmitter() != nullptr)
+	{
+		return FMonolithActionResult::Error(TEXT(
+			"Stateless emitter (UNiagaraStatelessEmitter) detected — use set_stateless_loop_profile "
+			"(Phase 3 — coming in a future release). set_emitter_loop_profile only supports stateful emitters."));
+	}
+
+	TArray<TSharedPtr<FJsonValue>> Warnings;
+	FString BehaviorCanonical;
+
+	if (BehaviorJV.IsValid() && BehaviorJV->Type == EJson::String)
+	{
+		BehaviorCanonical = CanonicalizeLoopBehavior(BehaviorJV->AsString());
+		if (BehaviorCanonical.IsEmpty())
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Unknown loop_behavior '%s'. Valid: 'Once' | 'Multiple' | 'Infinite'"),
+				*BehaviorJV->AsString()));
+		}
+	}
+
+	// Non-fatal coherence warnings (per design Q1 — warnings array, not errors).
+	if (CountJV.IsValid() && CountJV->Type == EJson::Number)
+	{
+		const bool bBehaviorIsMultiple = (BehaviorCanonical == TEXT("Multiple"));
+		if (BehaviorJV.IsValid() && !bBehaviorIsMultiple)
+		{
+			Warnings.Add(MakeShared<FJsonValueString>(FString::Printf(
+				TEXT("loop_count supplied with loop_behavior='%s' — LoopCount only applies when behavior is 'Multiple'."),
+				*BehaviorCanonical)));
+		}
+	}
+	if (DelayJV.IsValid() && DelayJV->Type == EJson::Number)
+	{
+		const bool bDelayExplicitlyEnabled = DelayEnabledJV.IsValid() &&
+			DelayEnabledJV->Type == EJson::Boolean && DelayEnabledJV->AsBool();
+		if (!bDelayExplicitlyEnabled)
+		{
+			Warnings.Add(MakeShared<FJsonValueString>(TEXT(
+				"loop_delay supplied without loop_delay_enabled=true — the LoopDelay input will be set but bLoopDelayEnabled may suppress it.")));
+		}
+	}
+
+	// Dispatch each supplied field through set_module_input_value. Track per-field
+	// failures and surface them as warnings (so a partial write is observable
+	// instead of silently dropped).
+	auto AppendWriteFailure = [&Warnings](const FString& Field, const FMonolithActionResult& R)
+	{
+		Warnings.Add(MakeShared<FJsonValueString>(FString::Printf(
+			TEXT("Failed to write %s: %s"), *Field, *R.ErrorMessage)));
+	};
+
+	// EmitterState exposes its loop topology as two distinct dispatch surfaces
+	// (verified by PIE smoke-test 2026-05-28):
+	//   - "Loop Behavior" + "UseLoopDelay" are STATIC SWITCHES (display-name with space).
+	//   - "Loop Duration" / "Loop Delay" / "Loop Count" are REGULAR MODULE INPUTS
+	//     (display-names with spaces, NOT C++ UPROPERTY names).
+	if (!BehaviorCanonical.IsEmpty())
+	{
+		// "Loop Behavior" static switch -- ENiagara_EmitterStateOptions enum-name passthrough.
+		FMonolithActionResult R = DispatchEmitterStateSwitch(
+			SystemPath, Emitter, TEXT("Loop Behavior"), BehaviorCanonical);
+		if (!R.bSuccess) AppendWriteFailure(TEXT("Loop Behavior"), R);
+	}
+	if (DurationJV.IsValid() && DurationJV->Type == EJson::Number)
+	{
+		// "Loop Duration" module input -- number stringified for the pin DefaultValue.
+		TSharedPtr<FJsonValue> Val = MakeShared<FJsonValueString>(
+			FString::SanitizeFloat(DurationJV->AsNumber()));
+		FMonolithActionResult R = DispatchEmitterStateInput(
+			SystemPath, Emitter, TEXT("Loop Duration"), Val);
+		if (!R.bSuccess) AppendWriteFailure(TEXT("Loop Duration"), R);
+	}
+	if (DelayJV.IsValid() && DelayJV->Type == EJson::Number)
+	{
+		// "Loop Delay" module input.
+		TSharedPtr<FJsonValue> Val = MakeShared<FJsonValueString>(
+			FString::SanitizeFloat(DelayJV->AsNumber()));
+		FMonolithActionResult R = DispatchEmitterStateInput(
+			SystemPath, Emitter, TEXT("Loop Delay"), Val);
+		if (!R.bSuccess) AppendWriteFailure(TEXT("Loop Delay"), R);
+	}
+	if (CountJV.IsValid() && CountJV->Type == EJson::Number)
+	{
+		// "Loop Count" module input -- integer.
+		TSharedPtr<FJsonValue> Val = MakeShared<FJsonValueString>(
+			FString::Printf(TEXT("%d"), static_cast<int32>(CountJV->AsNumber())));
+		FMonolithActionResult R = DispatchEmitterStateInput(
+			SystemPath, Emitter, TEXT("Loop Count"), Val);
+		if (!R.bSuccess) AppendWriteFailure(TEXT("Loop Count"), R);
+	}
+	if (DelayEnabledJV.IsValid() && DelayEnabledJV->Type == EJson::Boolean)
+	{
+		// "UseLoopDelay" static switch -- NiagaraBool, "true"/"false" string.
+		const FString BoolStr = DelayEnabledJV->AsBool() ? TEXT("true") : TEXT("false");
+		FMonolithActionResult R = DispatchEmitterStateSwitch(
+			SystemPath, Emitter, TEXT("UseLoopDelay"), BoolStr);
+		if (!R.bSuccess) AppendWriteFailure(TEXT("UseLoopDelay"), R);
+	}
+
+	TSharedRef<FJsonObject> Resp = MakeShared<FJsonObject>();
+	Resp->SetBoolField(TEXT("success"), true);
+	Resp->SetStringField(TEXT("asset_path"), SystemPath);
+	Resp->SetStringField(TEXT("emitter"), Emitter);
+	Resp->SetArrayField(TEXT("warnings"), Warnings);
+	return SuccessObj(Resp);
 }
 
 FMonolithActionResult FMonolithNiagaraTimingActions::HandleGetEmitterTimingSummary(const TSharedPtr<FJsonObject>& Params)
 {
-	return FMonolithActionResult::Error(TEXT("not implemented"));
+	using namespace MonolithNiagaraTimingLocal;
+
+	const FString SystemPath = GetAssetPath(Params);
+	if (SystemPath.IsEmpty())
+		return FMonolithActionResult::Error(TEXT("Missing required field: asset_path"));
+
+	FString FilterEmitter;
+	Params->TryGetStringField(TEXT("emitter"), FilterEmitter);
+
+	UNiagaraSystem* System = LoadSystem(SystemPath);
+	if (!System) return FMonolithActionResult::Error(TEXT("Failed to load system"));
+
+	const TArray<FNiagaraEmitterHandle>& Handles = System->GetEmitterHandles();
+
+	TArray<TSharedPtr<FJsonValue>> EmittersArr;
+	for (int32 i = 0; i < Handles.Num(); ++i)
+	{
+		const FNiagaraEmitterHandle& H = Handles[i];
+		const FString HandleName = H.GetName().ToString();
+
+		// Filter by name/id if the caller specified an emitter.
+		if (!FilterEmitter.IsEmpty())
+		{
+			const bool bMatch =
+				HandleName.Equals(FilterEmitter, ESearchCase::IgnoreCase) ||
+				H.GetIdName().ToString().Equals(FilterEmitter, ESearchCase::IgnoreCase) ||
+				H.GetId().ToString().Equals(FilterEmitter, ESearchCase::IgnoreCase);
+			if (!bMatch) continue;
+		}
+
+		TSharedRef<FJsonObject> EObj = MakeShared<FJsonObject>();
+		EObj->SetStringField(TEXT("name"), HandleName);
+		EObj->SetNumberField(TEXT("index"), i);
+
+		// Stateless emitters short-circuit — they don't expose EmitterState/sim
+		// stages the same way; aggregator returns a thin object with `stateless=true`
+		// so callers can branch.
+		if (H.GetStatelessEmitter() != nullptr)
+		{
+			EObj->SetBoolField(TEXT("stateless"), true);
+			EmittersArr.Add(MakeShared<FJsonValueObject>(EObj));
+			continue;
+		}
+		EObj->SetBoolField(TEXT("stateless"), false);
+
+		// --- EmitterState loop inputs (read via get_module_input_value) ---
+		auto SetNullableString = [&EObj](const TCHAR* Field, const FString& Val, bool bValid)
+		{
+			if (bValid) EObj->SetStringField(Field, Val);
+			else        EObj->SetField(Field, MakeShared<FJsonValueNull>());
+		};
+		auto SetNullableDouble = [&EObj](const TCHAR* Field, double Val, bool bValid)
+		{
+			if (bValid) EObj->SetNumberField(Field, Val);
+			else        EObj->SetField(Field, MakeShared<FJsonValueNull>());
+		};
+		auto SetNullableInt = [&EObj](const TCHAR* Field, int32 Val, bool bValid)
+		{
+			if (bValid) EObj->SetNumberField(Field, Val);
+			else        EObj->SetField(Field, MakeShared<FJsonValueNull>());
+		};
+		auto SetNullableBool = [&EObj](const TCHAR* Field, bool Val, bool bValid)
+		{
+			if (bValid) EObj->SetBoolField(Field, Val);
+			else        EObj->SetField(Field, MakeShared<FJsonValueNull>());
+		};
+
+		// EmitterState read surfaces match the write surfaces:
+		//   - "Loop Behavior" + "UseLoopDelay" via get_static_switch_value
+		//   - "Loop Duration" / "Loop Delay" / "Loop Count" via get_module_input_value
+		{
+			// "Loop Behavior" static switch -- enum-name string passthrough ("Once"/"Multiple"/"Infinite").
+			FString S;
+			bool bOK = TryGetSummaryString(
+				DispatchGetEmitterStateSwitch(SystemPath, HandleName, TEXT("Loop Behavior")), S);
+			SetNullableString(TEXT("loop_behavior"), S, bOK);
+		}
+		{
+			double D;
+			bool bOK = TryGetSummaryDouble(
+				DispatchGetEmitterStateInput(SystemPath, HandleName, TEXT("Loop Duration")), D);
+			SetNullableDouble(TEXT("loop_duration"), D, bOK);
+		}
+		{
+			double D;
+			bool bOK = TryGetSummaryDouble(
+				DispatchGetEmitterStateInput(SystemPath, HandleName, TEXT("Loop Delay")), D);
+			SetNullableDouble(TEXT("loop_delay"), D, bOK);
+		}
+		{
+			int32 V;
+			bool bOK = TryGetSummaryInt(
+				DispatchGetEmitterStateInput(SystemPath, HandleName, TEXT("Loop Count")), V);
+			SetNullableInt(TEXT("loop_count"), V, bOK);
+		}
+		{
+			// "UseLoopDelay" static switch -- NiagaraBool, "true"/"false" string.
+			bool B;
+			bool bOK = TryGetSummaryBool(
+				DispatchGetEmitterStateSwitch(SystemPath, HandleName, TEXT("UseLoopDelay")), B);
+			SetNullableBool(TEXT("loop_delay_enabled"), B, bOK);
+		}
+
+		// --- Sim-stage list (direct read against the emitter data — no dispatch) ---
+		TArray<TSharedPtr<FJsonValue>> StagesArr;
+		if (FVersionedNiagaraEmitterData* ED = H.GetEmitterData())
+		{
+			const TArray<UNiagaraSimulationStageBase*>& Stages = ED->GetSimulationStages();
+			for (int32 SI = 0; SI < Stages.Num(); ++SI)
+			{
+				UNiagaraSimulationStageBase* Stage = Stages[SI];
+				if (!Stage) continue;
+				TSharedRef<FJsonObject> SO = MakeShared<FJsonObject>();
+				SO->SetNumberField(TEXT("index"), SI);
+				SO->SetStringField(TEXT("name"), Stage->SimulationStageName.ToString());
+				SO->SetBoolField(TEXT("enabled"), Stage->bEnabled != 0);
+
+				if (UNiagaraSimulationStageGeneric* Generic = Cast<UNiagaraSimulationStageGeneric>(Stage))
+				{
+					FString ExecBehaviorStr;
+					switch (Generic->ExecuteBehavior)
+					{
+					case ENiagaraSimStageExecuteBehavior::Always:               ExecBehaviorStr = TEXT("Always"); break;
+					case ENiagaraSimStageExecuteBehavior::OnSimulationReset:    ExecBehaviorStr = TEXT("OnSimulationReset"); break;
+					case ENiagaraSimStageExecuteBehavior::NotOnSimulationReset: ExecBehaviorStr = TEXT("NotOnSimulationReset"); break;
+					default: ExecBehaviorStr = TEXT("Unknown"); break;
+					}
+					SO->SetStringField(TEXT("execute_behavior"), ExecBehaviorStr);
+
+					// NumIterations is FNiagaraParameterBindingWithValue — read via
+					// reflection ExportTextItem_Direct so the binding's serialized
+					// form ("(Value=N)") is what surfaces; that matches the write
+					// envelope the alias produces.
+					if (FProperty* NumIterProp = UNiagaraSimulationStageGeneric::StaticClass()
+						->FindPropertyByName(TEXT("NumIterations")))
+					{
+						FString ValStr;
+						NumIterProp->ExportTextItem_Direct(
+							ValStr,
+							NumIterProp->ContainerPtrToValuePtr<void>(Generic),
+							nullptr, Generic, PPF_None);
+						SO->SetStringField(TEXT("num_iterations"), ValStr);
+					}
+					else
+					{
+						SO->SetField(TEXT("num_iterations"), MakeShared<FJsonValueNull>());
+					}
+				}
+				else
+				{
+					SO->SetField(TEXT("execute_behavior"), MakeShared<FJsonValueNull>());
+					SO->SetField(TEXT("num_iterations"), MakeShared<FJsonValueNull>());
+				}
+				StagesArr.Add(MakeShared<FJsonValueObject>(SO));
+			}
+		}
+		EObj->SetArrayField(TEXT("sim_stages"), StagesArr);
+
+		// --- Initialize Particle / Lifetime min+max (best-effort) ---
+		// Module name canonicalised to "Initialize Particle"; Lifetime is a
+		// UniformRangedFloat dynamic input — when read through get_module_input_value
+		// the override-pin DefaultValue is the serialised form ("Min=X,Max=Y" pattern)
+		// when set as a constant or "(default)" otherwise. We surface the raw string
+		// to avoid speculating on the dynamic-input child-node parse, leaving
+		// Phase 4's set_particle_lifetime free to define the precise contract.
+		{
+			TSharedPtr<FJsonObject> LifetimeResp = nullptr;
+			{
+				TSharedPtr<FJsonObject> Env = MakeShared<FJsonObject>();
+				Env->SetStringField(TEXT("asset_path"), SystemPath);
+				Env->SetStringField(TEXT("emitter"), HandleName);
+				Env->SetStringField(TEXT("module_node"), TEXT("Initialize Particle"));
+				Env->SetStringField(TEXT("input"), TEXT("Lifetime"));
+				FMonolithActionResult R = FMonolithToolRegistry::Get().ExecuteAction(
+					TEXT("niagara"), TEXT("get_module_input_value"), Env);
+				if (R.bSuccess && R.Result.IsValid()) LifetimeResp = R.Result;
+			}
+			FString LifetimeRaw;
+			bool bHasLifetime = TryGetSummaryString(LifetimeResp, LifetimeRaw);
+			SetNullableString(TEXT("lifetime"), LifetimeRaw, bHasLifetime);
+		}
+
+		EmittersArr.Add(MakeShared<FJsonValueObject>(EObj));
+	}
+
+	if (!FilterEmitter.IsEmpty() && EmittersArr.Num() == 0)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Emitter '%s' not found. Use list_emitters to get valid emitter names or GUIDs."),
+			*FilterEmitter));
+	}
+
+	TSharedRef<FJsonObject> Resp = MakeShared<FJsonObject>();
+	Resp->SetStringField(TEXT("asset_path"), SystemPath);
+	Resp->SetArrayField(TEXT("emitters"), EmittersArr);
+	return SuccessObj(Resp);
 }
 
 // ----------------------------------------------------------------------------
