@@ -460,7 +460,7 @@ void FMonolithAIStateTreeActions::RegisterActions(FMonolithToolRegistry& Registr
 		TEXT("Compile a StateTree via UStateTreeEditingSubsystem. MANDATORY after any edits."),
 		FMonolithActionHandler::CreateStatic(&HandleCompileStateTree),
 		FParamSchemaBuilder()
-			.Required(TEXT("asset_path"), TEXT("string"), TEXT("StateTree asset path to compile"))
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("StateTree asset path to compile"))
 			.Build());
 
 	// 49. set_st_schema

@@ -26,6 +26,7 @@
 #include "Decision/FDecisionRecordIndexer.h"
 #include "Decision/DecisionSchema.h"
 #include "MonolithReflectionIntelModule.h"
+#include "MonolithRIMetaTable.h"
 
 #include "HAL/FileManager.h"
 #include "HAL/PlatformFileManager.h"
@@ -166,6 +167,9 @@ bool FDecisionRecordIndexer::Run(FSQLiteDatabase& DB, const TArray<FString>& Mar
 		return false;
 	}
 
+	// Handover doc item #1 — ensure the stale-detection meta table exists.
+	MonolithRIMeta::EnsureMetaTable(DB);
+
 	const FString ProjectRoot = FPaths::ConvertRelativePathToFull(FPaths::ProjectDir());
 
 	// Wipe-and-rewrite — keep the table semantics simple. The corpus is small
@@ -242,6 +246,10 @@ bool FDecisionRecordIndexer::Run(FSQLiteDatabase& DB, const TArray<FString>& Mar
 		TEXT("DecisionIndexer: %d records from %d files (%d errors)"),
 		AllRows.Num(), FilesScanned, FileErrors);
 	UE_LOG(LogMonolithReflectionIntel, Log, TEXT("%s"), *OutStatus);
+
+	// Handover doc item #1 — stamp the decision code-version on success.
+	MonolithRIMeta::WriteStoredVersion(DB, TEXT("decision"),
+		MonolithRIMeta::GetIndexerCodeVersion(TEXT("decision")));
 	return true;
 }
 

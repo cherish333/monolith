@@ -66,7 +66,7 @@ void FMonolithMeshCityBlockActions::RegisterActions(FMonolithToolRegistry& Regis
 			.Optional(TEXT("hospice_mode"), TEXT("boolean"), TEXT("ADA-compliant buildings"), TEXT("false"))
 			.Optional(TEXT("preset"), TEXT("string"), TEXT("Block preset name to load defaults from"))
 			.Optional(TEXT("location"), TEXT("array"), TEXT("World location [x,y,z] for block origin"))
-			.Optional(TEXT("folder"), TEXT("string"), TEXT("Outliner folder"), TEXT("CityBlock"))
+			.OptionalAssetPathWithDefault(TEXT("folder"), TEXT("Outliner folder"), TEXT("CityBlock"))
 			.Optional(TEXT("skip_facades"), TEXT("boolean"), TEXT("Skip facade generation"), TEXT("false"))
 			.Optional(TEXT("skip_roofs"), TEXT("boolean"), TEXT("Skip roof generation"), TEXT("false"))
 			.Optional(TEXT("skip_streets"), TEXT("boolean"), TEXT("Skip street generation"), TEXT("false"))
@@ -107,7 +107,7 @@ void FMonolithMeshCityBlockActions::RegisterActions(FMonolithToolRegistry& Regis
 			.Optional(TEXT("has_sidewalk"), TEXT("boolean"), TEXT("Generate sidewalks"), TEXT("true"))
 			.Optional(TEXT("location"), TEXT("array"), TEXT("World location [x,y,z]"))
 			.Optional(TEXT("label"), TEXT("string"), TEXT("Actor label"))
-			.Optional(TEXT("folder"), TEXT("string"), TEXT("Outliner folder"))
+			.OptionalAssetPath(TEXT("folder"), TEXT("Outliner folder"))
 			.Build());
 
 	// 4. place_street_furniture — lamps, hydrants, benches etc.
@@ -123,7 +123,7 @@ void FMonolithMeshCityBlockActions::RegisterActions(FMonolithToolRegistry& Regis
 			.Optional(TEXT("side"), TEXT("string"), TEXT("left, right, both"), TEXT("both"))
 			.Optional(TEXT("offset"), TEXT("number"), TEXT("Offset from street center in cm"), TEXT("250"))
 			.Optional(TEXT("seed"), TEXT("integer"), TEXT("Random seed"))
-			.Optional(TEXT("folder"), TEXT("string"), TEXT("Outliner folder"))
+			.OptionalAssetPath(TEXT("folder"), TEXT("Outliner folder"))
 			.OptionalAssetPath(TEXT("save_path_prefix"), TEXT("Base asset path for furniture meshes"))
 			.Optional(TEXT("decay"), TEXT("number"), TEXT("Decay level 0-1 — broken/tilted furniture"), TEXT("0"))
 			.Build());

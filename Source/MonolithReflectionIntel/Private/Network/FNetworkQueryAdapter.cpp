@@ -10,6 +10,7 @@
 
 #include "Network/FNetworkQueryAdapter.h"
 #include "MonolithReflectionIntelModule.h"
+#include "MonolithRIMetaTable.h"
 
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
@@ -214,7 +215,27 @@ FSQLiteDatabase* FNetworkQueryAdapter::GetRawDB()
 		const bool bTableExists = bPrepared
 			&& TableCheck.Step() == ESQLitePreparedStatementStepResult::Row;
 		TableCheck.Destroy();
-		if (!bTableExists)
+
+		// Handover doc item #1 — stale detection. Force-rebuild when the table
+		// is absent OR the stamped code-version no longer matches the current
+		// compiled constant.
+		bool bVersionMismatch = false;
+		if (bTableExists)
+		{
+			int32 StoredVersion = 0;
+			const bool bHasStamp = MonolithRIMeta::ReadStoredVersion(
+				*DB, TEXT("network"), StoredVersion);
+			const int32 CurrentVersion = MonolithRIMeta::GetIndexerCodeVersion(TEXT("network"));
+			if (!bHasStamp || StoredVersion != CurrentVersion)
+			{
+				UE_LOG(LogMonolithReflectionIntel, Log,
+					TEXT("network: stale-detection triggered (stored=%d, current=%d) — forcing rebuild"),
+					bHasStamp ? StoredVersion : -1, CurrentVersion);
+				bVersionMismatch = true;
+			}
+		}
+
+		if (!bTableExists || bVersionMismatch)
 		{
 			Module->ResetCachedQueryDb();
 			FString IndexerStatus;

@@ -42,6 +42,82 @@ static void die(const std::string& msg) {
     std::exit(1);
 }
 
+// ============================================================
+// Fuzzy match — ports MonolithFuzzyMatchDetail::ScoreFuzzyMatches
+// (Source/MonolithCore/Private/MonolithFuzzyMatch.cpp). The live version uses
+// Algo::LevenshteinDistance (a UE dependency this standalone tool cannot link),
+// so the distance is reimplemented inline. Score = 1 - dist/maxLen, top-N
+// descending, stable sort on ties — behaviourally identical to the live matcher
+// and the Python port in monolith_offline.py.
+// ============================================================
+
+static int levenshtein(const std::string& a, const std::string& b) {
+    if (a == b) return 0;
+    if (a.empty()) return (int)b.size();
+    if (b.empty()) return (int)a.size();
+
+    std::vector<int> prev(b.size() + 1);
+    for (size_t j = 0; j <= b.size(); ++j) prev[j] = (int)j;
+
+    for (size_t i = 1; i <= a.size(); ++i) {
+        std::vector<int> cur(b.size() + 1);
+        cur[0] = (int)i;
+        for (size_t j = 1; j <= b.size(); ++j) {
+            int cost = (a[i - 1] == b[j - 1]) ? 0 : 1;
+            cur[j] = std::min({prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost});
+        }
+        prev = std::move(cur);
+    }
+    return prev[b.size()];
+}
+
+// Return up to top_n keys ranked by Levenshtein-normalised score descending.
+static std::vector<std::string> fuzzy_top(const std::string& needle,
+                                          const std::vector<std::string>& keys,
+                                          int top_n = 3) {
+    if (needle.empty() || keys.empty() || top_n <= 0) return {};
+
+    std::vector<std::pair<float, std::string>> scored;
+    scored.reserve(keys.size());
+    for (const auto& k : keys) {
+        int dist = levenshtein(needle, k);
+        int max_len = std::max((int)needle.size(), (int)k.size());
+        float worst = max_len > 0 ? (float)max_len : 1.0f;
+        float score = 1.0f - ((float)dist / worst);
+        scored.emplace_back(score, k);
+    }
+    // Stable sort descending by score — preserves insertion order on ties.
+    std::stable_sort(scored.begin(), scored.end(),
+                     [](const auto& x, const auto& y) { return x.first > y.first; });
+
+    std::vector<std::string> out;
+    int take = std::min(top_n, (int)scored.size());
+    out.reserve(take);
+    for (int i = 0; i < take; ++i) out.push_back(scored[i].second);
+    return out;
+}
+
+static std::string did_you_mean_suffix(const std::string& needle,
+                                       const std::vector<std::string>& keys) {
+    auto sugg = fuzzy_top(needle, keys, 3);
+    if (sugg.empty()) return "";
+    std::string s = " did_you_mean: ";
+    for (size_t i = 0; i < sugg.size(); ++i) {
+        if (i > 0) s += ", ";
+        s += sugg[i];
+    }
+    return s;
+}
+
+// Namespaces this OFFLINE tool can serve from on-disk SQLite. The live MCP
+// server exposes ~29; the rest are LIVE-ONLY (require a running editor).
+static const std::vector<std::string>& offline_namespaces() {
+    static const std::vector<std::string> ns = {
+        "source", "project", "monolith", "cppreflect", "network", "decision", "risk"
+    };
+    return ns;
+}
+
 // FTS5 query escaping — mirrors Python escape_fts() and C++ EscapeFTS()
 static std::string escape_fts(const std::string& query) {
     // Replace :: with space (C++ qualified names)
@@ -224,7 +300,14 @@ static Args parse_args(int argc, char* argv[]) {
                   << "  get_stats\n"
                   << "  get_asset_details <asset_path>\n"
                   << "\nMonolith actions:\n"
-                  << "  guide [--section=NAME]   (NAME: onboarding|recipes|decisions|errors|skills_map|gotchas)\n";
+                  << "  guide [--section=NAME]   (NAME: onboarding|recipes|decisions|errors|skills_map|gotchas)\n"
+                  << "\nReflection Intelligence (read EngineSource.db reflect_* tables; offline subset):\n"
+                  << "  cppreflect get_uclass <class_name> [--module=M]\n"
+                  << "  network    list_replicated_classes [--limit=N]\n"
+                  << "  decision   list_decisions [--status=S] [--limit=N]\n"
+                  << "  risk       list_hotspots [--limit=N]\n"
+                  << "\nNOTE: only namespaces backed by on-disk SQLite are servable offline. The live\n"
+                  << "MCP server exposes ~29 namespaces; the rest are LIVE-ONLY (need a running editor).\n";
         std::exit(1);
     }
 
@@ -1001,6 +1084,135 @@ public:
 };
 
 // ============================================================
+// Reflection Intelligence actions (read-only, EngineSource.db reflect_* tables)
+//
+// Mirrors the live RI adapters (Source/MonolithReflectionIntel/Private/
+// {CppReflect,Network,Decision,Risk}/F*QueryAdapter.cpp) but serves only the
+// representative read actions that need nothing but on-disk SQLite. Table and
+// column names verified against the *Schema.cpp CREATE TABLE statements. Stays
+// behaviourally consistent with ReflectionActions in monolith_offline.py.
+// ============================================================
+
+class ReflectionActions {
+    Database db;
+
+public:
+    void open(const std::string& path) { db.open(path); }
+
+    // --- cppreflect get_uclass ---
+    void get_uclass(const Args& args) {
+        if (args.positional.empty()) die("get_uclass requires a class_name argument");
+        std::string class_name = args.positional[0];
+        std::string module = args.opt("module");
+
+        std::string sql = "SELECT class_name, module_name, parent_class, source_path, "
+                          "source_line, flags FROM reflect_uclasses WHERE class_name = ?";
+        std::vector<std::string> params = {class_name};
+        if (!module.empty()) { sql += " AND module_name = ?"; params.push_back(module); }
+
+        auto rows = query(db, sql, params);
+        if (rows.empty()) {
+            json out = {{"success", false}, {"error", "UCLASS not found: " + class_name},
+                        {"note", "Not in reflection index — run UBT then rebuild_reflection_index, or check the name."}};
+            std::cout << out.dump(2) << std::endl;
+            return;
+        }
+
+        auto& r = rows[0];
+        std::string cn = r.get("class_name");
+        std::string mn = r.get("module_name");
+
+        json uclass = {
+            {"class_name", cn}, {"module_name", mn},
+            {"parent_class", r.get("parent_class")},
+            {"source_path", r.get("source_path")},
+            {"source_line", r.get_int("source_line")},
+            {"flags", r.get("flags")},
+        };
+
+        auto props = query(db,
+            "SELECT property_name, property_type, blueprint_visibility, specifiers "
+            "FROM reflect_uproperties WHERE owning_class = ? AND cpp_module = ?", {cn, mn});
+        json jprops = json::array();
+        for (auto& p : props)
+            jprops.push_back({{"property_name", p.get("property_name")},
+                              {"property_type", p.get("property_type")},
+                              {"blueprint_visibility", p.get("blueprint_visibility")},
+                              {"specifiers", p.get("specifiers")}});
+        uclass["uproperties"] = jprops;
+
+        auto funcs = query(db,
+            "SELECT function_name, return_type, blueprint_callable, specifiers "
+            "FROM reflect_ufunctions WHERE owning_class = ? AND cpp_module = ?", {cn, mn});
+        json jfuncs = json::array();
+        for (auto& f : funcs)
+            jfuncs.push_back({{"function_name", f.get("function_name")},
+                              {"return_type", f.get("return_type")},
+                              {"blueprint_callable", f.get_int("blueprint_callable")},
+                              {"specifiers", f.get("specifiers")}});
+        uclass["ufunctions"] = jfuncs;
+
+        json out = {{"success", true}, {"uclass", uclass}};
+        std::cout << out.dump(2) << std::endl;
+    }
+
+    // --- network list_replicated_classes ---
+    void list_replicated_classes(const Args& args) {
+        int limit = args.opt_int("limit", 50);
+        auto rows = query(db,
+            "SELECT owning_class, cpp_module, COUNT(*) AS replicated_count "
+            "FROM reflect_replicated_properties GROUP BY owning_class, cpp_module "
+            "ORDER BY replicated_count DESC, owning_class LIMIT " + std::to_string(limit));
+        json arr = json::array();
+        for (auto& r : rows)
+            arr.push_back({{"owning_class", r.get("owning_class")},
+                           {"cpp_module", r.get("cpp_module")},
+                           {"replicated_count", r.get_int("replicated_count")}});
+        json out = {{"success", true}, {"count", arr.size()}, {"classes", arr}};
+        std::cout << out.dump(2) << std::endl;
+    }
+
+    // --- decision list_decisions ---
+    void list_decisions(const Args& args) {
+        int limit = args.opt_int("limit", 50);
+        std::string status = args.opt("status");
+        std::string sql = "SELECT decision_id, title, status, source_path, source_line, confidence "
+                          "FROM decision_records";
+        std::vector<std::string> params;
+        if (!status.empty()) { sql += " WHERE status = ?"; params.push_back(status); }
+        sql += " ORDER BY source_path LIMIT " + std::to_string(limit);
+
+        auto rows = query(db, sql, params);
+        json arr = json::array();
+        for (auto& r : rows)
+            arr.push_back({{"decision_id", r.get("decision_id")},
+                           {"title", r.get("title")},
+                           {"status", r.get("status")},
+                           {"source_path", r.get("source_path")},
+                           {"source_line", r.get_int("source_line")},
+                           {"confidence", r.get_double("confidence")}});
+        json out = {{"success", true}, {"count", arr.size()}, {"decisions", arr}};
+        std::cout << out.dump(2) << std::endl;
+    }
+
+    // --- risk list_hotspots ---
+    void list_hotspots(const Args& args) {
+        int limit = args.opt_int("limit", 50);
+        auto rows = query(db,
+            "SELECT file_path, churn, complexity_proxy, score FROM risk_hotspot_scores "
+            "ORDER BY score DESC, file_path LIMIT " + std::to_string(limit));
+        json arr = json::array();
+        for (auto& r : rows)
+            arr.push_back({{"file_path", r.get("file_path")},
+                           {"churn", r.get_int("churn")},
+                           {"complexity_proxy", r.get_int("complexity_proxy")},
+                           {"score", r.get_double("score")}});
+        json out = {{"success", true}, {"count", arr.size()}, {"hotspots", arr}};
+        std::cout << out.dump(2) << std::endl;
+    }
+};
+
+// ============================================================
 // DB path resolution
 // ============================================================
 
@@ -1327,8 +1539,46 @@ int main(int argc, char* argv[]) {
         if (it == actions.end()) die("Unknown monolith action: " + args.action + " (expected 'guide')");
         it->second(ma, args);
 
+    } else if (args.ns == "cppreflect" || args.ns == "network" ||
+               args.ns == "decision" || args.ns == "risk") {
+        // All Reflection Intelligence read tables live in EngineSource.db.
+        std::string db_path = args.opt("source_db");
+        if (db_path.empty()) db_path = (fs::path(db_dir) / "EngineSource.db").string();
+
+        ReflectionActions ra;
+        ra.open(db_path);
+
+        static const std::map<std::string, std::function<void(ReflectionActions&, const Args&)>> actions = {
+            {"get_uclass",               [](ReflectionActions& r, const Args& a) { r.get_uclass(a); }},
+            {"list_replicated_classes",  [](ReflectionActions& r, const Args& a) { r.list_replicated_classes(a); }},
+            {"list_decisions",           [](ReflectionActions& r, const Args& a) { r.list_decisions(a); }},
+            {"list_hotspots",            [](ReflectionActions& r, const Args& a) { r.list_hotspots(a); }},
+        };
+
+        auto it = actions.find(args.action);
+        if (it == actions.end()) {
+            std::vector<std::string> known;
+            for (const auto& kv : actions) known.push_back(kv.first);
+            die("Unknown " + args.ns + " action: " + args.action + did_you_mean_suffix(args.action, known));
+        }
+        it->second(ra, args);
+
     } else {
-        die("Unknown namespace: " + args.ns + " (expected 'source', 'project', or 'monolith')");
+        // Unknown namespace — list all offline-servable namespaces (matching the
+        // live server's error shape) + did_you_mean suggestions + the boundary note.
+        const auto& ns = offline_namespaces();
+        std::string ns_list;
+        for (size_t i = 0; i < ns.size(); ++i) {
+            if (i > 0) ns_list += ", ";
+            ns_list += "'" + ns[i] + "'";
+        }
+        std::cerr << "ERROR: Unknown namespace: " << args.ns
+                  << " (offline-servable: " << ns_list << ")"
+                  << did_you_mean_suffix(args.ns, ns) << std::endl;
+        std::cerr << "NOTE: this offline tool serves only namespaces backed by on-disk SQLite. "
+                     "The live MCP server exposes ~29 namespaces; the rest are LIVE-ONLY "
+                     "(require a running editor + UObject reflection)." << std::endl;
+        std::exit(2);
     }
 
     return 0;

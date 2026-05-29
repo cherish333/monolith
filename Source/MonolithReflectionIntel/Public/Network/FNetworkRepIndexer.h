@@ -94,7 +94,15 @@ public:
 		const TArray<FString>& ArtefactRoots,
 		bool bIncludeEnginePlugins,
 		bool bAllowMarketplacePaths,
-		FString& OutStatus);
+		FString& OutStatus,
+		/** Optional — receives the resolved absolute roots that DirectoryExists()
+		 *  accepted (the ones actually walked). Default nullptr preserves the
+		 *  existing API. */
+		TArray<FString>* OutScannedRoots = nullptr,
+		/** Optional — {AbsolutePath, Reason} pairs for any roots that were
+		 *  SKIPPED at the DirectoryExists() gate. Surfaced by
+		 *  `rebuild_reflection_index` so silent skips never recur. */
+		TArray<TPair<FString, FString>>* OutSkippedRoots = nullptr);
 
 private:
 	bool EnsureSchema(FSQLiteDatabase& DB);

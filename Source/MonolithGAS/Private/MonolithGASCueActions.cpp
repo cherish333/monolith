@@ -107,7 +107,7 @@ void FMonolithGASCueActions::RegisterActions(FMonolithToolRegistry& Registry)
 		FMonolithActionHandler::CreateStatic(&HandleScaffoldCueLibrary),
 		FParamSchemaBuilder()
 			.Required(TEXT("preset"), TEXT("string"), TEXT("Preset name: 'combat', 'status', 'horror', or 'all'"))
-			.Required(TEXT("save_path_prefix"), TEXT("string"), TEXT("Base path for generated cues (e.g. '/Game/GAS/Cues')"))
+			.RequiredAssetPath(TEXT("save_path_prefix"), TEXT("Base path for generated cues (e.g. '/Game/GAS/Cues')"))
 			.Build());
 }
 

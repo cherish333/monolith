@@ -143,7 +143,7 @@ void FMonolithAISmartObjectActions::RegisterActions(FMonolithToolRegistry& Regis
 			.RequiredAssetPath(TEXT("definition_path"), TEXT("Smart Object Definition asset path"))
 			.Required(TEXT("location"), TEXT("object"), TEXT("World location {x, y, z}"))
 			.Optional(TEXT("rotation"), TEXT("object"), TEXT("World rotation {pitch, yaw, roll}"))
-			.Optional(TEXT("folder_path"), TEXT("string"), TEXT("World Outliner folder (default: AI/SmartObjects)"))
+			.OptionalAssetPath(TEXT("folder_path"), TEXT("World Outliner folder (default: AI/SmartObjects)"))
 			.Build());
 
 	// 139. find_smart_objects_in_level

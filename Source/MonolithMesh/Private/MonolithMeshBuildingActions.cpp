@@ -65,7 +65,7 @@ void FMonolithMeshBuildingActions::RegisterActions(FMonolithToolRegistry& Regist
 			.Optional(TEXT("materials"), TEXT("object"), TEXT("Map of slot ID to material asset path (0=exterior, 1=interior, 2=floor, 3=trim)"))
 			.Optional(TEXT("location"), TEXT("array"), TEXT("World location [x, y, z]"))
 			.Optional(TEXT("label"), TEXT("string"), TEXT("Actor label"))
-			.Optional(TEXT("folder"), TEXT("string"), TEXT("Outliner folder path"))
+			.OptionalAssetPath(TEXT("folder"), TEXT("Outliner folder path"))
 			.Optional(TEXT("building_id"), TEXT("string"), TEXT("Building ID for the descriptor"))
 			.Optional(TEXT("omit_exterior_walls"), TEXT("boolean"), TEXT("Skip exterior wall geometry (use when facade will replace exterior walls). FExteriorFaceDef entries still emitted."), TEXT("false"))
 			.Optional(TEXT("facade_style"), TEXT("string"), TEXT("Facade style name (loads from FacadeStyles/ presets). When set, generates integrated facade with windows/doors/trim. Automatically enables omit_exterior_walls."))

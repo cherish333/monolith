@@ -117,6 +117,12 @@ TArray<FString> FMonolithParamSchema::FindUnknownKeys(
 	Allowed.Add(TEXT("_fields"));
 	Allowed.Add(TEXT("_omit"));
 	Allowed.Add(TEXT("_compact_json"));
+	// Phase 1.1 (RI ergonomics handover #3) — nested-payload shaping params.
+	// `_row_fields` filters each row of the unique top-level list payload;
+	// `_path_fields` retains only matching dotted leaves. Same allowlist
+	// treatment as the original three.
+	Allowed.Add(TEXT("_row_fields"));
+	Allowed.Add(TEXT("_path_fields"));
 
 	for (const auto& Pair : Params->Values)
 	{
@@ -349,13 +355,22 @@ FMonolithActionResult FMonolithToolRegistry::ExecuteAction(
 		}
 	}
 
-	// Survivor D (plan §3.D) — schema-tagged AssetPath \→/ rewrite.
+	// Survivor D (plan §3.D) — schema-tagged path-kind handling.
 	// Runs AFTER K2 alias rewrite (so the key the schema sees matches the
 	// param name in EffectiveParams) and BEFORE K3 unknown-key check.
-	// Only Kind == AssetPath is rewritten; all other Kinds (Other, DiskPath,
-	// GameplayTag) pass through. Warnings appended to the same K3 warnings[]
-	// channel by the post-handler block below.
-	TArray<FString> AssetPathRewriteWarnings;
+	//
+	//   - Kind == AssetPath: `\` rewritten to `/` (silent fix-up + warning).
+	//   - Kind == DiskPath:  backslash detected → warning, NO rewrite.
+	//                        (Per RI ergonomics handover #5, 2026-05-29: the
+	//                        DiskPath indexes store paths with forward slashes,
+	//                        but DiskPath legitimately COULD address a real OS
+	//                        path so we never silently rewrite — we just warn
+	//                        loudly. The trap was silent-empty-on-backslash.)
+	//   - All other Kinds (Other, GameplayTag) pass through untouched.
+	//
+	// Warnings appended to the same K3 warnings[] channel by the post-handler
+	// block below.
+	TArray<FString> PathParamWarnings;
 	if (ActionInfo.ParamSchema.IsValid())
 	{
 		for (const auto& SchemaPair : ActionInfo.ParamSchema->Values)
@@ -370,7 +385,8 @@ FMonolithActionResult FMonolithToolRegistry::ExecuteAction(
 			{
 				continue; // No kind tag → Other (default) → no rewrite.
 			}
-			if (MonolithParamKind::FromString(KindStr) != EMonolithParamKind::AssetPath)
+			const EMonolithParamKind Kind = MonolithParamKind::FromString(KindStr);
+			if (Kind != EMonolithParamKind::AssetPath && Kind != EMonolithParamKind::DiskPath)
 			{
 				continue;
 			}
@@ -386,11 +402,21 @@ FMonolithActionResult FMonolithToolRegistry::ExecuteAction(
 				continue;
 			}
 
-			FString Rewritten = Value.Replace(TEXT("\\"), TEXT("/"));
-			EffectiveParams->SetStringField(ParamName, Rewritten);
-			AssetPathRewriteWarnings.Add(FString::Printf(
-				TEXT("Normalised backslashes in 'asset_path' param '%s' — future calls should use forward slashes."),
-				*ParamName));
+			if (Kind == EMonolithParamKind::AssetPath)
+			{
+				FString Rewritten = Value.Replace(TEXT("\\"), TEXT("/"));
+				EffectiveParams->SetStringField(ParamName, Rewritten);
+				PathParamWarnings.Add(FString::Printf(
+					TEXT("Normalised backslashes in 'asset_path' param '%s' — future calls should use forward slashes."),
+					*ParamName));
+			}
+			else // DiskPath
+			{
+				FString Suggested = Value.Replace(TEXT("\\"), TEXT("/"));
+				PathParamWarnings.Add(FString::Printf(
+					TEXT("DiskPath param '%s' contains backslashes — paths in this index are stored with forward slashes ('/'), so a query for '%s' will likely return zero results. Convert to '%s'."),
+					*ParamName, *Value, *Suggested));
+			}
 		}
 	}
 
@@ -433,7 +459,7 @@ FMonolithActionResult FMonolithToolRegistry::ExecuteAction(
 	if (ActionResult.bSuccess && ActionResult.Result.IsValid())
 	{
 		TArray<FString> AllWarnings;
-		AllWarnings.Append(AssetPathRewriteWarnings);
+		AllWarnings.Append(PathParamWarnings);
 		for (const FString& K : Unknown)
 		{
 			AllWarnings.Add(FString::Printf(TEXT("Unknown param '%s' for action '%s:%s'"), *K, *Namespace, *Action));

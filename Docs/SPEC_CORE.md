@@ -751,6 +751,8 @@ Unknown action / unknown namespace dispatch errors now carry a `data.suggestions
 1. Unknown action name within a known namespace — `error.data.kind = "action"`, suggestions are sibling actions in the same namespace ranked by distance to the supplied action name.
 2. Unknown namespace (top-level tool name unrecognised) — `error.data.kind = "namespace"`, suggestions are registered namespace names ranked by distance.
 
+**Reachability scope (RI handover #11, 2026-05-29).** `did_you_mean` targets RAW / enumless MCP callers — the offline CLI (`monolith_query.exe`) and any client that posts an arbitrary `action` string. It is effectively unreachable from the typed Claude Code MCP client, because each per-namespace dispatcher advertises its `action` as a closed enum in the `tools/list` inputSchema, so an unknown action is rejected by the client before it can reach the dispatcher. This is by design, not a gap: the enum guard means the typo can't occur on the typed path. Bringing the suggestions to the offline CLI is tracked separately (handover #8).
+
 **Error payload shape.**
 
 ```json

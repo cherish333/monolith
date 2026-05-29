@@ -213,7 +213,7 @@ void FMonolithMeshLevelDesignActions::RegisterActions(FMonolithToolRegistry& Reg
 			.Optional(TEXT("inner_cone_angle"), TEXT("number"), TEXT("Inner cone angle in degrees (spot only)"), TEXT("25"))
 			.Optional(TEXT("outer_cone_angle"), TEXT("number"), TEXT("Outer cone angle in degrees (spot only)"), TEXT("44"))
 			.Optional(TEXT("name"), TEXT("string"), TEXT("Actor label"))
-			.Optional(TEXT("folder"), TEXT("string"), TEXT("Outliner folder path"))
+			.OptionalAssetPath(TEXT("folder"), TEXT("Outliner folder path"))
 			.Optional(TEXT("mobility"), TEXT("string"), TEXT("Mobility: Static, Stationary, Movable"), TEXT("Stationary"))
 			.Build());
 
@@ -293,7 +293,7 @@ void FMonolithMeshLevelDesignActions::RegisterActions(FMonolithToolRegistry& Reg
 			.Required(TEXT("mesh"), TEXT("string"), TEXT("Static mesh asset path for the HISM"))
 			.Required(TEXT("actors"), TEXT("array"), TEXT("Array of actor names to convert"))
 			.Optional(TEXT("name"), TEXT("string"), TEXT("Label for the new HISM actor"))
-			.Optional(TEXT("folder"), TEXT("string"), TEXT("Outliner folder path"))
+			.OptionalAssetPath(TEXT("folder"), TEXT("Outliner folder path"))
 			.Optional(TEXT("preserve_materials"), TEXT("boolean"), TEXT("Copy material overrides from first actor"), TEXT("true"))
 			.Build());
 

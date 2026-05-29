@@ -171,7 +171,7 @@ void FMonolithMeshAdvancedLevelActions::RegisterActions(FMonolithToolRegistry& R
 			.Optional(TEXT("scale"), TEXT("array"), TEXT("Scale [x, y, z]"), TEXT("[1,1,1]"))
 			.Optional(TEXT("properties"), TEXT("object"), TEXT("Property name->value pairs to set via reflection"))
 			.Optional(TEXT("label"), TEXT("string"), TEXT("Actor label in the outliner"))
-			.Optional(TEXT("folder"), TEXT("string"), TEXT("Outliner folder path"))
+			.OptionalAssetPath(TEXT("folder"), TEXT("Outliner folder path"))
 			.Build());
 
 	// 3. place_spline

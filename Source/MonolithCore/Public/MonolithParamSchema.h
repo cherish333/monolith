@@ -119,6 +119,67 @@ public:
 		return *this;
 	}
 
+	// --- Path-kind sugar WITH aliases (no default). For path params that also
+	// declare K2 alias keys. Type forced "string"; default empty.
+	FParamSchemaBuilder& RequiredAssetPath(const TCHAR* Name, const TCHAR* Description,
+		std::initializer_list<const TCHAR*> Aliases)
+	{
+		AddParam(Name, TEXT("string"), Description, /*bRequired=*/true, TEXT(""), /*bHasDefault=*/false, Aliases, EMonolithParamKind::AssetPath);
+		return *this;
+	}
+
+	FParamSchemaBuilder& OptionalAssetPath(const TCHAR* Name, const TCHAR* Description,
+		std::initializer_list<const TCHAR*> Aliases)
+	{
+		AddParam(Name, TEXT("string"), Description, /*bRequired=*/false, TEXT(""), /*bHasDefault=*/false, Aliases, EMonolithParamKind::AssetPath);
+		return *this;
+	}
+
+	FParamSchemaBuilder& RequiredDiskPath(const TCHAR* Name, const TCHAR* Description,
+		std::initializer_list<const TCHAR*> Aliases)
+	{
+		AddParam(Name, TEXT("string"), Description, /*bRequired=*/true, TEXT(""), /*bHasDefault=*/false, Aliases, EMonolithParamKind::DiskPath);
+		return *this;
+	}
+
+	FParamSchemaBuilder& OptionalDiskPath(const TCHAR* Name, const TCHAR* Description,
+		std::initializer_list<const TCHAR*> Aliases)
+	{
+		AddParam(Name, TEXT("string"), Description, /*bRequired=*/false, TEXT(""), /*bHasDefault=*/false, Aliases, EMonolithParamKind::DiskPath);
+		return *this;
+	}
+
+	// --- Path-kind sugar WITH a non-empty default value. For Optional path
+	// params that carry a default (e.g. a default /Game/... save location).
+	// Type forced "string". The plain Optional overloads stay Other.
+	FParamSchemaBuilder& OptionalAssetPathWithDefault(const TCHAR* Name, const TCHAR* Description,
+		const TCHAR* Default)
+	{
+		AddParam(Name, TEXT("string"), Description, /*bRequired=*/false, Default, /*bHasDefault=*/true, {}, EMonolithParamKind::AssetPath);
+		return *this;
+	}
+
+	FParamSchemaBuilder& OptionalAssetPathWithDefault(const TCHAR* Name, const TCHAR* Description,
+		const TCHAR* Default, std::initializer_list<const TCHAR*> Aliases)
+	{
+		AddParam(Name, TEXT("string"), Description, /*bRequired=*/false, Default, /*bHasDefault=*/true, Aliases, EMonolithParamKind::AssetPath);
+		return *this;
+	}
+
+	FParamSchemaBuilder& OptionalDiskPathWithDefault(const TCHAR* Name, const TCHAR* Description,
+		const TCHAR* Default)
+	{
+		AddParam(Name, TEXT("string"), Description, /*bRequired=*/false, Default, /*bHasDefault=*/true, {}, EMonolithParamKind::DiskPath);
+		return *this;
+	}
+
+	FParamSchemaBuilder& OptionalDiskPathWithDefault(const TCHAR* Name, const TCHAR* Description,
+		const TCHAR* Default, std::initializer_list<const TCHAR*> Aliases)
+	{
+		AddParam(Name, TEXT("string"), Description, /*bRequired=*/false, Default, /*bHasDefault=*/true, Aliases, EMonolithParamKind::DiskPath);
+		return *this;
+	}
+
 	TSharedPtr<FJsonObject> Build()
 	{
 		return Schema;

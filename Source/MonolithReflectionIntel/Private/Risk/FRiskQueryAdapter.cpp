@@ -8,6 +8,7 @@
 
 #include "Risk/FRiskQueryAdapter.h"
 #include "MonolithReflectionIntelModule.h"
+#include "MonolithRIMetaTable.h"
 
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
@@ -208,7 +209,25 @@ FSQLiteDatabase* FRiskQueryAdapter::GetRawDB()
 		const bool bTableExists = bPrepared
 			&& TableCheck.Step() == ESQLitePreparedStatementStepResult::Row;
 		TableCheck.Destroy();
-		if (!bTableExists)
+
+		// Handover doc item #1 — stale detection.
+		bool bVersionMismatch = false;
+		if (bTableExists)
+		{
+			int32 StoredVersion = 0;
+			const bool bHasStamp = MonolithRIMeta::ReadStoredVersion(
+				*DB, TEXT("risk"), StoredVersion);
+			const int32 CurrentVersion = MonolithRIMeta::GetIndexerCodeVersion(TEXT("risk"));
+			if (!bHasStamp || StoredVersion != CurrentVersion)
+			{
+				UE_LOG(LogMonolithReflectionIntel, Log,
+					TEXT("risk: stale-detection triggered (stored=%d, current=%d) — forcing rebuild"),
+					bHasStamp ? StoredVersion : -1, CurrentVersion);
+				bVersionMismatch = true;
+			}
+		}
+
+		if (!bTableExists || bVersionMismatch)
 		{
 			Module->ResetCachedQueryDb();
 			FString IndexerStatus;

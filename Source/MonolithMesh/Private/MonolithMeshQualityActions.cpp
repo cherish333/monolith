@@ -55,7 +55,7 @@ void FMonolithMeshQualityActions::RegisterActions(FMonolithToolRegistry& Registr
 		TEXT("Scan assets by path and flag names not matching prefix conventions (SM_ for StaticMesh, SK_ for SkeletalMesh, M_ for Material, MI_ for MaterialInstance, T_ for Texture, BP_ for Blueprint). Supports custom rules."),
 		FMonolithActionHandler::CreateStatic(&FMonolithMeshQualityActions::ValidateNamingConventions),
 		FParamSchemaBuilder()
-			.Optional(TEXT("scan_path"), TEXT("string"), TEXT("Content path to scan (e.g. /Game/Environment)"), TEXT("/Game"))
+			.OptionalAssetPathWithDefault(TEXT("scan_path"), TEXT("Content path to scan (e.g. /Game/Environment)"), TEXT("/Game"))
 			.Optional(TEXT("max_results"), TEXT("integer"), TEXT("Maximum violations to return"), TEXT("100"))
 			.Optional(TEXT("custom_rules"), TEXT("object"), TEXT("Custom prefix rules: {\"ClassName\": \"Prefix_\", ...}"))
 			.Build());
@@ -103,7 +103,7 @@ void FMonolithMeshQualityActions::RegisterActions(FMonolithToolRegistry& Registr
 		TEXT("Analyze texture memory usage: pool size, used, top textures, by-format breakdown. Identifies budget hogs and gives recommendations."),
 		FMonolithActionHandler::CreateStatic(&FMonolithMeshQualityActions::AnalyzeTextureBudget),
 		FParamSchemaBuilder()
-			.Optional(TEXT("scan_path"), TEXT("string"), TEXT("Content path filter (empty = all)"), TEXT(""))
+			.OptionalAssetPath(TEXT("scan_path"), TEXT("Content path filter (empty = all)"))
 			.Optional(TEXT("top_count"), TEXT("integer"), TEXT("Number of top textures to return"), TEXT("20"))
 			.Build());
 

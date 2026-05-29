@@ -293,4 +293,25 @@ private:
 	 *  seconds later (e.g., after source.trigger_reindex completes and the
 	 *  user retries) is still served promptly. */
 	static constexpr double RetryCooldownSeconds = 5.0;
+
+	// ------------------------------------------------------------------------
+	// Scan-root diagnostics (handover doc item #2 — "no silent skips").
+	//
+	// Per-subsystem the last Run() of the cppreflect / network indexers stamps
+	// the list of roots it actually walked + a list of roots that were skipped
+	// (with reason). `FReflectMaintenanceAdapter::HandleRebuildReflectionIndex`
+	// surfaces both lists in the response so callers can see "root added but
+	// found nothing" instead of being told only an aggregate file count.
+	// ------------------------------------------------------------------------
+public:
+	const TArray<FString>& GetLastCppReflectScannedRoots() const { return LastCppReflectScannedRoots; }
+	const TArray<TPair<FString, FString>>& GetLastCppReflectSkippedRoots() const { return LastCppReflectSkippedRoots; }
+	const TArray<FString>& GetLastNetworkScannedRoots() const { return LastNetworkScannedRoots; }
+	const TArray<TPair<FString, FString>>& GetLastNetworkSkippedRoots() const { return LastNetworkSkippedRoots; }
+
+private:
+	TArray<FString>                  LastCppReflectScannedRoots;
+	TArray<TPair<FString, FString>>  LastCppReflectSkippedRoots; // {path, reason}
+	TArray<FString>                  LastNetworkScannedRoots;
+	TArray<TPair<FString, FString>>  LastNetworkSkippedRoots;
 };

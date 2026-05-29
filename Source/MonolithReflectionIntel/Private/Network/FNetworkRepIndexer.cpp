@@ -28,6 +28,7 @@
 #include "Network/FNetworkRepIndexer.h"
 #include "Network/NetworkSchema.h"
 #include "MonolithReflectionIntelModule.h"
+#include "MonolithRIMetaTable.h"
 
 #include "HAL/FileManager.h"
 #include "HAL/PlatformFileManager.h"
@@ -98,9 +99,14 @@ bool FNetworkRepIndexer::Run(FSQLiteDatabase& DB,
 	const TArray<FString>& ArtefactRoots,
 	bool bIncludeEnginePlugins,
 	bool bAllowMarketplacePaths,
-	FString& OutStatus)
+	FString& OutStatus,
+	TArray<FString>* OutScannedRoots,
+	TArray<TPair<FString, FString>>* OutSkippedRoots)
 {
 	ensure(IsInGameThread());
+
+	// EnsureMetaTable up front — handover doc item #1 (stale-detection).
+	MonolithRIMeta::EnsureMetaTable(DB);
 
 	if (!EnsureSchema(DB))
 	{
@@ -134,15 +140,27 @@ bool FNetworkRepIndexer::Run(FSQLiteDatabase& DB,
 		}
 	}
 
+	// Handover doc item #2 — track scanned vs skipped roots and surface them up
+	// through the optional output params. Missing-root log bumped Verbose →
+	// Warning so silent skips become visible (the marketplace-scan rebase bug
+	// took 2 cycles purely because this was Verbose).
 	TArray<TPair<FString, FString>> ModuleAndArtefactPairs;
 	for (const FString& Root : ResolvedRoots)
 	{
 		IPlatformFile& Pf = FPlatformFileManager::Get().GetPlatformFile();
 		if (!Pf.DirectoryExists(*Root))
 		{
-			UE_LOG(LogMonolithReflectionIntel, Verbose,
+			UE_LOG(LogMonolithReflectionIntel, Warning,
 				TEXT("FNetworkRepIndexer: skipping missing root '%s'"), *Root);
+			if (OutSkippedRoots)
+			{
+				OutSkippedRoots->Emplace(Root, TEXT("directory does not exist"));
+			}
 			continue;
+		}
+		if (OutScannedRoots)
+		{
+			OutScannedRoots->Add(Root);
 		}
 		CollectArtefacts(Root, bIncludeEnginePlugins, bAllowMarketplacePaths, ModuleAndArtefactPairs);
 	}
@@ -153,6 +171,9 @@ bool FNetworkRepIndexer::Run(FSQLiteDatabase& DB,
 			"FNetworkRepIndexer: no UHT artefacts found — has the project built "
 			"with UBT yet? (Live Coding patches do not produce gen.cpp).");
 		UE_LOG(LogMonolithReflectionIntel, Warning, TEXT("%s"), *OutStatus);
+		// Stamp the code-version on zero-artefact success (handover item #1).
+		MonolithRIMeta::WriteStoredVersion(DB, TEXT("network"),
+			MonolithRIMeta::GetIndexerCodeVersion(TEXT("network")));
 		return true;
 	}
 
@@ -180,6 +201,10 @@ bool FNetworkRepIndexer::Run(FSQLiteDatabase& DB,
 		TEXT("FNetworkRepIndexer: %d artefacts scanned → ReplicatedProperties=%d"),
 		FilesScanned, TotalReps);
 	UE_LOG(LogMonolithReflectionIntel, Log, TEXT("%s"), *OutStatus);
+
+	// Handover doc item #1 — stamp the network code-version on success.
+	MonolithRIMeta::WriteStoredVersion(DB, TEXT("network"),
+		MonolithRIMeta::GetIndexerCodeVersion(TEXT("network")));
 	return true;
 }
 

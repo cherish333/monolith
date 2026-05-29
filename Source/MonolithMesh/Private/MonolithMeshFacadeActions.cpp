@@ -66,7 +66,7 @@ void FMonolithMeshFacadeActions::RegisterActions(FMonolithToolRegistry& Registry
 			.Optional(TEXT("ground_floor_style"), TEXT("string"), TEXT("Ground floor treatment: residential, storefront, entrance"), TEXT("residential"))
 			.Optional(TEXT("location"), TEXT("array"), TEXT("World location [x, y, z]"))
 			.Optional(TEXT("label"), TEXT("string"), TEXT("Actor label"))
-			.Optional(TEXT("folder"), TEXT("string"), TEXT("Outliner folder path"))
+			.OptionalAssetPath(TEXT("folder"), TEXT("Outliner folder path"))
 			.Optional(TEXT("overwrite"), TEXT("boolean"), TEXT("Allow overwriting existing asset at save_path"), TEXT("false"))
 			.Build());
 
@@ -88,7 +88,7 @@ void FMonolithMeshFacadeActions::RegisterActions(FMonolithToolRegistry& Registry
 			.Optional(TEXT("rust_stains"), TEXT("boolean"), TEXT("Add rust streak marker geometry below windows"), TEXT("true"))
 			.Optional(TEXT("cracks"), TEXT("boolean"), TEXT("Add crack line geometry on wall surface"), TEXT("true"))
 			.OptionalAssetPath(TEXT("save_path"), TEXT("Asset path for the damage overlay mesh"))
-			.Optional(TEXT("folder"), TEXT("string"), TEXT("Outliner folder path"))
+			.OptionalAssetPath(TEXT("folder"), TEXT("Outliner folder path"))
 			.Optional(TEXT("overwrite"), TEXT("boolean"), TEXT("Allow overwriting existing asset"), TEXT("false"))
 			.Build());
 }

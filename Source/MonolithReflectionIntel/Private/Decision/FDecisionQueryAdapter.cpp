@@ -19,6 +19,7 @@
 
 #include "Decision/FDecisionQueryAdapter.h"
 #include "MonolithReflectionIntelModule.h"
+#include "MonolithRIMetaTable.h"
 
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
@@ -289,7 +290,27 @@ FSQLiteDatabase* FDecisionQueryAdapter::GetRawDB()
 			&& TableCheck.Step() == ESQLitePreparedStatementStepResult::Row;
 		// Release the prepared statement before tearing down the underlying handle.
 		TableCheck.Destroy();
-		if (!bTableExists)
+
+		// Handover doc item #1 — stale detection. Force-rebuild when the table
+		// is absent OR the stamped code-version no longer matches the current
+		// compiled constant.
+		bool bVersionMismatch = false;
+		if (bTableExists)
+		{
+			int32 StoredVersion = 0;
+			const bool bHasStamp = MonolithRIMeta::ReadStoredVersion(
+				*DB, TEXT("decision"), StoredVersion);
+			const int32 CurrentVersion = MonolithRIMeta::GetIndexerCodeVersion(TEXT("decision"));
+			if (!bHasStamp || StoredVersion != CurrentVersion)
+			{
+				UE_LOG(LogMonolithReflectionIntel, Log,
+					TEXT("decision: stale-detection triggered (stored=%d, current=%d) — forcing rebuild"),
+					bHasStamp ? StoredVersion : -1, CurrentVersion);
+				bVersionMismatch = true;
+			}
+		}
+
+		if (!bTableExists || bVersionMismatch)
 		{
 			// Drop the RO handle so the indexer's RW open does not contend
 			// with our reader, then reopen RO once the indexer has closed.

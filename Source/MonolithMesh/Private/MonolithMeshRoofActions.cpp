@@ -64,7 +64,7 @@ void FMonolithMeshRoofActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Optional(TEXT("material_fascia"), TEXT("string"), TEXT("Material asset path for fascia trim (slot 2)"))
 			.Optional(TEXT("location"), TEXT("array"), TEXT("World location [x,y,z]"))
 			.Optional(TEXT("label"), TEXT("string"), TEXT("Actor label"))
-			.Optional(TEXT("folder"), TEXT("string"), TEXT("Outliner folder path"))
+			.OptionalAssetPath(TEXT("folder"), TEXT("Outliner folder path"))
 			.Optional(TEXT("overwrite"), TEXT("boolean"), TEXT("Allow overwriting existing asset"), TEXT("false"))
 			.Optional(TEXT("building_id"), TEXT("string"), TEXT("Building ID for tagging the actor"))
 			.Build());

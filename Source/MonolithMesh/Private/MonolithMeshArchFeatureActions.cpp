@@ -359,7 +359,7 @@ void FMonolithMeshArchFeatureActions::RegisterActions(FMonolithToolRegistry& Reg
 			.Optional(TEXT("rotation"), TEXT("number"), TEXT("Yaw rotation in degrees"))
 			.Optional(TEXT("building_context"), TEXT("object"), BuildingContextDesc)
 			.Optional(TEXT("label"), TEXT("string"), TEXT("Actor label"))
-			.Optional(TEXT("folder"), TEXT("string"), TEXT("Outliner folder path"))
+			.OptionalAssetPath(TEXT("folder"), TEXT("Outliner folder path"))
 			.Optional(TEXT("overwrite"), TEXT("boolean"), TEXT("Overwrite existing asset"), TEXT("false"))
 			.Build());
 
@@ -391,7 +391,7 @@ void FMonolithMeshArchFeatureActions::RegisterActions(FMonolithToolRegistry& Reg
 			.Optional(TEXT("rotation"), TEXT("number"), TEXT("Yaw rotation in degrees"))
 			.Optional(TEXT("building_context"), TEXT("object"), BuildingContextDesc)
 			.Optional(TEXT("label"), TEXT("string"), TEXT("Actor label"))
-			.Optional(TEXT("folder"), TEXT("string"), TEXT("Outliner folder path"))
+			.OptionalAssetPath(TEXT("folder"), TEXT("Outliner folder path"))
 			.Optional(TEXT("overwrite"), TEXT("boolean"), TEXT("Overwrite existing asset"), TEXT("false"))
 			.Build());
 
@@ -418,7 +418,7 @@ void FMonolithMeshArchFeatureActions::RegisterActions(FMonolithToolRegistry& Reg
 			.Optional(TEXT("rotation"), TEXT("number"), TEXT("Yaw rotation in degrees"))
 			.Optional(TEXT("building_context"), TEXT("object"), BuildingContextDesc)
 			.Optional(TEXT("label"), TEXT("string"), TEXT("Actor label"))
-			.Optional(TEXT("folder"), TEXT("string"), TEXT("Outliner folder path"))
+			.OptionalAssetPath(TEXT("folder"), TEXT("Outliner folder path"))
 			.Optional(TEXT("overwrite"), TEXT("boolean"), TEXT("Overwrite existing asset"), TEXT("false"))
 			.Build());
 
@@ -444,7 +444,7 @@ void FMonolithMeshArchFeatureActions::RegisterActions(FMonolithToolRegistry& Reg
 			.Optional(TEXT("rotation"), TEXT("number"), TEXT("Yaw rotation in degrees"))
 			.Optional(TEXT("building_context"), TEXT("object"), BuildingContextDesc)
 			.Optional(TEXT("label"), TEXT("string"), TEXT("Actor label"))
-			.Optional(TEXT("folder"), TEXT("string"), TEXT("Outliner folder path"))
+			.OptionalAssetPath(TEXT("folder"), TEXT("Outliner folder path"))
 			.Optional(TEXT("overwrite"), TEXT("boolean"), TEXT("Overwrite existing asset"), TEXT("false"))
 			.Build());
 
@@ -470,7 +470,7 @@ void FMonolithMeshArchFeatureActions::RegisterActions(FMonolithToolRegistry& Reg
 			.Optional(TEXT("location"), TEXT("array"), TEXT("World location [x,y,z]"))
 			.Optional(TEXT("building_context"), TEXT("object"), BuildingContextDesc)
 			.Optional(TEXT("label"), TEXT("string"), TEXT("Actor label"))
-			.Optional(TEXT("folder"), TEXT("string"), TEXT("Outliner folder path"))
+			.OptionalAssetPath(TEXT("folder"), TEXT("Outliner folder path"))
 			.Optional(TEXT("overwrite"), TEXT("boolean"), TEXT("Overwrite existing asset"), TEXT("false"))
 			.Build());
 }

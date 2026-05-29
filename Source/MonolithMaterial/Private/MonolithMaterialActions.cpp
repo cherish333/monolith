@@ -599,7 +599,7 @@ void FMonolithMaterialActions::RegisterActions(FMonolithToolRegistry& Registry)
 		TEXT("Import a texture from disk into the project content"),
 		FMonolithActionHandler::CreateStatic(&FMonolithMaterialActions::ImportTexture),
 		FParamSchemaBuilder()
-			.Required(TEXT("source_file"), TEXT("string"), TEXT("Absolute path to the image file on disk (e.g. D:/Textures/diffuse.png)"))
+			.RequiredDiskPath(TEXT("source_file"), TEXT("Absolute path to the image file on disk (e.g. D:/Textures/diffuse.png)"))
 			.RequiredAssetPath(TEXT("dest_path"), TEXT("Content path for the imported texture (e.g. /Game/Textures/MyTexture)"))
 			.Optional(TEXT("dest_name"), TEXT("string"), TEXT("Override asset name (default: derived from dest_path)"))
 			.Optional(TEXT("compression"), TEXT("string"), TEXT("Compression setting: Default, Normalmap, NormalmapBC5, NormalmapLA, Grayscale, Alpha, Masks, HDR, etc. (default: Default)"), TEXT("Default"))
@@ -614,7 +614,7 @@ void FMonolithMaterialActions::RegisterActions(FMonolithToolRegistry& Registry)
 		FMonolithActionHandler::CreateStatic(&FMonolithMaterialActions::CreatePbrMaterialFromDisk),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("material_path"), TEXT("UE asset path for the new material (e.g. /Game/Materials/M_MyMaterial)"))
-			.Required(TEXT("texture_folder"), TEXT("string"), TEXT("UE content folder for imported textures (e.g. /Game/Textures/MyMaterial)"))
+			.RequiredAssetPath(TEXT("texture_folder"), TEXT("UE content folder for imported textures (e.g. /Game/Textures/MyMaterial)"))
 			.Required(TEXT("maps"), TEXT("object"), TEXT("Map of PBR type to disk path. Keys: basecolor, albedo, normal, roughness, metallic, metalness, ao, height, emissive, opacity"))
 			.Optional(TEXT("blend_mode"), TEXT("string"), TEXT("Material blend mode"), TEXT("Opaque"))
 			.Optional(TEXT("shading_model"), TEXT("string"), TEXT("Shading model"), TEXT("DefaultLit"))

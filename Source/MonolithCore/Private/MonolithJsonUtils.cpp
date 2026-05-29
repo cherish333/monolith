@@ -149,6 +149,253 @@ namespace MonolithResponseShapingDetail
 		return false;
 	}
 
+	/** True if the JSON value is an array AND every element is a JSON object. Empty arrays return false. */
+	static bool IsArrayOfObjects(const TSharedPtr<FJsonValue>& Val)
+	{
+		if (!Val.IsValid() || Val->Type != EJson::Array)
+		{
+			return false;
+		}
+		const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+		if (!Val->TryGetArray(Arr) || !Arr || Arr->Num() == 0)
+		{
+			return false;
+		}
+		for (const TSharedPtr<FJsonValue>& Elem : *Arr)
+		{
+			if (!Elem.IsValid() || Elem->Type != EJson::Object)
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	/**
+	 * Phase 1.1 — `_row_fields` per-row whitelist.
+	 *
+	 * Locate the unique top-level array-of-objects key in Response. If exactly
+	 * one such key exists, mutate each row in-place to retain only keys in
+	 * RowFieldsSet. If multiple exist, emit an ambiguity warning and skip.
+	 * If none exist, emit a "no list payload found" warning and skip.
+	 * Empty RowFieldsSet is a no-op with warning.
+	 */
+	static void ApplyRowFieldsFilter(
+		TSharedPtr<FJsonObject>& Response,
+		const TSet<FString>& RowFieldsSet,
+		TArray<FString>& Warnings)
+	{
+		if (!Response.IsValid())
+		{
+			return;
+		}
+		if (RowFieldsSet.Num() == 0)
+		{
+			Warnings.Add(TEXT("`_row_fields:[]` is empty — no-op. Provide one or more row field names to filter list payloads."));
+			return;
+		}
+
+		// Find all top-level array-of-objects keys (the candidate list payloads).
+		TArray<FString> ListPayloadKeys;
+		for (const auto& Pair : Response->Values)
+		{
+			if (IsArrayOfObjects(Pair.Value))
+			{
+				ListPayloadKeys.Add(Pair.Key);
+			}
+		}
+
+		if (ListPayloadKeys.Num() == 0)
+		{
+			Warnings.Add(TEXT("`_row_fields` skipped — no top-level array-of-objects (list payload) found in response."));
+			return;
+		}
+		if (ListPayloadKeys.Num() > 1)
+		{
+			Warnings.Add(FString::Printf(
+				TEXT("_row_fields ambiguous: multiple list payloads found (%s) — use _path_fields"),
+				*FString::Join(ListPayloadKeys, TEXT(", "))));
+			return;
+		}
+
+		// Exactly one list payload — filter each row.
+		const FString& ListKey = ListPayloadKeys[0];
+		const TArray<TSharedPtr<FJsonValue>>* RowsPtr = nullptr;
+		if (!Response->TryGetArrayField(ListKey, RowsPtr) || !RowsPtr)
+		{
+			return;
+		}
+
+		for (const TSharedPtr<FJsonValue>& RowVal : *RowsPtr)
+		{
+			if (!RowVal.IsValid() || RowVal->Type != EJson::Object)
+			{
+				continue;
+			}
+			const TSharedPtr<FJsonObject>* RowObjPtr = nullptr;
+			if (!RowVal->TryGetObject(RowObjPtr) || !RowObjPtr || !(*RowObjPtr).IsValid())
+			{
+				continue;
+			}
+			TSharedPtr<FJsonObject> RowObj = *RowObjPtr;
+
+			TArray<FString> ExistingKeys;
+			RowObj->Values.GetKeys(ExistingKeys);
+			for (const FString& K : ExistingKeys)
+			{
+				if (!RowFieldsSet.Contains(K))
+				{
+					RowObj->RemoveField(K);
+				}
+			}
+		}
+	}
+
+	/**
+	 * Walk a dotted path through Source. Returns the JSON value at the leaf,
+	 * or an invalid TSharedPtr if any segment is missing or non-traversable.
+	 * Path segments traverse objects only (we do NOT index into arrays).
+	 */
+	static TSharedPtr<FJsonValue> WalkDottedPath(
+		const TSharedPtr<FJsonObject>& Source,
+		const TArray<FString>& Segments)
+	{
+		if (!Source.IsValid() || Segments.Num() == 0)
+		{
+			return nullptr;
+		}
+
+		TSharedPtr<FJsonObject> CurrentObj = Source;
+		for (int32 Idx = 0; Idx < Segments.Num(); ++Idx)
+		{
+			const FString& Seg = Segments[Idx];
+			if (!CurrentObj.IsValid() || !CurrentObj->HasField(Seg))
+			{
+				return nullptr;
+			}
+			TSharedPtr<FJsonValue> Val = CurrentObj->TryGetField(Seg);
+			if (!Val.IsValid())
+			{
+				return nullptr;
+			}
+			if (Idx == Segments.Num() - 1)
+			{
+				return Val;
+			}
+			// Must descend further — value at this level must be an object.
+			if (Val->Type != EJson::Object)
+			{
+				return nullptr;
+			}
+			const TSharedPtr<FJsonObject>* NextObjPtr = nullptr;
+			if (!Val->TryGetObject(NextObjPtr) || !NextObjPtr || !(*NextObjPtr).IsValid())
+			{
+				return nullptr;
+			}
+			CurrentObj = *NextObjPtr;
+		}
+		return nullptr;
+	}
+
+	/**
+	 * Insert a JSON value at a dotted path into a destination object, creating
+	 * intermediate objects as needed. Existing intermediates that are not objects
+	 * are silently overwritten (we own Dest and started empty).
+	 */
+	static void InsertAtDottedPath(
+		TSharedPtr<FJsonObject>& Dest,
+		const TArray<FString>& Segments,
+		const TSharedPtr<FJsonValue>& Leaf)
+	{
+		if (!Dest.IsValid() || Segments.Num() == 0 || !Leaf.IsValid())
+		{
+			return;
+		}
+
+		TSharedPtr<FJsonObject> CurrentObj = Dest;
+		for (int32 Idx = 0; Idx < Segments.Num(); ++Idx)
+		{
+			const FString& Seg = Segments[Idx];
+			if (Idx == Segments.Num() - 1)
+			{
+				CurrentObj->SetField(Seg, Leaf);
+				return;
+			}
+
+			// Need an intermediate object at this segment.
+			TSharedPtr<FJsonObject> NextObj;
+			if (CurrentObj->HasField(Seg))
+			{
+				TSharedPtr<FJsonValue> Existing = CurrentObj->TryGetField(Seg);
+				if (Existing.IsValid() && Existing->Type == EJson::Object)
+				{
+					const TSharedPtr<FJsonObject>* ExistingObjPtr = nullptr;
+					if (Existing->TryGetObject(ExistingObjPtr) && ExistingObjPtr && (*ExistingObjPtr).IsValid())
+					{
+						NextObj = *ExistingObjPtr;
+					}
+				}
+			}
+			if (!NextObj.IsValid())
+			{
+				NextObj = MakeShared<FJsonObject>();
+				CurrentObj->SetObjectField(Seg, NextObj);
+			}
+			CurrentObj = NextObj;
+		}
+	}
+
+	/**
+	 * Phase 1.1 — `_path_fields` dotted-path retention.
+	 *
+	 * For each "a.b.c" path string, walk Response; if the leaf exists, copy it
+	 * into a fresh structure mirroring the path. Missing paths drop cleanly.
+	 * Response is REPLACED with the built structure (so caller sees a minimal
+	 * object containing only the matched leaves).
+	 *
+	 * Empty PathFieldsSet is a no-op with warning.
+	 */
+	static void ApplyPathFieldsFilter(
+		TSharedPtr<FJsonObject>& Response,
+		const TSet<FString>& PathFieldsSet,
+		TArray<FString>& Warnings)
+	{
+		if (!Response.IsValid())
+		{
+			return;
+		}
+		if (PathFieldsSet.Num() == 0)
+		{
+			Warnings.Add(TEXT("`_path_fields:[]` is empty — no-op. Provide one or more dotted paths (e.g., \"uclass.class_name\")."));
+			return;
+		}
+
+		TSharedPtr<FJsonObject> Built = MakeShared<FJsonObject>();
+		for (const FString& Path : PathFieldsSet)
+		{
+			TArray<FString> Segments;
+			Path.ParseIntoArray(Segments, TEXT("."), /*InCullEmpty=*/true);
+			if (Segments.Num() == 0)
+			{
+				continue;
+			}
+
+			TSharedPtr<FJsonValue> Leaf = WalkDottedPath(Response, Segments);
+			if (!Leaf.IsValid())
+			{
+				continue; // Missing path — clean drop, no warning.
+			}
+			InsertAtDottedPath(Built, Segments, Leaf);
+		}
+
+		// Swap Response contents with Built. Keep the same object handle.
+		Response->Values.Empty();
+		for (const auto& Pair : Built->Values)
+		{
+			Response->SetField(Pair.Key, Pair.Value);
+		}
+	}
+
 	/** A value counts as "empty" for _compact_json if it is null, "", {}, or []. Numbers/bools/nonempty pass. */
 	static bool IsEmptyForCompact(const TSharedPtr<FJsonValue>& Val)
 	{
@@ -200,8 +447,23 @@ void ApplyResponseShaping(
 
 	TSet<FString> FieldsSet;
 	TSet<FString> OmitSet;
-	const bool bHasFields = MonolithResponseShapingDetail::ReadStringArrayParam(Params, TEXT("_fields"), FieldsSet);
-	const bool bHasOmit   = MonolithResponseShapingDetail::ReadStringArrayParam(Params, TEXT("_omit"),   OmitSet);
+	TSet<FString> RowFieldsSet;
+	TSet<FString> PathFieldsSet;
+	const bool bHasFields     = MonolithResponseShapingDetail::ReadStringArrayParam(Params, TEXT("_fields"),      FieldsSet);
+	const bool bHasOmit       = MonolithResponseShapingDetail::ReadStringArrayParam(Params, TEXT("_omit"),        OmitSet);
+	// _row_fields / _path_fields: presence check is "key exists" (so empty-array
+	// can trigger the documented warning). Use HasField rather than the bool
+	// returned by ReadStringArrayParam, which only signals non-empty success.
+	const bool bHasRowFields  = Params->HasField(TEXT("_row_fields"));
+	const bool bHasPathFields = Params->HasField(TEXT("_path_fields"));
+	if (bHasRowFields)
+	{
+		MonolithResponseShapingDetail::ReadStringArrayParam(Params, TEXT("_row_fields"), RowFieldsSet);
+	}
+	if (bHasPathFields)
+	{
+		MonolithResponseShapingDetail::ReadStringArrayParam(Params, TEXT("_path_fields"), PathFieldsSet);
+	}
 
 	bool bCompact = false;
 	if (!Params->TryGetBoolField(TEXT("_compact_json"), bCompact))
@@ -246,6 +508,23 @@ void ApplyResponseShaping(
 		{
 			Response->RemoveField(K);
 		}
+	}
+
+	// Phase 1.1 — _row_fields per-row whitelist on the unique list payload.
+	// Runs AFTER _fields/_omit (so if _fields whitelisted away the list payload
+	// the row filter is a clean no-op with a "no list payload" warning).
+	if (bHasRowFields)
+	{
+		MonolithResponseShapingDetail::ApplyRowFieldsFilter(Response, RowFieldsSet, Warnings);
+	}
+
+	// Phase 1.1 — _path_fields dotted-path retention. REPLACES Response with a
+	// freshly-built structure containing only matched leaves. Runs AFTER
+	// _row_fields so row filtering applies before the path projection (which
+	// can preserve a filtered list payload via a path that lands on its key).
+	if (bHasPathFields)
+	{
+		MonolithResponseShapingDetail::ApplyPathFieldsFilter(Response, PathFieldsSet, Warnings);
 	}
 
 	// _compact_json — drop top-level keys whose value is null/""/{}/[]. Runs AFTER fields/omit.

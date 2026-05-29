@@ -78,7 +78,7 @@ void FMonolithBlueprintCompileActions::RegisterActions(FMonolithToolRegistry& Re
 		TEXT("Save ALL currently-dirty Blueprint and Widget Blueprint packages in one sweep (closes the data-loss window after a batch of edit actions that dirty but do not persist packages). Filter with path_prefix (default /Game). Returns saved[], failed[], count."),
 		FMonolithActionHandler::CreateStatic(&HandleSaveDirtyAssets),
 		FParamSchemaBuilder()
-			.Optional(TEXT("path_prefix"), TEXT("string"), TEXT("Only save assets whose package path starts with this prefix (default: /Game). Pass empty string to save all dirty Blueprint/Widget packages regardless of path."), TEXT("/Game"))
+			.OptionalAssetPathWithDefault(TEXT("path_prefix"), TEXT("Only save assets whose package path starts with this prefix (default: /Game). Pass empty string to save all dirty Blueprint/Widget packages regardless of path."), TEXT("/Game"))
 			.Build());
 }
 

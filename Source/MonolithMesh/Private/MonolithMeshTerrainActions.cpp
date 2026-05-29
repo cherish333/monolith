@@ -115,7 +115,7 @@ void FMonolithMeshTerrainActions::RegisterActions(FMonolithToolRegistry& Registr
 			.Optional(TEXT("material_pier"), TEXT("string"), TEXT("Material asset path for pier columns"))
 			.Optional(TEXT("location"), TEXT("array"), TEXT("World location [x, y, z]"))
 			.Optional(TEXT("label"), TEXT("string"), TEXT("Actor label"))
-			.Optional(TEXT("folder"), TEXT("string"), TEXT("Outliner folder path"))
+			.OptionalAssetPath(TEXT("folder"), TEXT("Outliner folder path"))
 			.Optional(TEXT("overwrite"), TEXT("boolean"), TEXT("Allow overwriting existing asset"), TEXT("false"))
 			.Build());
 
@@ -134,7 +134,7 @@ void FMonolithMeshTerrainActions::RegisterActions(FMonolithToolRegistry& Registr
 			.Optional(TEXT("material"), TEXT("string"), TEXT("Material asset path"))
 			.Optional(TEXT("location"), TEXT("array"), TEXT("World location [x, y, z]"))
 			.Optional(TEXT("label"), TEXT("string"), TEXT("Actor label"))
-			.Optional(TEXT("folder"), TEXT("string"), TEXT("Outliner folder path"))
+			.OptionalAssetPath(TEXT("folder"), TEXT("Outliner folder path"))
 			.Build());
 
 	// ---- place_building_on_terrain ----
@@ -148,7 +148,7 @@ void FMonolithMeshTerrainActions::RegisterActions(FMonolithToolRegistry& Registr
 			.Optional(TEXT("terrain_samples"), TEXT("object"), TEXT("Pre-computed terrain samples (auto-sampled if omitted)"))
 			.Optional(TEXT("hospice_mode"), TEXT("boolean"), TEXT("Generate ADA-compliant ramps"), TEXT("false"))
 			.Optional(TEXT("create_retaining_walls"), TEXT("boolean"), TEXT("Auto-create retaining walls for cut sites"), TEXT("true"))
-			.Optional(TEXT("folder"), TEXT("string"), TEXT("Outliner folder path"))
+			.OptionalAssetPath(TEXT("folder"), TEXT("Outliner folder path"))
 			.Optional(TEXT("seed"), TEXT("integer"), TEXT("Random seed for any procedural variation"))
 			.Build());
 }

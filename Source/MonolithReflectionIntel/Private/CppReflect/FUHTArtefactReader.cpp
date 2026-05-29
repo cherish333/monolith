@@ -37,6 +37,7 @@
 #include "CppReflect/FUHTArtefactReader.h"
 #include "CppReflect/CppReflectSchema.h"
 #include "MonolithReflectionIntelModule.h"
+#include "MonolithRIMetaTable.h"
 
 #include "HAL/FileManager.h"
 #include "HAL/PlatformFileManager.h"
@@ -203,9 +204,16 @@ bool FUHTArtefactReader::Run(FSQLiteDatabase& DB,
 	const TArray<FString>& ArtefactRoots,
 	bool bIncludeEnginePlugins,
 	bool bAllowMarketplacePaths,
-	FString& OutStatus)
+	FString& OutStatus,
+	TArray<FString>* OutScannedRoots,
+	TArray<TPair<FString, FString>>* OutSkippedRoots)
 {
 	ensure(IsInGameThread());
+
+	// EnsureMetaTable up front — keeps the stale-detection table alongside the
+	// reflect_* tables under the same lock window. Non-fatal on failure (the
+	// rest of the run can still produce useful data); logged inside.
+	MonolithRIMeta::EnsureMetaTable(DB);
 
 	if (!EnsureSchema(DB))
 	{
@@ -242,15 +250,28 @@ bool FUHTArtefactReader::Run(FSQLiteDatabase& DB,
 	}
 
 	// Collect all `(ModuleName, AbsArtefactPath)` pairs from every root.
+	// Handover doc item #2: track scanned vs skipped roots and surface them up
+	// (callers wire them into rebuild_reflection_index response). Bump the
+	// missing-root log from Verbose to Warning so silent skips stop costing
+	// debug cycles (the marketplace-scan rebase bug took 2 cycles purely
+	// because this log was Verbose).
 	TArray<TPair<FString, FString>> ModuleAndArtefactPairs;
 	for (const FString& Root : ResolvedRoots)
 	{
 		IPlatformFile& Pf = FPlatformFileManager::Get().GetPlatformFile();
 		if (!Pf.DirectoryExists(*Root))
 		{
-			UE_LOG(LogMonolithReflectionIntel, Verbose,
+			UE_LOG(LogMonolithReflectionIntel, Warning,
 				TEXT("FUHTArtefactReader: skipping missing root '%s'"), *Root);
+			if (OutSkippedRoots)
+			{
+				OutSkippedRoots->Emplace(Root, TEXT("directory does not exist"));
+			}
 			continue;
+		}
+		if (OutScannedRoots)
+		{
+			OutScannedRoots->Add(Root);
 		}
 		CollectArtefacts(Root, bIncludeEnginePlugins, bAllowMarketplacePaths, ModuleAndArtefactPairs);
 	}
@@ -262,6 +283,10 @@ bool FUHTArtefactReader::Run(FSQLiteDatabase& DB,
 			"FUHTArtefactReader: no UHT artefacts found — has the project built "
 			"with UBT yet? (Live Coding patches do not produce gen.cpp).");
 		UE_LOG(LogMonolithReflectionIntel, Warning, TEXT("%s"), *OutStatus);
+		// Stamp the code-version even on zero-artefact success — schema is in
+		// place and the row shape matches; rebuild on next code-bump still works.
+		MonolithRIMeta::WriteStoredVersion(DB, TEXT("cppreflect"),
+			MonolithRIMeta::GetIndexerCodeVersion(TEXT("cppreflect")));
 		return true; // schema bootstrap counts as success
 	}
 
@@ -301,6 +326,12 @@ bool FUHTArtefactReader::Run(FSQLiteDatabase& DB,
 		TEXT("FUHTArtefactReader: %d artefacts scanned → UClasses=%d UProps=%d UFuncs=%d UInterfaceImpls=%d"),
 		FilesScanned, TotalUClasses, TotalUProps, TotalUFuncs, TotalUImpls);
 	UE_LOG(LogMonolithReflectionIntel, Log, TEXT("%s"), *OutStatus);
+
+	// Handover doc item #1 — stamp the cppreflect code-version on success so the
+	// adapter's lazy-bootstrap version-mismatch check can detect a stale schema
+	// next call (and force a rebuild).
+	MonolithRIMeta::WriteStoredVersion(DB, TEXT("cppreflect"),
+		MonolithRIMeta::GetIndexerCodeVersion(TEXT("cppreflect")));
 	return true;
 }
 

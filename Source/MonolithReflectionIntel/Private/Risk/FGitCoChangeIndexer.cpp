@@ -27,6 +27,7 @@
 #include "Risk/FGitCoChangeIndexer.h"
 #include "Risk/RiskSchema.h"
 #include "MonolithReflectionIntelModule.h"
+#include "MonolithRIMetaTable.h"
 
 #include "HAL/PlatformFileManager.h"
 #include "HAL/PlatformProcess.h"
@@ -126,6 +127,14 @@ bool FGitCoChangeIndexer::Run(
 		return false;
 	}
 
+	// Handover doc item #1 — ensure the stale-detection meta table exists.
+	// GitCoChange is one of three risk sub-indexers; we stamp the unified "risk"
+	// subsystem version after THIS indexer's writes succeed (the runner only
+	// returns true when all three subindexers report OK, but stamping here is
+	// sufficient because the version check is just "did the parsing code shift"
+	// and the runner re-fires all three on rebuild).
+	MonolithRIMeta::EnsureMetaTable(DB);
+
 	// Wipe-and-rewrite — keep semantics simple. Per-repo data dominates so the
 	// repo_tag column is the natural delete key. Wipe everything; the loop
 	// below re-populates per repo.
@@ -218,6 +227,10 @@ bool FGitCoChangeIndexer::Run(
 			 "%d co-change pairs, %d churn rows"),
 		ReposScanned, ReposSkipped, ErrorRepoCount, TotalPairs, TotalChurnRows);
 	UE_LOG(LogMonolithReflectionIntel, Log, TEXT("%s"), *OutStatus);
+
+	// Handover doc item #1 — stamp the risk code-version on success.
+	MonolithRIMeta::WriteStoredVersion(DB, TEXT("risk"),
+		MonolithRIMeta::GetIndexerCodeVersion(TEXT("risk")));
 	return true;
 }
 

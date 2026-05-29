@@ -677,6 +677,11 @@ bool FMonolithReflectionIntelModule::RunCppReflectIndexersOnce(FString& OutStatu
 	// FAssetGraphJoiner reads it.
 	FString UhtStatus, JoinerStatus;
 	bool bUhtOk = false, bJoinerOk = false;
+	// Handover doc item #2 — collect scanned/skipped roots from the UHT reader
+	// and stamp them onto the module instance for FReflectMaintenanceAdapter to
+	// surface in the rebuild_reflection_index response.
+	TArray<FString> ScannedRootsLocal;
+	TArray<TPair<FString, FString>> SkippedRootsLocal;
 	{
 		FScopeLock Lock(&SharedDb->GetLock());
 		FSQLiteDatabase* RawDb = SharedDb->GetRawHandle();
@@ -691,10 +696,16 @@ bool FMonolithReflectionIntelModule::RunCppReflectIndexersOnce(FString& OutStatu
 			return false;
 		}
 		FUHTArtefactReader UhtReader;
-		bUhtOk = UhtReader.Run(*RawDb, ArtefactRoots, bIncludeEnginePlugins, bAllowMarketplacePaths, UhtStatus);
+		bUhtOk = UhtReader.Run(*RawDb, ArtefactRoots, bIncludeEnginePlugins, bAllowMarketplacePaths,
+			UhtStatus, &ScannedRootsLocal, &SkippedRootsLocal);
 
 		FAssetGraphJoiner Joiner;
 		bJoinerOk = Joiner.Run(*RawDb, JoinerStatus);
+	}
+	if (Self)
+	{
+		Self->LastCppReflectScannedRoots = MoveTemp(ScannedRootsLocal);
+		Self->LastCppReflectSkippedRoots = MoveTemp(SkippedRootsLocal);
 	}
 
 	OutStatus = FString::Printf(
@@ -803,6 +814,10 @@ bool FMonolithReflectionIntelModule::RunNetworkIndexerOnce(FString& OutStatus)
 	}
 
 	bool bOk = false;
+	// Handover doc item #2 — capture scanned/skipped roots for the network
+	// indexer too; surfaced via FReflectMaintenanceAdapter.
+	TArray<FString> NetScannedRoots;
+	TArray<TPair<FString, FString>> NetSkippedRoots;
 	{
 		FScopeLock Lock(&SharedDb->GetLock());
 		FSQLiteDatabase* RawDb = SharedDb->GetRawHandle();
@@ -817,7 +832,13 @@ bool FMonolithReflectionIntelModule::RunNetworkIndexerOnce(FString& OutStatus)
 			return false;
 		}
 		FNetworkRepIndexer Indexer;
-		bOk = Indexer.Run(*RawDb, ArtefactRoots, bIncludeEnginePlugins, bAllowMarketplacePaths, OutStatus);
+		bOk = Indexer.Run(*RawDb, ArtefactRoots, bIncludeEnginePlugins, bAllowMarketplacePaths,
+			OutStatus, &NetScannedRoots, &NetSkippedRoots);
+	}
+	if (Self)
+	{
+		Self->LastNetworkScannedRoots = MoveTemp(NetScannedRoots);
+		Self->LastNetworkSkippedRoots = MoveTemp(NetSkippedRoots);
 	}
 
 	if (Self)

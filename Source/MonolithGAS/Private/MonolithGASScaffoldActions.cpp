@@ -91,7 +91,7 @@ void FMonolithGASScaffoldActions::RegisterActions(FMonolithToolRegistry& Registr
 		FMonolithActionHandler::CreateStatic(&HandleGrantAbilityToPawn),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("pawn_bp_path"), TEXT("Pawn Blueprint asset path (e.g. /Game/Tests/BP_TestPawn) — must contain a UAbilitySystemComponent"))
-			.Required(TEXT("ability_class_path"), TEXT("string"), TEXT("GameplayAbility class path — Blueprint asset path or class name"))
+			.RequiredAssetPath(TEXT("ability_class_path"), TEXT("GameplayAbility class path — Blueprint asset path or class name"))
 			.Optional(TEXT("level"), TEXT("integer"), TEXT("Ability level (default 1, stored alongside class — only used if ASC array is FGameplayAbilitySpec-shaped, otherwise ignored)"), TEXT("1"))
 			.Optional(TEXT("input_id"), TEXT("integer"), TEXT("Input ID (default -1, only used if ASC array is FGameplayAbilitySpec-shaped, otherwise ignored)"), TEXT("-1"))
 			.Build());

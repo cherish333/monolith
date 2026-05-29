@@ -113,7 +113,7 @@ void FMonolithAIControllerActions::RegisterActions(FMonolithToolRegistry& Regist
 			.Required(TEXT("location"), TEXT("object"), TEXT("Spawn location as {x,y,z}"))
 			.Optional(TEXT("rotation"), TEXT("object"), TEXT("Spawn rotation as {pitch,yaw,roll}"))
 			.Optional(TEXT("label"), TEXT("string"), TEXT("Actor label in the Outliner"))
-			.Optional(TEXT("folder_path"), TEXT("string"), TEXT("World Outliner folder (default: AI)"))
+			.OptionalAssetPath(TEXT("folder_path"), TEXT("World Outliner folder (default: AI)"))
 			.Build());
 
 	// 104. get_ai_actors

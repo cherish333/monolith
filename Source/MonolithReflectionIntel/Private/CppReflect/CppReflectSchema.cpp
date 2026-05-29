@@ -21,8 +21,13 @@ namespace MonolithCppReflectSchema
 		// list — bare C++ name without prefix-stripping (`ACharacter`,
 		// `UObject`, ...). `source_path` is project-relative forward-slashed
 		// (e.g. "Source/Leviathan/Public/Characters/LeviathanCharacterBase.h").
-		// `source_line` is 0 in Phase 3a — UHT artefacts do not carry the
-		// declaration line; the tree-sitter Phase 3b pass will fill this in.
+		// `source_line` is 0 at write time — UHT artefacts do not carry the
+		// declaration line. The cppreflect query adapter (FCppReflectQueryAdapter)
+		// now best-effort joins the line from the source-symbol index (the same
+		// EngineSource.db `symbols` table that powers source_query) when the
+		// stored value is 0, so `get_uclass` / `list_ufunctions` responses
+		// surface real lines without forcing a separate `source_query` call. The
+		// tree-sitter Phase 3b pass will fill the column itself.
 		// `flags` is a colon-joined metadata-key list (UHT Class_MetaDataParams
 		// keys, e.g. "IsBlueprintBase:BlueprintType") — NOT C++ specifiers. UHT
 		// rewrites some specifiers into metadata keys (UCLASS(Blueprintable) is

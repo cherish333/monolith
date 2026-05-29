@@ -9,8 +9,10 @@
 
 #include "Maintenance/FReflectMaintenanceAdapter.h"
 #include "MonolithReflectionIntelModule.h"
+#include "MonolithRIMetaTable.h"
 
 #include "Dom/JsonObject.h"
+#include "Dom/JsonValue.h"
 #include "Modules/ModuleManager.h"
 #include "MonolithParamSchema.h"
 
@@ -92,5 +94,64 @@ FMonolithActionResult FReflectMaintenanceAdapter::HandleRebuildReflectionIndex(
 	Out->SetStringField(TEXT("cppreflect"), CppReflectStatus);
 	Out->SetStringField(TEXT("network"), NetworkStatus);
 	Out->SetBoolField(TEXT("project_only"), true);
+
+	// Handover doc item #1 — surface the stamped indexer-code-version for each
+	// RI subsystem so callers can verify the freshly-rebuilt tables carry the
+	// current compiled version (and bump-out-of-band detection has somewhere to
+	// land in the response). All four subsystems' constants live in
+	// MonolithRIMetaTable.cpp; we just project them.
+	{
+		TSharedPtr<FJsonObject> Versions = MakeShared<FJsonObject>();
+		Versions->SetNumberField(TEXT("cppreflect"),
+			MonolithRIMeta::GetIndexerCodeVersion(TEXT("cppreflect")));
+		Versions->SetNumberField(TEXT("network"),
+			MonolithRIMeta::GetIndexerCodeVersion(TEXT("network")));
+		Versions->SetNumberField(TEXT("risk"),
+			MonolithRIMeta::GetIndexerCodeVersion(TEXT("risk")));
+		Versions->SetNumberField(TEXT("decision"),
+			MonolithRIMeta::GetIndexerCodeVersion(TEXT("decision")));
+		Out->SetObjectField(TEXT("meta_versions"), Versions);
+	}
+
+	// Handover doc item #2 — surface per-subsystem scanned/skipped roots. The
+	// indexers track these (FUHTArtefactReader / FNetworkRepIndexer optional
+	// output params); the module's runner stamps the latest sets onto its
+	// instance. Project them into the response so silent "root added but it
+	// doesn't exist" failures are visible (vs the previous Verbose-only log).
+	auto PathsToJson = [](const TArray<FString>& Paths)
+	{
+		TArray<TSharedPtr<FJsonValue>> A;
+		A.Reserve(Paths.Num());
+		for (const FString& P : Paths) { A.Add(MakeShared<FJsonValueString>(P)); }
+		return A;
+	};
+	auto SkipsToJson = [](const TArray<TPair<FString, FString>>& Skipped)
+	{
+		TArray<TSharedPtr<FJsonValue>> A;
+		A.Reserve(Skipped.Num());
+		for (const TPair<FString, FString>& S : Skipped)
+		{
+			TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
+			O->SetStringField(TEXT("path"),   S.Key);
+			O->SetStringField(TEXT("reason"), S.Value);
+			A.Add(MakeShared<FJsonValueObject>(O));
+		}
+		return A;
+	};
+	{
+		TSharedPtr<FJsonObject> CppDiag = MakeShared<FJsonObject>();
+		CppDiag->SetArrayField(TEXT("roots_scanned"),
+			PathsToJson(Module->GetLastCppReflectScannedRoots()));
+		CppDiag->SetArrayField(TEXT("roots_skipped"),
+			SkipsToJson(Module->GetLastCppReflectSkippedRoots()));
+		Out->SetObjectField(TEXT("cppreflect_diagnostics"), CppDiag);
+
+		TSharedPtr<FJsonObject> NetDiag = MakeShared<FJsonObject>();
+		NetDiag->SetArrayField(TEXT("roots_scanned"),
+			PathsToJson(Module->GetLastNetworkScannedRoots()));
+		NetDiag->SetArrayField(TEXT("roots_skipped"),
+			SkipsToJson(Module->GetLastNetworkSkippedRoots()));
+		Out->SetObjectField(TEXT("network_diagnostics"), NetDiag);
+	}
 	return FMonolithActionResult::Success(Out);
 }

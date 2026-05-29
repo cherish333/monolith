@@ -8,6 +8,7 @@
 
 #include "CppReflect/FCppReflectQueryAdapter.h"
 #include "MonolithReflectionIntelModule.h"
+#include "MonolithRIMetaTable.h"
 
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
@@ -94,6 +95,95 @@ namespace
 	// (colon-lists do not repeat a key within one row), so the count is the
 	// number of UCLASSes carrying that token.
 	// ---------------------------------------------------------------------
+
+	/**
+	 * Handover doc item #10 — best-effort source-line auto-join.
+	 *
+	 * UHT artefacts discard the original header line number, so every reflect_*
+	 * row carries source_line=0. Rather than round-trip every caller through
+	 * source_query("search_source"), look the line up in the same EngineSource.db
+	 * symbol index that already powers source_query.
+	 *
+	 * Lookup shape:
+	 *   SELECT line_start FROM symbols
+	 *   WHERE name = ? AND kind IN ('class','struct')
+	 *   LIMIT 1
+	 *
+	 * Why kind-restricted: `symbols.name` is the raw C++ identifier (preserves
+	 * A/U/I prefix — verified in MonolithCppParser.cpp:170 where Kind is set to
+	 * 'class' or 'struct'). For UCLASS rows this matches the class_name field
+	 * 1:1.
+	 *
+	 * `source_path` join is NOT used: cppreflect rows store the UHT
+	 * ModuleRelativePath ("Public/Foo/Bar.h") while symbols.files.path stores
+	 * the absolute / project-relative path from IFileManager::FindFilesRecursive,
+	 * so a direct equality JOIN would never match. Name-only lookup is a
+	 * best-effort compromise (same-named classes in different modules collapse
+	 * to the first hit; acceptable per the "0 means unknown" contract — caller
+	 * always tolerates 0).
+	 *
+	 * Returns 0 on miss. Caller must already hold the shared DB lock (the
+	 * borrowed source-symbol DB is the SAME handle this query uses).
+	 */
+	int32 LookupClassSourceLine(FSQLiteDatabase& DB, const FString& ClassName)
+	{
+		if (ClassName.IsEmpty()) { return 0; }
+		FSQLitePreparedStatement Stmt;
+		if (!Stmt.Create(DB, TEXT(
+			"SELECT line_start FROM symbols "
+			"WHERE name = ? AND kind IN ('class','struct') "
+			"LIMIT 1;")))
+		{
+			return 0;
+		}
+		Stmt.SetBindingValueByIndex(1, ClassName);
+		if (Stmt.Step() != ESQLitePreparedStatementStepResult::Row) { return 0; }
+		int32 Line = 0;
+		Stmt.GetColumnValueByIndex(0, Line);
+		return Line;
+	}
+
+	/** Variant for UFUNCTION rows: scope the function-name lookup to the owning
+	 *  class via the parent-symbol foreign key. Empty class falls back to a
+	 *  bare name lookup (won't disambiguate between same-named functions in
+	 *  different classes; engine code with that pattern keeps line=0). */
+	int32 LookupFunctionSourceLine(FSQLiteDatabase& DB, const FString& OwningClass, const FString& FunctionName)
+	{
+		if (FunctionName.IsEmpty()) { return 0; }
+		if (OwningClass.IsEmpty())
+		{
+			FSQLitePreparedStatement Stmt;
+			if (!Stmt.Create(DB, TEXT(
+				"SELECT line_start FROM symbols "
+				"WHERE name = ? AND kind IN ('function','method') "
+				"LIMIT 1;")))
+			{
+				return 0;
+			}
+			Stmt.SetBindingValueByIndex(1, FunctionName);
+			if (Stmt.Step() != ESQLitePreparedStatementStepResult::Row) { return 0; }
+			int32 Line = 0;
+			Stmt.GetColumnValueByIndex(0, Line);
+			return Line;
+		}
+		FSQLitePreparedStatement Stmt;
+		if (!Stmt.Create(DB, TEXT(
+			"SELECT s.line_start FROM symbols s "
+			"JOIN symbols p ON p.id = s.parent_symbol_id "
+			"WHERE s.name = ? AND s.kind IN ('function','method') "
+			"  AND p.name = ? AND p.kind IN ('class','struct') "
+			"LIMIT 1;")))
+		{
+			return 0;
+		}
+		Stmt.SetBindingValueByIndex(1, FunctionName);
+		Stmt.SetBindingValueByIndex(2, OwningClass);
+		if (Stmt.Step() != ESQLitePreparedStatementStepResult::Row) { return 0; }
+		int32 Line = 0;
+		Stmt.GetColumnValueByIndex(0, Line);
+		return Line;
+	}
+
 	bool CollectClassSpecifierTokens(FSQLiteDatabase& DB, TMap<FString, int32>& OutCounts)
 	{
 		FSQLitePreparedStatement Stmt;
@@ -282,7 +372,28 @@ FSQLiteDatabase* FCppReflectQueryAdapter::GetRawDB()
 		const bool bTableExists = bPrepared
 			&& TableCheck.Step() == ESQLitePreparedStatementStepResult::Row;
 		TableCheck.Destroy();
-		if (!bTableExists)
+
+		// Handover doc item #1 — stale detection. Force-rebuild when the table
+		// is absent OR the stamped indexer-code-version no longer matches the
+		// current compiled constant. This catches the silent-stale-rows trap
+		// caused by parser/schema changes that don't invalidate the table itself.
+		bool bVersionMismatch = false;
+		if (bTableExists)
+		{
+			int32 StoredVersion = 0;
+			const bool bHasStamp = MonolithRIMeta::ReadStoredVersion(
+				*DB, TEXT("cppreflect"), StoredVersion);
+			const int32 CurrentVersion = MonolithRIMeta::GetIndexerCodeVersion(TEXT("cppreflect"));
+			if (!bHasStamp || StoredVersion != CurrentVersion)
+			{
+				UE_LOG(LogMonolithReflectionIntel, Log,
+					TEXT("cppreflect: stale-detection triggered (stored=%d, current=%d) — forcing rebuild"),
+					bHasStamp ? StoredVersion : -1, CurrentVersion);
+				bVersionMismatch = true;
+			}
+		}
+
+		if (!bTableExists || bVersionMismatch)
 		{
 			Module->ResetCachedQueryDb();
 			FString IndexerStatus;
@@ -348,6 +459,14 @@ FMonolithActionResult FCppReflectQueryAdapter::HandleGetUClass(const TSharedPtr<
 	ClassStmt.GetColumnValueByIndex(3, SrcPath);
 	ClassStmt.GetColumnValueByIndex(4, SrcLine);
 	ClassStmt.GetColumnValueByIndex(5, Flags);
+
+	// Handover doc item #10 — best-effort auto-join the original source line
+	// when the stored value is 0 (UHT discards header line numbers; the
+	// source-symbol index has them).
+	if (SrcLine == 0)
+	{
+		SrcLine = LookupClassSourceLine(*DB, CName);
+	}
 
 	TSharedPtr<FJsonObject> UClassObj = MakeShared<FJsonObject>();
 	UClassObj->SetStringField(TEXT("class_name"), CName);
@@ -622,7 +741,7 @@ FMonolithActionResult FCppReflectQueryAdapter::HandleListUFunctions(const TShare
 	if (bBpOnly)                { WhereSql += TEXT(" AND blueprint_callable = 1"); }
 
 	const FString Sql = FString::Printf(
-		TEXT("SELECT owning_class, function_name, return_type, blueprint_callable, cpp_module, specifiers "
+		TEXT("SELECT owning_class, function_name, return_type, blueprint_callable, cpp_module, specifiers, source_line "
 			 "FROM reflect_ufunctions %s "
 			 "ORDER BY owning_class, function_name "
 			 "LIMIT ? OFFSET ?;"),
@@ -643,12 +762,21 @@ FMonolithActionResult FCppReflectQueryAdapter::HandleListUFunctions(const TShare
 	{
 		FString OClass, FName, RetType, FModule, Specs;
 		int32 BpCallable = 0;
+		int32 SrcLine = 0;
 		Stmt.GetColumnValueByIndex(0, OClass);
 		Stmt.GetColumnValueByIndex(1, FName);
 		Stmt.GetColumnValueByIndex(2, RetType);
 		Stmt.GetColumnValueByIndex(3, BpCallable);
 		Stmt.GetColumnValueByIndex(4, FModule);
 		Stmt.GetColumnValueByIndex(5, Specs);
+		Stmt.GetColumnValueByIndex(6, SrcLine);
+
+		// Handover doc item #10 — best-effort auto-join the original source
+		// line from the symbol index when the stored value is 0.
+		if (SrcLine == 0)
+		{
+			SrcLine = LookupFunctionSourceLine(*DB, OClass, FName);
+		}
 
 		TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
 		R->SetStringField(TEXT("owning_class"), OClass);
@@ -657,6 +785,7 @@ FMonolithActionResult FCppReflectQueryAdapter::HandleListUFunctions(const TShare
 		R->SetBoolField(TEXT("blueprint_callable"), BpCallable != 0);
 		R->SetStringField(TEXT("cpp_module"), FModule);
 		R->SetStringField(TEXT("specifiers"), Specs);
+		R->SetNumberField(TEXT("source_line"), SrcLine);
 		Rows.Add(MakeShared<FJsonValueObject>(R));
 	}
 

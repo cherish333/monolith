@@ -256,4 +256,269 @@ bool FMonolithResponseShapingStrictParamsAllowlistTest::RunTest(const FString& /
 	return true;
 }
 
+// =============================================================================
+// Phase 1.1 — RI ergonomics handover #3: _row_fields + _path_fields tests.
+// Handover doc: Plugins/Monolith/Docs/plans/2026-05-29-ri-ergonomics-improvements-handover.md
+// =============================================================================
+
+namespace MonolithResponseShapingTestDetail
+{
+	/** Build a response with one top-level list payload `decisions[]` of 3 rows. */
+	static TSharedPtr<FJsonObject> MakeListPayloadResponse()
+	{
+		TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
+		R->SetNumberField(TEXT("count"), 3);
+		R->SetStringField(TEXT("cursor"), TEXT(""));
+
+		TArray<TSharedPtr<FJsonValue>> Rows;
+		for (int32 I = 0; I < 3; ++I)
+		{
+			TSharedPtr<FJsonObject> Row = MakeShared<FJsonObject>();
+			Row->SetStringField(TEXT("title"), FString::Printf(TEXT("decision-%d"), I));
+			Row->SetStringField(TEXT("source_path"), FString::Printf(TEXT("Docs/Research/d%d.md"), I));
+			Row->SetStringField(TEXT("rationale"), TEXT("long verbose blob that should be droppable"));
+			Row->SetNumberField(TEXT("score"), I * 10);
+			Rows.Add(MakeShared<FJsonValueObject>(Row));
+		}
+		R->SetArrayField(TEXT("decisions"), Rows);
+		return R;
+	}
+
+	/** Build a response with TWO top-level list payloads (ambiguity scenario). */
+	static TSharedPtr<FJsonObject> MakeAmbiguousListPayloadResponse()
+	{
+		TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
+
+		TArray<TSharedPtr<FJsonValue>> RowsA;
+		for (int32 I = 0; I < 2; ++I)
+		{
+			TSharedPtr<FJsonObject> Row = MakeShared<FJsonObject>();
+			Row->SetStringField(TEXT("title"), FString::Printf(TEXT("a-%d"), I));
+			RowsA.Add(MakeShared<FJsonValueObject>(Row));
+		}
+		R->SetArrayField(TEXT("decisions"), RowsA);
+
+		TArray<TSharedPtr<FJsonValue>> RowsB;
+		for (int32 I = 0; I < 2; ++I)
+		{
+			TSharedPtr<FJsonObject> Row = MakeShared<FJsonObject>();
+			Row->SetStringField(TEXT("name"), FString::Printf(TEXT("b-%d"), I));
+			RowsB.Add(MakeShared<FJsonValueObject>(Row));
+		}
+		R->SetArrayField(TEXT("risks"), RowsB);
+
+		return R;
+	}
+
+	/** Build a response with a nested `uclass` envelope (the _path_fields target). */
+	static TSharedPtr<FJsonObject> MakeNestedEnvelopeResponse()
+	{
+		TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
+
+		TSharedPtr<FJsonObject> UClass = MakeShared<FJsonObject>();
+		UClass->SetStringField(TEXT("class_name"), TEXT("UMyClass"));
+		UClass->SetStringField(TEXT("parent_class"), TEXT("UObject"));
+		UClass->SetStringField(TEXT("source_path"), TEXT("Source/Foo/MyClass.h"));
+
+		TArray<TSharedPtr<FJsonValue>> Props;
+		TSharedPtr<FJsonObject> P0 = MakeShared<FJsonObject>();
+		P0->SetStringField(TEXT("name"), TEXT("Health"));
+		Props.Add(MakeShared<FJsonValueObject>(P0));
+		UClass->SetArrayField(TEXT("uproperties"), Props);
+
+		R->SetObjectField(TEXT("uclass"), UClass);
+		R->SetStringField(TEXT("envelope_field"), TEXT("noise"));
+		return R;
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 7: _row_fields on a 3-row list — verify only retained keys appear per row.
+// ---------------------------------------------------------------------------
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMonolithResponseShapingRowFieldsTest,
+	"Monolith.ResponseShaping.RowFields",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FMonolithResponseShapingRowFieldsTest::RunTest(const FString& /*Parameters*/)
+{
+	using namespace MonolithResponseShapingTestDetail;
+
+	TSharedPtr<FJsonObject> Response = MakeListPayloadResponse();
+	TSharedPtr<FJsonObject> Params = MakeParams();
+	SetStringArray(Params, TEXT("_row_fields"), {TEXT("title"), TEXT("source_path")});
+
+	TArray<FString> Warnings;
+	ApplyResponseShaping(Response, Params, Warnings);
+
+	TestEqual(TEXT("no warnings emitted for clean single-payload case"), Warnings.Num(), 0);
+
+	const TArray<TSharedPtr<FJsonValue>>* Rows = nullptr;
+	TestTrue(TEXT("decisions[] still present"),
+		Response->TryGetArrayField(TEXT("decisions"), Rows) && Rows != nullptr);
+	if (Rows)
+	{
+		TestEqual(TEXT("3 rows preserved"), Rows->Num(), 3);
+		for (const TSharedPtr<FJsonValue>& RowVal : *Rows)
+		{
+			const TSharedPtr<FJsonObject>* RowObj = nullptr;
+			if (RowVal.IsValid() && RowVal->TryGetObject(RowObj) && RowObj && (*RowObj).IsValid())
+			{
+				TestTrue (TEXT("row retains title"),       (*RowObj)->HasField(TEXT("title")));
+				TestTrue (TEXT("row retains source_path"), (*RowObj)->HasField(TEXT("source_path")));
+				TestFalse(TEXT("row drops rationale"),     (*RowObj)->HasField(TEXT("rationale")));
+				TestFalse(TEXT("row drops score"),         (*RowObj)->HasField(TEXT("score")));
+			}
+		}
+	}
+	// Envelope keys (count, cursor) untouched by _row_fields.
+	TestTrue(TEXT("envelope count untouched"), Response->HasField(TEXT("count")));
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// Test 8: _row_fields with no list payload — warning + no-op.
+// ---------------------------------------------------------------------------
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMonolithResponseShapingRowFieldsNoListTest,
+	"Monolith.ResponseShaping.RowFieldsNoList",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FMonolithResponseShapingRowFieldsNoListTest::RunTest(const FString& /*Parameters*/)
+{
+	using namespace MonolithResponseShapingTestDetail;
+
+	// MakeKitchenSinkResponse has no array-of-objects key.
+	TSharedPtr<FJsonObject> Response = MakeKitchenSinkResponse();
+	const int32 InitialKeys = Response->Values.Num();
+
+	TSharedPtr<FJsonObject> Params = MakeParams();
+	SetStringArray(Params, TEXT("_row_fields"), {TEXT("title")});
+
+	TArray<FString> Warnings;
+	ApplyResponseShaping(Response, Params, Warnings);
+
+	TestEqual(TEXT("response keys untouched (no-op)"), Response->Values.Num(), InitialKeys);
+	TestTrue(TEXT("exactly one warning emitted"), Warnings.Num() == 1);
+	if (Warnings.Num() >= 1)
+	{
+		TestTrue(TEXT("warning mentions no list payload"),
+			Warnings[0].Contains(TEXT("no top-level array-of-objects")));
+	}
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// Test 9: _row_fields ambiguous — warning + no-op.
+// ---------------------------------------------------------------------------
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMonolithResponseShapingRowFieldsAmbiguousTest,
+	"Monolith.ResponseShaping.RowFieldsAmbiguous",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FMonolithResponseShapingRowFieldsAmbiguousTest::RunTest(const FString& /*Parameters*/)
+{
+	using namespace MonolithResponseShapingTestDetail;
+
+	TSharedPtr<FJsonObject> Response = MakeAmbiguousListPayloadResponse();
+	TSharedPtr<FJsonObject> Params = MakeParams();
+	SetStringArray(Params, TEXT("_row_fields"), {TEXT("title")});
+
+	TArray<FString> Warnings;
+	ApplyResponseShaping(Response, Params, Warnings);
+
+	// No mutation should have happened — both rows in `risks` keep `name`.
+	const TArray<TSharedPtr<FJsonValue>>* RisksRows = nullptr;
+	if (Response->TryGetArrayField(TEXT("risks"), RisksRows) && RisksRows && RisksRows->Num() > 0)
+	{
+		const TSharedPtr<FJsonObject>* RowObj = nullptr;
+		if ((*RisksRows)[0]->TryGetObject(RowObj) && RowObj && (*RowObj).IsValid())
+		{
+			TestTrue(TEXT("risks row retains `name` (no mutation)"), (*RowObj)->HasField(TEXT("name")));
+		}
+	}
+
+	TestTrue(TEXT("at least one warning emitted"), Warnings.Num() >= 1);
+	bool bSawAmbiguity = false;
+	for (const FString& W : Warnings)
+	{
+		if (W.Contains(TEXT("_row_fields ambiguous")))
+		{
+			bSawAmbiguity = true;
+			break;
+		}
+	}
+	TestTrue(TEXT("warning text mentions `_row_fields ambiguous`"), bSawAmbiguity);
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// Test 10: _path_fields simple — extract a nested leaf via "foo.bar" path.
+// ---------------------------------------------------------------------------
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMonolithResponseShapingPathFieldsTest,
+	"Monolith.ResponseShaping.PathFields",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FMonolithResponseShapingPathFieldsTest::RunTest(const FString& /*Parameters*/)
+{
+	using namespace MonolithResponseShapingTestDetail;
+
+	TSharedPtr<FJsonObject> Response = MakeNestedEnvelopeResponse();
+	TSharedPtr<FJsonObject> Params = MakeParams();
+	SetStringArray(Params, TEXT("_path_fields"),
+		{TEXT("uclass.class_name"), TEXT("uclass.parent_class")});
+
+	TArray<FString> Warnings;
+	ApplyResponseShaping(Response, Params, Warnings);
+
+	TestEqual(TEXT("no warnings emitted for clean path"), Warnings.Num(), 0);
+	TestFalse(TEXT("envelope_field dropped"), Response->HasField(TEXT("envelope_field")));
+	TestTrue (TEXT("uclass envelope present"), Response->HasField(TEXT("uclass")));
+
+	const TSharedPtr<FJsonObject>* UClassObj = nullptr;
+	if (Response->TryGetObjectField(TEXT("uclass"), UClassObj) && UClassObj && (*UClassObj).IsValid())
+	{
+		TestTrue (TEXT("class_name retained"),    (*UClassObj)->HasField(TEXT("class_name")));
+		TestTrue (TEXT("parent_class retained"),  (*UClassObj)->HasField(TEXT("parent_class")));
+		TestFalse(TEXT("source_path dropped"),    (*UClassObj)->HasField(TEXT("source_path")));
+		TestFalse(TEXT("uproperties dropped"),    (*UClassObj)->HasField(TEXT("uproperties")));
+	}
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// Test 11: _path_fields missing path — graceful skip, no warning.
+// ---------------------------------------------------------------------------
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMonolithResponseShapingPathFieldsMissingTest,
+	"Monolith.ResponseShaping.PathFieldsMissing",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FMonolithResponseShapingPathFieldsMissingTest::RunTest(const FString& /*Parameters*/)
+{
+	using namespace MonolithResponseShapingTestDetail;
+
+	TSharedPtr<FJsonObject> Response = MakeNestedEnvelopeResponse();
+	TSharedPtr<FJsonObject> Params = MakeParams();
+	// Mix one valid leaf with two missing paths — valid should be retained,
+	// missing should drop silently with no warnings.
+	SetStringArray(Params, TEXT("_path_fields"),
+		{TEXT("uclass.class_name"), TEXT("uclass.does_not_exist"), TEXT("non_existent_root.child")});
+
+	TArray<FString> Warnings;
+	ApplyResponseShaping(Response, Params, Warnings);
+
+	TestEqual(TEXT("no warnings emitted for missing-path skip"), Warnings.Num(), 0);
+
+	const TSharedPtr<FJsonObject>* UClassObj = nullptr;
+	if (Response->TryGetObjectField(TEXT("uclass"), UClassObj) && UClassObj && (*UClassObj).IsValid())
+	{
+		TestTrue (TEXT("class_name (valid path) retained"), (*UClassObj)->HasField(TEXT("class_name")));
+		TestFalse(TEXT("missing leaf NOT in output"),       (*UClassObj)->HasField(TEXT("does_not_exist")));
+	}
+	TestFalse(TEXT("non-existent root NOT in output"), Response->HasField(TEXT("non_existent_root")));
+	return true;
+}
+
 #endif // WITH_DEV_AUTOMATION_TESTS
