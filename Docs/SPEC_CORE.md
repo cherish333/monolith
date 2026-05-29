@@ -274,6 +274,25 @@ python Scripts/monolith_offline.py <namespace> <action> [args...]
 | `get_stats` | — | — | Row counts for all tables + top 20 asset class breakdown |
 | `get_asset_details` | `asset_path` | — | Nodes, variables, parameters for one asset |
 
+**Reflection Intelligence (20 actions) — full parity, byte-identical to live.** All four RI namespaces are fully servable offline: `cppreflect` (6 — `get_uclass`, `list_uproperties`, `list_ufunctions`, `find_interface_impls`, `find_class_specifier`, `list_class_specifiers`), `network` (4 — `list_replicated_classes`, `list_rpc_functions`, `list_onrep_handlers`, `audit_unbalanced_onreps`), `decision` (5 — `list_decisions`, `get_decision`, `list_stale`, `find_supersession_chain`, `find_referent_decisions`), and `risk` (5 — `get_hotspot_score`, `get_cochange_pairs`, `get_file_churn`, `get_release_window_hotspots`, `list_conditional_gates`). The offline JSON is **byte-identical** to the live MCP server: same field names, types, key ordering, row data, float formatting (`%.17g`), and cursor tokens (base64 of UE pretty-printed `{\r\n\t"qh":N,...}` using UE's `Strihash_DEPRECATED` filter-hash). Prior builds covered only 4 of the 20 with divergent shapes and a phantom `risk.list_hotspots` action (now removed).
+
+**Two intentional, documented differences vs the live MCP payload (NOT bugs):**
+
+1. **`success` envelope.** The offline CLI adds a top-level `success: true|false` as its in-band status channel — a CLI has no MCP protocol envelope to carry success/error out-of-band. Live payloads have no `success` key. The DATA payload nested under it is byte-identical.
+2. **Wall-clock fields.** Time-derived values (`cutoff_unix`, `since_unix`) and any cursor whose filter-hash includes them (`risk.get_release_window_hotspots`) legitimately differ by the run-time gap across separate process invocations — on both live and offline. This is faithful parity with a live time-quirk, not drift.
+
+**exe is canonical; py is a dev-only fallback in lockstep.** `monolith_query.exe` is the preferred path. `monolith_offline.py` is a stdlib-only fallback kept byte-for-byte equal to the exe — the parity guard enforces `exe == py`.
+
+**Parity + freshness guards (ship-blocking):**
+
+| Script | Role |
+|--------|------|
+| `Scripts/verify_offline_parity.py` | HARD-GATE parity guard — byte-diffs exe vs py across all 20 RI actions; exits non-zero on any diff. `make_release.ps1` runs it as a ship gate. |
+| `Scripts/check_offline_exe_fresh.py` | Staleness guard — compares the exe's `--version` `source_hash` against a fresh hash of `monolith_query.cpp`; flags a stale exe. |
+| `Tools/MonolithQuery/build.bat` | Injects `SOURCE_HASH` (certutil SHA256 of the source) into the exe via `/DSOURCE_HASH`. |
+
+`make_release.ps1` now builds the exe fresh (vcvars + `build.bat`) before the Binaries copy, then runs the parity guard — a stale or drifted exe can never ship. The 20-action RI parity is the scope verified this sprint; the source/project namespaces share the same engine but were not re-audited for byte-parity in this pass.
+
 ### Implementation Notes
 
 - Opens DBs with `PRAGMA query_only=ON` + `PRAGMA journal_mode=DELETE`. The DELETE journal mode override is mandatory — WAL mode silently returns 0 rows on Windows when opened in any read-only mode (same bug that affected the C++ module; see CLAUDE.md Key Lessons).
