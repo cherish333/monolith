@@ -2,7 +2,7 @@
 
 **Version:** v0.17.0 · **Last updated:** 2026-05-29
 
-**In-tree action total: 1384** registered across **24 in-tree namespaces** (all active by default; 45 town-gen actions are experimental and disabled until you flip `bEnableProceduralTownGen=true`, which lifts the registry to 1429). The `ui` namespace re-exports 4 GAS UI binding actions as aliases, which are included in that headline figure. v0.17.0 adds the Reflection Intelligence layer — five new namespaces (`decision`, `risk`, `cppreflect`, `network`, `pipeline`) plus 5 cross-namespace audit actions registered onto existing namespaces (`source`, `material`, `niagara`, `blueprint`, `project`). The five `monolith_*` meta-tools (`discover`, `status`, `update`, `reindex`, `guide`) plus the `bulk_fill_query` and `describe_query` framework dispatchers round out the MCP tool count. This total EXCLUDES sibling-plugin actions (`MonolithISX`, `MonolithSteamBridge`, `MonolithSubstance`, `MonolithClaudeDesignBridge`) — they ship in their own repos and are not in the public release zip.
+**In-tree action total: 1385** registered across **24 in-tree namespaces** (all active by default; 45 town-gen actions are experimental and disabled until you flip `bEnableProceduralTownGen=true`, which lifts the registry to 1430). The `ui` namespace re-exports 4 GAS UI binding actions as aliases, which are included in that headline figure. v0.17.0 adds the Reflection Intelligence layer — five new namespaces (`decision`, `risk`, `cppreflect`, `network`, `pipeline`) plus 5 cross-namespace audit actions registered onto existing namespaces (`source`, `material`, `niagara`, `blueprint`, `project`). The five `monolith_*` meta-tools (`discover`, `status`, `update`, `reindex`, `guide`) plus the `bulk_fill_query` and `describe_query` framework dispatchers round out the MCP tool count. This total EXCLUDES sibling-plugin actions (`MonolithISX`, `MonolithSteamBridge`, `MonolithSubstance`, `MonolithClaudeDesignBridge`) — they ship in their own repos and are not in the public release zip.
 
 Live editor introspection on a fully loaded project (with sibling plugins present) can report additional namespaces beyond the in-tree Monolith surface. Those actions ship in their owning sibling repositories and are documented separately — see [§Sibling Plugins](#sibling-plugins).
 
@@ -39,10 +39,10 @@ Live editor introspection on a fully loaded project (with sibling plugins presen
 | [describe](#describe) | 3 | Read-only schema introspection for the same 12 adapters (`schema`, `list_targets`, `action_schema`) |
 | [decision](#decision) | 5 | **New v0.17.0.** Reflection Intelligence — architectural decision records mined from markdown corpora |
 | [risk](#risk) | 5 | **New v0.17.0.** Reflection Intelligence — git-churn / co-change / hotspot signals + conditional-gate inventory |
-| [cppreflect](#cppreflect) | 5 | **New v0.17.0.** Reflection Intelligence — UE 5.7 UHT reflection-edge queries (UCLASS / UPROPERTY / UFUNCTION / UINTERFACE + cpp↔asset edges) |
+| [cppreflect](#cppreflect) | 6 | **New v0.17.0.** Reflection Intelligence — UE 5.7 UHT reflection-edge queries (UCLASS / UPROPERTY / UFUNCTION / UINTERFACE + cpp↔asset edges + specifier discovery) |
 | [network](#network) | 4 | **New v0.17.0.** Reflection Intelligence — UE 5.7 replication inspection (replicated classes, RPCs, OnRep handlers, unbalanced-OnRep audit) |
 | [pipeline](#pipeline) | 2 | **New v0.17.0.** Reflection Intelligence — read-only composer actions (`pr_review`, `release_readiness`) |
-| **In-tree subtotal** | **1384** | (all default-active; +45 experimental town gen → 1429 when registered) |
+| **In-tree subtotal** | **1385** | (all default-active; +45 experimental town gen → 1430 when registered) |
 | [Sibling plugins](#sibling-plugins) | varies | Separate plugins, separate distribution |
 
 ---
@@ -1258,7 +1258,7 @@ List `#if WITH_*` macros, `bHas*` 3-location probe variables, and `MONOLITH_RELE
 
 ## cppreflect
 
-**New v0.17.0 (Reflection Intelligence, Phase 3a).** UE 5.7 reflection-edge queries driven by a regex sweep over UHT artefacts (`Intermediate/Build/Win64/.../Inc/<Module>/UHT/*.gen.cpp`) cross-joined with `IAssetRegistry::GetDependencies`. No tree-sitter dependency, no ThirdParty vendoring. Writes into `reflect_uclasses`, `reflect_uproperties`, `reflect_ufunctions`, `reflect_uinterfaces`, `reflect_uinterface_impls`, and `cpp_asset_edges` on `EngineSource.db`. All 5 actions are read-only + idempotent. **5 actions.**
+**New v0.17.0 (Reflection Intelligence, Phase 3a).** UE 5.7 reflection-edge queries driven by a regex sweep over UHT artefacts (`Intermediate/Build/Win64/.../Inc/<Module>/UHT/*.gen.cpp`) cross-joined with `IAssetRegistry::GetDependencies`. No tree-sitter dependency, no ThirdParty vendoring. Writes into `reflect_uclasses`, `reflect_uproperties`, `reflect_ufunctions`, `reflect_uinterfaces`, `reflect_uinterface_impls`, and `cpp_asset_edges` on `EngineSource.db`. All 6 actions are read-only + idempotent. **6 actions** (5 shipped in v0.17.0 Phase 3a; `list_class_specifiers` added [Unreleased]).
 
 > **Phase 3a caller-contract notes:** `source_path` is UHT's `ModuleRelativePath` (not project-relative); `source_line` is `0` everywhere (UHT discards the original-header line — pair with `source_query("search_source")` for per-line precision); `reflect_uproperties.blueprint_visibility` / `.specifiers` are empty strings (Phase 3b populates them); `cpp_asset_edges.edge_kind` is the coarse `'package_dep'`.
 
@@ -1313,16 +1313,26 @@ List every C++ UCLASS that implements the given UINTERFACE. Blueprint implementa
 
 ### `cppreflect_query.find_class_specifier`
 
-Find every UCLASS carrying a given specifier (`BlueprintType`, `Blueprintable`, `Abstract`, `Deprecated`, etc.) — substring match against `reflect_uclasses.class_specifiers`. Cursor-paginated.
+Find every UCLASS carrying a given specifier — substring match against the `flags` column of `reflect_uclasses`. Cursor-paginated. The `flags` column stores UHT metadata keys (`IsBlueprintBase`, `BlueprintType`, `Abstract`, etc.), NOT raw C++ UCLASS specifiers, so matching is forgiving ([Unreleased] enhancements): an alias map translates well-known C++ specifiers (`Blueprintable` → `IsBlueprintBase`); specifiers UHT drops entirely (`MinimalAPI`, `NotBlueprintable`) return an explicit not-captured note rather than a silent empty result; matching is case-insensitive. Call `list_class_specifiers` to discover the queryable token universe.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `specifier` | string | **required** | Substring match — `"BlueprintType"` matches both `BlueprintType` and `MinimalAPI,BlueprintType,...` |
+| `specifier` | string | **required** | Substring match against the stored token, case-insensitive — `"BlueprintType"` matches both `BlueprintType` and `IsBlueprintBase:BlueprintType,...`. Well-known C++ specifiers (`Blueprintable`) are alias-mapped to the stored token |
 | `module_filter` | string | optional | Optional module-name substring. Default: `""` |
 | `limit` | integer | optional | Hard cap `500`. Default: `100` |
 | `cursor` | string | optional | Opaque cursor |
 
-**Returns:** `{ "classes": [ { "class_name", "module_name", "parent_class", "class_specifiers", "source_path", "source_line" } ], "total_estimate": N, "next_cursor": "<opaque>" }`.
+**Returns:** `{ "classes": [ { "class_name", "module_name", "parent_class", "class_specifiers", "source_path", "source_line" } ], "effective_token": "<translated-token>", "total_estimate": N, "next_cursor": "<opaque>" }`. For specifiers UHT drops (`MinimalAPI` / `NotBlueprintable`), the response carries a not-captured note and refers you to `list_class_specifiers`.
+
+### `cppreflect_query.list_class_specifiers`
+
+**New [Unreleased].** Return the DISTINCT universe of tokens stored in the `flags` column of `reflect_uclasses`, each with a per-token class count. The `flags` column stores UHT metadata keys (e.g. `IsBlueprintBase`, `BlueprintType`, `Abstract`), NOT raw C++ UCLASS specifiers. Use this to discover what `find_class_specifier` can actually match. No params.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| _(none)_ | — | — | Takes no params |
+
+**Returns:** `{ "specifiers": [ { "token": "IsBlueprintBase", "class_count": 142 }, ... ], "total_estimate": N }` — tokens ordered by `class_count` descending.
 
 ---
 
@@ -1481,7 +1491,7 @@ If you're building a sibling plugin yourself, read `Plugins/Monolith/Docs/SIBLIN
 |---|---|---|---|---|
 | External sibling plugin | Custom | Varies | Registers its own namespace at startup and ships through its own repo/channel. | Outside `Plugins/Monolith/` |
 
-**Why these aren't in the in-tree count:** the in-tree 1384/24 figure counts only modules shipped inside the public `Monolith-vX.Y.Z.zip` release. Sibling plugins live in their own folders, ship via their own channels (or stay private), and may or may not be installed in any given consumer's project. Their absence is not a degraded state — Monolith is fully functional without them.
+**Why these aren't in the in-tree count:** the in-tree 1385/24 figure counts only modules shipped inside the public `Monolith-vX.Y.Z.zip` release. Sibling plugins live in their own folders, ship via their own channels (or stay private), and may or may not be installed in any given consumer's project. Their absence is not a degraded state — Monolith is fully functional without them.
 
 Private sibling bridges are intentionally omitted from the public API reference. Their action rosters, namespaces, and release notes belong in their own repos/channels; Monolith must not publish them as part of the public API surface.
 
