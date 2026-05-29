@@ -83,22 +83,22 @@ namespace
 	}
 
 	/**
-	 * Classify a UFUNCTION name into an RPC kind based on prefix:
-	 *   Server_*       → "Server"
-	 *   Client_*       → "Client"
-	 *   Multicast_*    → "Multicast"
-	 *   NetMulticast_* → "Multicast" (alias)
+	 * Classify an RPC kind from the stored `specifiers` column (the normalized
+	 * EFunctionFlags string written by FUHTArtefactReader, e.g. "Server,Reliable"
+	 * / "Client" / "NetMulticast,Unreliable"):
+	 *   contains "Server"       → "Server"
+	 *   contains "Client"       → "Client"
+	 *   contains "NetMulticast" → "Multicast"
 	 *
-	 * Returns FString() for non-RPC names. The "Multicast" canonical form
-	 * collapses both `Multicast_*` and `NetMulticast_*` because the UE
-	 * convention varies — both are net-multicast in practice.
+	 * Returns FString() when no endpoint token is present. The "Multicast"
+	 * canonical form is surfaced to callers for symmetry with the historical
+	 * rpc_kind vocabulary (Server | Client | Multicast).
 	 */
-	FString ClassifyRpcKindByName(const FString& FunctionName)
+	FString ClassifyRpcKindFromSpecifiers(const FString& Specifiers)
 	{
-		if (FunctionName.StartsWith(TEXT("Server_"))) { return TEXT("Server"); }
-		if (FunctionName.StartsWith(TEXT("Client_"))) { return TEXT("Client"); }
-		if (FunctionName.StartsWith(TEXT("NetMulticast_"))) { return TEXT("Multicast"); }
-		if (FunctionName.StartsWith(TEXT("Multicast_"))) { return TEXT("Multicast"); }
+		if (Specifiers.Contains(TEXT("Server")))       { return TEXT("Server"); }
+		if (Specifiers.Contains(TEXT("Client")))       { return TEXT("Client"); }
+		if (Specifiers.Contains(TEXT("NetMulticast"))) { return TEXT("Multicast"); }
 		return FString();
 	}
 }
@@ -112,11 +112,12 @@ void FNetworkQueryAdapter::RegisterActions(FMonolithToolRegistry& Registry)
 	// ---- list_replicated_classes ----
 	Registry.RegisterAction(TEXT("network"), TEXT("list_replicated_classes"),
 		TEXT("List UCLASSes that contain at least one replicated UPROPERTY. "
-		     "Aggregated from the Phase 4a reflect_replicated_properties table "
-		     "(populated from UHT artefact metadata blocks). Each row carries "
-		     "the owning_class, cpp_module, and a `replicated_property_count` "
-		     "of distinct properties with replication metadata on that class. "
-		     "Cursor pagination."),
+		     "Aggregated from reflect_replicated_properties, which captures both "
+		     "UPROPERTY(ReplicatedUsing=OnRep_Foo) (from UHT metadata blocks) and "
+		     "bare UPROPERTY(Replicated) / DOREPLIFETIME replication (from the "
+		     "CPF_Net property flag). Each row carries owning_class, cpp_module, and "
+		     "a `replicated_property_count` of distinct replicated properties on "
+		     "that class. Cursor pagination."),
 		FMonolithActionHandler::CreateStatic(&FNetworkQueryAdapter::HandleListReplicatedClasses),
 		FParamSchemaBuilder()
 			.Optional(TEXT("limit"), TEXT("integer"),
@@ -127,12 +128,13 @@ void FNetworkQueryAdapter::RegisterActions(FMonolithToolRegistry& Registry)
 
 	// ---- list_rpc_functions ----
 	Registry.RegisterAction(TEXT("network"), TEXT("list_rpc_functions"),
-		TEXT("List UFUNCTIONs matching RPC name patterns: `Server_*`, `Client_*`, "
-		     "`Multicast_*`, `NetMulticast_*`. Phase 4a uses NAME PATTERN matching "
-		     "on reflect_ufunctions.function_name; Phase 4b will switch to "
-		     "specifier-driven detection once reflect_ufunctions.specifiers is "
-		     "populated. Filter by `class_name` (exact) and/or `rpc_kind` "
-		     "(Server|Client|Multicast). Cursor pagination."),
+		TEXT("List UFUNCTION RPCs detected from their net specifiers. Matches on "
+		     "reflect_ufunctions.specifiers (the normalized EFunctionFlags string — "
+		     "e.g. `Server,Reliable` / `Client` / `NetMulticast,Unreliable`), so it "
+		     "captures RPCs named plainly (UFUNCTION(Server, Reliable) Reload()) that "
+		     "name-prefix matching would miss. Each row carries the parsed `specifiers` "
+		     "and a canonical `rpc_kind` (Server|Client|Multicast). Filter by "
+		     "`class_name` (exact) and/or `rpc_kind`. Cursor pagination."),
 		FMonolithActionHandler::CreateStatic(&FNetworkQueryAdapter::HandleListRPCFunctions),
 		FParamSchemaBuilder()
 			.Optional(TEXT("class_name"), TEXT("string"),
@@ -365,17 +367,21 @@ FMonolithActionResult FNetworkQueryAdapter::HandleListRPCFunctions(const TShared
 		Page = State.Page;
 	}
 
-	// Name-pattern detection — we OR four prefixes that map to (Server, Client,
-	// Multicast{2}). The RpcKindFilter further restricts when supplied.
+	// Specifier-based detection (network workstream). The authoritative net
+	// signal is reflect_ufunctions.specifiers — the normalized EFunctionFlags
+	// string FUHTArtefactReader writes for every UFUNCTION RPC (e.g.
+	// "Server,Reliable"). A non-RPC function has an empty/NULL specifiers value
+	// and never matches. We OR the three endpoint tokens; the optional
+	// `rpc_kind` filter restricts further in C++. All inputs are BOUND — no
+	// concatenation of caller-supplied strings into SQL.
 	FString WhereSql = TEXT(
-		"WHERE (function_name LIKE 'Server_%' "
-		"   OR function_name LIKE 'Client_%' "
-		"   OR function_name LIKE 'Multicast_%' "
-		"   OR function_name LIKE 'NetMulticast_%')");
+		"WHERE (specifiers LIKE '%Server%' "
+		"   OR specifiers LIKE '%Client%' "
+		"   OR specifiers LIKE '%NetMulticast%')");
 	if (!ClassName.IsEmpty()) { WhereSql += TEXT(" AND owning_class = ?"); }
 
 	const FString Sql = FString::Printf(
-		TEXT("SELECT owning_class, function_name, cpp_module, blueprint_callable "
+		TEXT("SELECT owning_class, function_name, cpp_module, blueprint_callable, specifiers "
 		     "FROM reflect_ufunctions %s "
 		     "ORDER BY cpp_module, owning_class, function_name "
 		     "LIMIT ? OFFSET ?;"),
@@ -394,14 +400,15 @@ FMonolithActionResult FNetworkQueryAdapter::HandleListRPCFunctions(const TShared
 	TArray<TSharedPtr<FJsonValue>> Rows;
 	while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
 	{
-		FString OClass, FName, MName;
+		FString OClass, FName, MName, Specifiers;
 		int32 BpCallable = 0;
 		Stmt.GetColumnValueByIndex(0, OClass);
 		Stmt.GetColumnValueByIndex(1, FName);
 		Stmt.GetColumnValueByIndex(2, MName);
 		Stmt.GetColumnValueByIndex(3, BpCallable);
+		Stmt.GetColumnValueByIndex(4, Specifiers);
 
-		const FString Kind = ClassifyRpcKindByName(FName);
+		const FString Kind = ClassifyRpcKindFromSpecifiers(Specifiers);
 		// Filter by rpc_kind in C++ (cheaper than an OR-chain inside the SQL).
 		if (!RpcKindFilter.IsEmpty() && !Kind.Equals(RpcKindFilter, ESearchCase::IgnoreCase))
 		{
@@ -413,6 +420,7 @@ FMonolithActionResult FNetworkQueryAdapter::HandleListRPCFunctions(const TShared
 		R->SetStringField(TEXT("function_name"), FName);
 		R->SetStringField(TEXT("cpp_module"), MName);
 		R->SetStringField(TEXT("rpc_kind"), Kind);
+		R->SetStringField(TEXT("specifiers"), Specifiers);
 		R->SetBoolField(TEXT("blueprint_callable"), BpCallable != 0);
 		Rows.Add(MakeShared<FJsonValueObject>(R));
 	}

@@ -91,6 +91,44 @@ public:
 	static bool RunNetworkIndexerOnce(FString& OutStatus);
 
 	/**
+	 * Maintenance (v0.17.0) — FORCE a genuine, project-scoped repopulation of the
+	 * reflection tables this RI workstream owns, regardless of current state:
+	 *   - cppreflect set  (FUHTArtefactReader + FAssetGraphJoiner):
+	 *       reflect_uclasses / reflect_uproperties / reflect_ufunctions /
+	 *       reflect_uinterfaces / reflect_uinterface_impls / cpp_asset_edges
+	 *   - network set     (FNetworkRepIndexer):
+	 *       reflect_replicated_properties
+	 *
+	 * WHY this exists: after a cold rebuild (or any change to the indexers'
+	 * parsing code), those tables are STALE but there is NO clean trigger to
+	 * rebuild them — the lazy bootstrap (FCppReflectQueryAdapter / FNetworkQueryAdapter)
+	 * only fires when its table is ABSENT, OnReloadComplete only fires on Live
+	 * Coding hot-reload, and source.trigger_(project_)reindex rebuilds the
+	 * source-symbol tables, NOT these reflect_* tables. This method is the
+	 * explicit, reusable force-rebuild entry point.
+	 *
+	 * FORCE SEMANTICS: the per-phase runners (RunCppReflectIndexersOnce /
+	 * RunNetworkIndexerOnce) do NOT consult the bootstrap latch — they always
+	 * invoke the indexers' Run(), and Run() itself WIPEs (DELETE FROM) each owned
+	 * table before repopulating, so a single runner call is already a genuine
+	 * clear+rewrite. The ONLY skip path is the failure-throttle cooldown
+	 * (*LastFailureTime within RetryCooldownSeconds). This method clears that
+	 * cooldown AND the lazy-bootstrap latch BEFORE each runner call so neither a
+	 * recent failure nor a prior successful bootstrap can short-circuit the
+	 * rebuild. On a transient failure the runners re-arm the cooldown/latch as
+	 * usual (the next adapter call retries), exactly as on the lazy path.
+	 *
+	 * PROJECT-ONLY: both runners resolve roots to FPaths::ProjectIntermediateDir()/Build
+	 * and pass bIncludeEnginePlugins = Settings->bIndexEnginePluginReflection
+	 * (default false). This force path adds no engine scope — engine artefacts and
+	 * the engine source-symbol index are untouched.
+	 *
+	 * Game-thread only (the runners assert ensure(IsInGameThread()) transitively
+	 * via the indexers' Run()). Returns true iff BOTH runners reported success.
+	 */
+	bool ForceRebuildReflectionTables(FString& OutCppReflectStatus, FString& OutNetworkStatus);
+
+	/**
 	 * Return the SHARED EngineSource.db handle owned by UMonolithSourceSubsystem,
 	 * borrowed for read-only queries. This module no longer opens its own handle
 	 * (the UE 5.7 single-open `unreal-fs` VFS rejects a second open of the same
@@ -153,6 +191,10 @@ private:
 	void RegisterNetworkActions();
 	void RegisterAuditActions();
 	void RegisterPipelineActions();
+	// Maintenance — `reflect` namespace (1 write/maintenance action:
+	// rebuild_reflection_index). Fully owned by this module; unregistered
+	// wholesale in ShutdownModule.
+	void RegisterMaintenanceActions();
 	void OnReloadComplete(EReloadCompleteReason Reason);
 
 	FDelegateHandle ReloadCompleteHandle;

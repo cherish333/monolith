@@ -114,4 +114,5 @@ private:
 	FRegexPattern BeginClassPattern;         // "// ********** Begin Class <Name> ***..."
 	FRegexPattern NewPropMetaDataHeader;     // "constexpr ... NewProp_<X>_MetaData[]"
 	FRegexPattern MetaDataPairPattern;       // single `{ "Key", "Value" },` row
+	FRegexPattern ClassPropertyFlagsPattern; // "Z_Construct_UClass_<C>_Statics::NewProp_<X> = { "<X>", ..., (EPropertyFlags)0x<HEX>,"
 };

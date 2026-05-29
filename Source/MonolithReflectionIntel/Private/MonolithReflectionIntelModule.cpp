@@ -31,6 +31,8 @@
 #include "Network/FNetworkQueryAdapter.h"
 #include "Audit/FAuditAdapter.h"
 #include "Pipeline/FPipelineAdapter.h"
+// Maintenance (v0.17.0) — `reflect` namespace force-rebuild adapter.
+#include "Maintenance/FReflectMaintenanceAdapter.h"
 #include "MonolithReflectionIntelSettings.h"
 
 #include "HAL/PlatformFileManager.h"
@@ -115,6 +117,8 @@ void FMonolithReflectionIntelModule::StartupModule()
 	RegisterNetworkActions();
 	RegisterAuditActions();
 	RegisterPipelineActions();
+	// Maintenance (v0.17.0) — reflect_query namespace (1 force-rebuild action).
+	RegisterMaintenanceActions();
 
 	// Bind hot-reload hook so the decision corpus refreshes after Live Coding /
 	// UBT rebuilds. The indexer pass now WRITES THROUGH the subsystem's shared
@@ -138,7 +142,7 @@ void FMonolithReflectionIntelModule::StartupModule()
 		     "risk_query: 5 actions, source_query: +1 audit action, "
 		     "cppreflect_query: 6 actions, network_query: 4 actions, "
 		     "material/niagara/blueprint/project: +1 audit each, "
-		     "pipeline_query: 2 composers)"));
+		     "pipeline_query: 2 composers, reflect_query: 1 maintenance action)"));
 }
 
 void FMonolithReflectionIntelModule::ShutdownModule()
@@ -166,6 +170,8 @@ void FMonolithReflectionIntelModule::ShutdownModule()
 	// Phase 4a — pipeline_query is fully owned by this module (no other
 	// module registers there in Phase 4a).
 	FMonolithToolRegistry::Get().UnregisterNamespace(TEXT("pipeline"));
+	// Maintenance — reflect_query is fully owned by this module.
+	FMonolithToolRegistry::Get().UnregisterNamespace(TEXT("reflect"));
 	// NOTE: we do NOT unregister the `source` / `material` / `niagara` /
 	// `blueprint` / `project` namespaces here — MonolithSource / MonolithMaterial
 	// / MonolithNiagara / MonolithBlueprint / MonolithIndex own the lion's share
@@ -233,6 +239,11 @@ void FMonolithReflectionIntelModule::RegisterAuditActions()
 void FMonolithReflectionIntelModule::RegisterPipelineActions()
 {
 	FPipelineAdapter::RegisterActions(FMonolithToolRegistry::Get());
+}
+
+void FMonolithReflectionIntelModule::RegisterMaintenanceActions()
+{
+	FReflectMaintenanceAdapter::RegisterActions(FMonolithToolRegistry::Get());
 }
 
 void FMonolithReflectionIntelModule::OnReloadComplete(EReloadCompleteReason /*Reason*/)
@@ -699,6 +710,43 @@ bool FMonolithReflectionIntelModule::RunNetworkIndexerOnce(FString& OutStatus)
 		}
 	}
 	return bOk;
+}
+
+bool FMonolithReflectionIntelModule::ForceRebuildReflectionTables(
+	FString& OutCppReflectStatus, FString& OutNetworkStatus)
+{
+	// Game-thread contract — the runners (and the indexers' Run() they invoke)
+	// touch GEditor / the shared SQLite handle, which are game-thread-only. The
+	// indexers assert ensure(IsInGameThread()) themselves; mirror it here so a
+	// mis-dispatch is caught at the entry point rather than deep in the sweep.
+	ensure(IsInGameThread());
+
+	// FORCE the cppreflect set. The runner itself never checks the bootstrap
+	// latch — it always calls FUHTArtefactReader::Run + FAssetGraphJoiner::Run,
+	// and FUHTArtefactReader::Run WIPEs (DELETE FROM) reflect_uclasses /
+	// reflect_uproperties / reflect_ufunctions / reflect_uinterfaces /
+	// reflect_uinterface_impls before repopulating (FAssetGraphJoiner wipes +
+	// rewrites cpp_asset_edges in the same lock window). So a single runner call
+	// is already a genuine clear+rewrite. The ONLY thing that could skip it is
+	// the failure-throttle cooldown — clear it (and the lazy latch) so a recent
+	// transient failure cannot turn this explicit force into a throttled no-op.
+	CppReflectLastFailureTime    = 0.0;
+	bCppReflectBootstrapAttempted = false;
+	const bool bCppOk = RunCppReflectIndexersOnce(OutCppReflectStatus);
+
+	// FORCE the network set. Same reasoning: RunNetworkIndexerOnce always calls
+	// FNetworkRepIndexer::Run, which WIPEs reflect_replicated_properties before
+	// repopulating. Clear the cooldown + latch first so neither path skips.
+	NetworkLastFailureTime    = 0.0;
+	bNetworkBootstrapAttempted = false;
+	const bool bNetOk = RunNetworkIndexerOnce(OutNetworkStatus);
+
+	const bool bAllOk = bCppOk && bNetOk;
+	UE_LOG(LogMonolithReflectionIntel, Log,
+		TEXT("ForceRebuildReflectionTables: %s | cppreflect=%s | network=%s"),
+		bAllOk ? TEXT("OK") : TEXT("PARTIAL/FAILED"),
+		*OutCppReflectStatus, *OutNetworkStatus);
+	return bAllOk;
 }
 
 #undef LOCTEXT_NAMESPACE

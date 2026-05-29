@@ -141,7 +141,62 @@ FUHTArtefactReader::FUHTArtefactReader()
 	, InterfaceParamPattern(
 		// `{ Z_Construct_UClass_<I>_NoRegister, (int32)VTABLE_OFFSET(<C>, I<I_no_U>), false }`
 		TEXT("\\{\\s*Z_Construct_UClass_([A-Za-z_][A-Za-z0-9_]*)_NoRegister\\s*,\\s*\\(int32\\)VTABLE_OFFSET\\(\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*,"))
+	, FuncParamsHeaderPattern(
+		// The definition line of a function's registration params, e.g.:
+		//   const UECodeGen_Private::FFunctionParams
+		//     Z_Construct_UFunction_<Class>_<Func>_Statics::FuncParams = {
+		//       { (UObject*(*)())Z_Construct_UClass_<Class>, nullptr, "<Func>", ...
+		// Capture: 1=Class, 2=Func-from-symbol, 3=Func-from-string-literal.
+		// The `(EFunctionFlags)0x...` bitfield sits on a CONTINUATION line of the
+		// SAME initializer (verified against UE 5.7 WeaponBase_ISX.gen.cpp), so a
+		// bounded forward scan follows this match to recover the flags. Delegate
+		// signatures use Z_Construct_UDelegateFunction_*, which this pattern does
+		// NOT match — net specifiers only apply to UFUNCTION RPCs.
+		TEXT("Z_Construct_UFunction_([A-Za-z_][A-Za-z0-9_]*)_([A-Za-z_][A-Za-z0-9_]*)_Statics::FuncParams\\s*=\\s*\\{\\s*\\{[^\"]*\"([A-Za-z_][A-Za-z0-9_]*)\""))
+	, FunctionFlagsPattern(
+		// The registration-flag bitfield token: `(EFunctionFlags)0x<HEX>`.
+		TEXT("\\(EFunctionFlags\\)0x([0-9A-Fa-f]+)"))
 {
+}
+
+// EFunctionFlags bit values — mirror of
+// Engine/Source/Runtime/CoreUObject/Public/UObject/Script.h (EFunctionFlags).
+// Verified via offline source index against UE 5.7. Net-relevant bits only.
+namespace
+{
+	constexpr uint32 kFUNC_Net          = 0x00000040; // FUNC_Net — function is network-replicated
+	constexpr uint32 kFUNC_NetReliable  = 0x00000080; // FUNC_NetReliable
+	constexpr uint32 kFUNC_NetMulticast = 0x00004000; // FUNC_NetMulticast — Server -> All Clients
+	constexpr uint32 kFUNC_NetServer    = 0x00200000; // FUNC_NetServer — executes on servers
+	constexpr uint32 kFUNC_NetClient    = 0x01000000; // FUNC_NetClient — executes on clients
+	constexpr uint32 kFUNC_NetValidate  = 0x80000000; // FUNC_NetValidate — supplies a _Validate impl
+}
+
+FString FUHTArtefactReader::NetSpecifiersFromFunctionFlags(uint32 FunctionFlags)
+{
+	// FUNC_Net gates the entire classification — a non-replicated function is
+	// not an RPC and gets an empty specifier string.
+	if ((FunctionFlags & kFUNC_Net) == 0)
+	{
+		return FString();
+	}
+
+	TArray<FString> Parts;
+
+	// Endpoint specifier first (Server / Client / NetMulticast). A net function
+	// always carries exactly one of these; if (defensively) none are set we still
+	// surface the reliability so the row is not silently empty.
+	if (FunctionFlags & kFUNC_NetServer)         { Parts.Add(TEXT("Server")); }
+	else if (FunctionFlags & kFUNC_NetClient)    { Parts.Add(TEXT("Client")); }
+	else if (FunctionFlags & kFUNC_NetMulticast) { Parts.Add(TEXT("NetMulticast")); }
+
+	// Reliability: FUNC_NetReliable present → Reliable, absent → Unreliable.
+	Parts.Add((FunctionFlags & kFUNC_NetReliable) ? TEXT("Reliable") : TEXT("Unreliable"));
+
+	// WithValidation is an orthogonal modifier on Server RPCs.
+	if (FunctionFlags & kFUNC_NetValidate) { Parts.Add(TEXT("WithValidation")); }
+
+	return FString::Join(Parts, TEXT(","));
 }
 
 bool FUHTArtefactReader::Run(FSQLiteDatabase& DB,
@@ -381,6 +436,57 @@ void FUHTArtefactReader::ScanArtefact(
 		}
 	}
 
+	// -----------------------------------------------------------------
+	// Pre-pass — net-specifier harvest. Each UFUNCTION's registration
+	// `...FuncParams = { { ... "<Func>", ...` carries an `(EFunctionFlags)0x...`
+	// bitfield on a CONTINUATION line of the same initializer. We map
+	// (OwningClass|FuncName) → normalized net-specifier string so Pass 1 can
+	// stamp it onto the matching reflect_ufunctions row regardless of whether
+	// the function was enumerated from the legacy FuncInfo[] or modern Funcs[]
+	// array. The bitfield is the AUTHORITATIVE net signal — UFUNCTION(Server,
+	// Reliable) compiles to FUNC_Net|FUNC_NetReliable|FUNC_NetServer, never to a
+	// name prefix. Non-net functions produce an empty string and are skipped.
+	// -----------------------------------------------------------------
+	TMap<FString, FString> FunctionNetSpecifiers; // key "Class|Func" → "Server,Reliable"
+	{
+		// The flags token may be a few lines past the header (params struct +
+		// size lines sit between). A small bounded window is ample — verified
+		// layout is header line + up to ~4 continuation lines before the flags.
+		constexpr int32 kFlagsScanWindow = 8;
+		for (int32 LineIdx = 0; LineIdx < Lines.Num(); ++LineIdx)
+		{
+			FRegexMatcher HeaderM(FuncParamsHeaderPattern, Lines[LineIdx]);
+			if (!HeaderM.FindNext()) { continue; }
+
+			const FString DeclaringClass = HeaderM.GetCaptureGroup(1);
+			const FString FuncSym        = HeaderM.GetCaptureGroup(2);
+			const FString FuncStr        = HeaderM.GetCaptureGroup(3);
+			// The string literal and the symbol token must agree; a mismatch is
+			// exceptional and skipped defensively (mirrors the Funcs[] policy).
+			if (!FuncStr.Equals(FuncSym, ESearchCase::CaseSensitive)) { continue; }
+
+			// Scan this line and a bounded window of following lines for the
+			// `(EFunctionFlags)0x...` token belonging to this initializer.
+			const int32 ScanEnd = FMath::Min(LineIdx + kFlagsScanWindow, Lines.Num());
+			for (int32 FlagLine = LineIdx; FlagLine < ScanEnd; ++FlagLine)
+			{
+				FRegexMatcher FlagM(FunctionFlagsPattern, Lines[FlagLine]);
+				if (!FlagM.FindNext()) { continue; }
+
+				const FString HexStr = FlagM.GetCaptureGroup(1);
+				const uint32 Flags = static_cast<uint32>(
+					FCString::Strtoui64(*HexStr, nullptr, /*Base=*/16));
+				const FString Specifiers = NetSpecifiersFromFunctionFlags(Flags);
+				if (!Specifiers.IsEmpty())
+				{
+					FunctionNetSpecifiers.Add(
+						DeclaringClass + TEXT("|") + FuncStr, Specifiers);
+				}
+				break; // first flags token after the header is the right one
+			}
+		}
+	}
+
 	for (int32 LineIdx = 0; LineIdx < Lines.Num(); ++LineIdx)
 	{
 		const FString& Line = Lines[LineIdx];
@@ -445,6 +551,11 @@ void FUHTArtefactReader::ScanArtefact(
 				Row.ReturnType.Empty(); // Phase 3a does not parse the parms struct
 				Row.bBlueprintCallable = true; // presence in Funcs[] implies BP-VM exposure
 				Row.CppModule = ModuleName;
+				// Net-specifier stamp (network workstream): empty for non-RPC.
+				if (const FString* Spec = FunctionNetSpecifiers.Find(Key))
+				{
+					Row.Specifiers = *Spec;
+				}
 				OutBatch.UFunctions.Add(MoveTemp(Row));
 			}
 		}
@@ -478,6 +589,11 @@ void FUHTArtefactReader::ScanArtefact(
 				Row.ReturnType.Empty();
 				Row.bBlueprintCallable = true;
 				Row.CppModule = ModuleName;
+				// Net-specifier stamp (network workstream): empty for non-RPC.
+				if (const FString* Spec = FunctionNetSpecifiers.Find(Key))
+				{
+					Row.Specifiers = *Spec;
+				}
 				OutBatch.UFunctions.Add(MoveTemp(Row));
 			}
 		}
@@ -527,6 +643,31 @@ void FUHTArtefactReader::ScanArtefact(
 				OutBatch.InterfaceImpls.Add(MoveTemp(Row));
 			}
 		}
+	}
+
+	// -----------------------------------------------------------------
+	// Fallback emission — a net RPC that carries no exec-thunk (and so never
+	// appears in Funcs[]/FuncInfo[]) would otherwise have no reflect_ufunctions
+	// row at all, losing its specifiers. In practice every UFUNCTION RPC gets an
+	// exec thunk (verified: WeaponBase_ISX::Reload appears in Funcs[]), so this
+	// pass is a no-op for current artefacts — but it guarantees the specifier
+	// signal is never silently dropped for an unusual codegen shape. Keys not
+	// already in SeenFunctionKeys get a row with bBlueprintCallable=false (no
+	// BP-VM exposure observed). The "Class|Func" key encodes the owning class.
+	for (const TPair<FString, FString>& Pair : FunctionNetSpecifiers)
+	{
+		if (SeenFunctionKeys.Contains(Pair.Key)) { continue; }
+		int32 SepIdx = INDEX_NONE;
+		if (!Pair.Key.FindChar(TEXT('|'), SepIdx) || SepIdx <= 0) { continue; }
+		FCppReflectUFunctionRow Row;
+		Row.OwningClass = Pair.Key.Left(SepIdx);
+		Row.FunctionName = Pair.Key.Mid(SepIdx + 1);
+		Row.ReturnType.Empty();
+		Row.bBlueprintCallable = false; // not in Funcs[]/FuncInfo[] → no BP-VM exposure
+		Row.CppModule = ModuleName;
+		Row.Specifiers = Pair.Value;
+		SeenFunctionKeys.Add(Pair.Key);
+		OutBatch.UFunctions.Add(MoveTemp(Row));
 	}
 
 	// -----------------------------------------------------------------

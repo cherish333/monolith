@@ -152,4 +152,16 @@ private:
 	FRegexPattern FuncInfoPattern;           // LEGACY FuncInfo[] entry "{ &Z_..._<Class>_<Func>, "<Func>" }"
 	FRegexPattern FuncDesignatorPattern;     // MODERN Funcs[] entry "{ .NameUTF8 = UTF8TEXT("<F>"), .Pointer = &<C>::exec<F> }"
 	FRegexPattern InterfaceParamPattern;     // FImplementedInterfaceParams row → Z_Construct_UClass_<I>_NoRegister
+	FRegexPattern FuncParamsHeaderPattern;   // "Z_Construct_UFunction_<Class>_<Func>_Statics::FuncParams = { { ... "<Func>","
+	FRegexPattern FunctionFlagsPattern;      // "(EFunctionFlags)0x<HEX>" — the registration-flag bitfield
+
+	/**
+	 * Decode an EFunctionFlags bitfield (parsed from a `(EFunctionFlags)0x...`
+	 * token in a FuncParams definition) into a normalized net-specifier string,
+	 * e.g. "Server,Reliable" / "Client" / "NetMulticast,Unreliable". Returns
+	 * an empty string when the function carries no net flags (FUNC_Net unset),
+	 * which the caller treats as "not an RPC". Bit values mirror
+	 * Engine/Source/Runtime/CoreUObject/Public/UObject/Script.h (EFunctionFlags).
+	 */
+	static FString NetSpecifiersFromFunctionFlags(uint32 FunctionFlags);
 };

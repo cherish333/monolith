@@ -71,7 +71,27 @@ FNetworkRepIndexer::FNetworkRepIndexer()
 	, MetaDataPairPattern(
 		// A `{ "Key", "Value" }` row inside a MetaDataPairParam[] body.
 		TEXT("\\{\\s*\"([^\"]+)\"\\s*,\\s*\"([^\"]*)\"\\s*\\}"))
+	, ClassPropertyFlagsPattern(
+		// A class-MEMBER property declaration carrying its EPropertyFlags bitfield:
+		//   const UECodeGen_Private::F<T>PropertyParams
+		//     Z_Construct_UClass_<C>_Statics::NewProp_<X> = { "<X>", nullptr,
+		//       (EPropertyFlags)0x<HEX>, ...
+		// Anchored on `Z_Construct_UClass_` so FUNCTION-param properties
+		// (Z_Construct_UFunction_*) and STRUCT members (Z_Construct_UScriptStruct_*)
+		// are excluded — only UCLASS members can be UPROPERTY(Replicated).
+		// Captures: 1=Class, 2=PropName-from-symbol, 3=PropName-from-literal,
+		// 4=64-bit hex EPropertyFlags. Verified against UE 5.7 WeaponBase_ISX.gen.cpp.
+		TEXT("Z_Construct_UClass_([A-Za-z_][A-Za-z0-9_]*)_Statics::NewProp_([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*\\{\\s*\"([^\"]+)\"\\s*,\\s*[^,]*,\\s*\\(EPropertyFlags\\)0x([0-9A-Fa-f]+)"))
 {
+}
+
+// EPropertyFlags bit values — mirror of
+// Engine/Source/Runtime/CoreUObject/Public/UObject/ObjectMacros.h (EPropertyFlags).
+// Verified via offline source index against UE 5.7. Replication-relevant bits.
+namespace
+{
+	constexpr uint64 kCPF_Net       = 0x0000000000000020ull; // CPF_Net — relevant to network replication
+	constexpr uint64 kCPF_RepNotify = 0x0000000100000000ull; // CPF_RepNotify — notify on replicate (ReplicatedUsing)
 }
 
 bool FNetworkRepIndexer::Run(FSQLiteDatabase& DB,
@@ -254,6 +274,27 @@ void FNetworkRepIndexer::ScanArtefact(
 	FString PendingRepKind;
 	FString PendingRepNotifyFunc;
 
+	// ReplicatedUsing-emitted keys ("Class|Prop") — the bare-Replicated fallback
+	// below skips these so a ReplicatedUsing property is never double-emitted.
+	TSet<FString> EmittedReplicatedUsingKeys;
+
+	// CPF_Net harvest. The replication type-tag lives on the class-member
+	// property DECLARATION line (outside any MetaData block):
+	//   const ...F<T>PropertyParams Z_Construct_UClass_<C>_Statics::NewProp_<X>
+	//     = { "<X>", nullptr, (EPropertyFlags)0x...Net..., ... }
+	// We harvest every (Class|Prop) carrying CPF_Net here, then emit a
+	// rep_kind="Replicated" row for any that did NOT already fire ReplicatedUsing
+	// (bare UPROPERTY(Replicated) and GAS DOREPLIFETIME-driven replication —
+	// both set CPF_Net without a "ReplicatedUsing" MetaData pair).
+	struct FNetPropHarvest
+	{
+		FString OwningClass;
+		FString PropertyName;
+		bool    bRepNotify = false; // CPF_RepNotify also set → it's a ReplicatedUsing prop
+	};
+	TArray<FNetPropHarvest> NetProps;
+	TSet<FString> NetPropKeysSeen; // dedupe harvest on "Class|Prop"
+
 	for (int32 LineIdx = 0; LineIdx < Lines.Num(); ++LineIdx)
 	{
 		const FString& Line = Lines[LineIdx];
@@ -275,6 +316,38 @@ void FNetworkRepIndexer::ScanArtefact(
 		}
 
 		if (CurrentClass.IsEmpty()) { continue; }
+
+		// ------ CPF_Net harvest (class-member property declarations). Scanned
+		// on every in-class line, independent of MetaData-block state, because
+		// the declaration line sits OUTSIDE the per-property MetaData arrays.
+		{
+			FRegexMatcher FlagM(ClassPropertyFlagsPattern, Line);
+			while (FlagM.FindNext())
+			{
+				const FString DeclaringClass = FlagM.GetCaptureGroup(1);
+				const FString PropSym        = FlagM.GetCaptureGroup(2);
+				const FString PropStr        = FlagM.GetCaptureGroup(3);
+				const FString HexStr         = FlagM.GetCaptureGroup(4);
+				if (DeclaringClass != CurrentClass) { continue; } // foreign
+				// Symbol vs string-literal must agree (mirrors the Phase 3a
+				// NewProp_*_Underlying defensive skip).
+				if (!PropStr.Equals(PropSym, ESearchCase::CaseSensitive)) { continue; }
+
+				const uint64 PropFlags = static_cast<uint64>(
+					FCString::Strtoui64(*HexStr, nullptr, /*Base=*/16));
+				if ((PropFlags & kCPF_Net) == 0) { continue; } // not replicated
+
+				const FString Key = DeclaringClass + TEXT("|") + PropStr;
+				bool bAlreadySeen = false;
+				NetPropKeysSeen.Add(Key, &bAlreadySeen);
+				if (bAlreadySeen) { continue; }
+				FNetPropHarvest H;
+				H.OwningClass = DeclaringClass;
+				H.PropertyName = PropStr;
+				H.bRepNotify = (PropFlags & kCPF_RepNotify) != 0;
+				NetProps.Add(MoveTemp(H));
+			}
+		}
 
 		// ------ Open a per-property MetaData block.
 		if (!bInMetaBlock)
@@ -306,6 +379,7 @@ void FNetworkRepIndexer::ScanArtefact(
 				Row.RepKind = PendingRepKind;
 				Row.RepNotifyFunc = PendingRepNotifyFunc;
 				Row.SourcePath = SourceHeaderRel;
+				EmittedReplicatedUsingKeys.Add(CurrentClass + TEXT("|") + CurrentMetaProperty);
 				OutBatch.ReplicatedProperties.Add(MoveTemp(Row));
 			}
 			CurrentMetaProperty.Empty();
@@ -329,6 +403,25 @@ void FNetworkRepIndexer::ScanArtefact(
 				PendingRepNotifyFunc = Val;
 			}
 		}
+	}
+
+	// ------ Bare-Replicated fallback emission. For every CPF_Net property that
+	// did NOT fire a ReplicatedUsing row, emit rep_kind="Replicated" with an
+	// empty rep_notify_func. This captures UPROPERTY(Replicated) and
+	// DOREPLIFETIME-macro replication — neither emits a "ReplicatedUsing"
+	// MetaData pair, so the legacy MetaData-only scan missed them entirely.
+	for (const FNetPropHarvest& H : NetProps)
+	{
+		const FString Key = H.OwningClass + TEXT("|") + H.PropertyName;
+		if (EmittedReplicatedUsingKeys.Contains(Key)) { continue; }
+		FNetworkRepPropertyRow Row;
+		Row.OwningClass = H.OwningClass;
+		Row.PropertyName = H.PropertyName;
+		Row.CppModule = ModuleName;
+		Row.RepKind = TEXT("Replicated");
+		Row.RepNotifyFunc.Empty();
+		Row.SourcePath = SourceHeaderRel;
+		OutBatch.ReplicatedProperties.Add(MoveTemp(Row));
 	}
 }
 
