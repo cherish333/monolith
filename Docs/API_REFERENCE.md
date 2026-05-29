@@ -2,7 +2,7 @@
 
 **Version:** v0.17.0 · **Last updated:** 2026-05-29
 
-**In-tree action total: 1385** registered across **24 in-tree namespaces** (all active by default; 45 town-gen actions are experimental and disabled until you flip `bEnableProceduralTownGen=true`, which lifts the registry to 1430). The `ui` namespace re-exports 4 GAS UI binding actions as aliases, which are included in that headline figure. v0.17.0 adds the Reflection Intelligence layer — five new namespaces (`decision`, `risk`, `cppreflect`, `network`, `pipeline`) plus 5 cross-namespace audit actions registered onto existing namespaces (`source`, `material`, `niagara`, `blueprint`, `project`). The five `monolith_*` meta-tools (`discover`, `status`, `update`, `reindex`, `guide`) plus the `bulk_fill_query` and `describe_query` framework dispatchers round out the MCP tool count. This total EXCLUDES sibling-plugin actions (`MonolithISX`, `MonolithSteamBridge`, `MonolithSubstance`, `MonolithClaudeDesignBridge`) — they ship in their own repos and are not in the public release zip.
+**In-tree action total: 1386** registered across **25 in-tree namespaces** (all active by default; 45 town-gen actions are experimental and disabled until you flip `bEnableProceduralTownGen=true`, which lifts the registry to 1431). The `ui` namespace re-exports 4 GAS UI binding actions as aliases, which are included in that headline figure. v0.17.0 adds the Reflection Intelligence layer — six namespaces (`decision`, `risk`, `cppreflect`, `network`, `pipeline`, plus the [Unreleased] `reflect` index-maintenance namespace) plus 5 cross-namespace audit actions registered onto existing namespaces (`source`, `material`, `niagara`, `blueprint`, `project`). The five `monolith_*` meta-tools (`discover`, `status`, `update`, `reindex`, `guide`) plus the `bulk_fill_query` and `describe_query` framework dispatchers round out the MCP tool count. This total EXCLUDES sibling-plugin actions (`MonolithISX`, `MonolithSteamBridge`, `MonolithSubstance`, `MonolithClaudeDesignBridge`) — they ship in their own repos and are not in the public release zip.
 
 Live editor introspection on a fully loaded project (with sibling plugins present) can report additional namespaces beyond the in-tree Monolith surface. Those actions ship in their owning sibling repositories and are documented separately — see [§Sibling Plugins](#sibling-plugins).
 
@@ -42,7 +42,8 @@ Live editor introspection on a fully loaded project (with sibling plugins presen
 | [cppreflect](#cppreflect) | 6 | **New v0.17.0.** Reflection Intelligence — UE 5.7 UHT reflection-edge queries (UCLASS / UPROPERTY / UFUNCTION / UINTERFACE + cpp↔asset edges + specifier discovery) |
 | [network](#network) | 4 | **New v0.17.0.** Reflection Intelligence — UE 5.7 replication inspection (replicated classes, RPCs, OnRep handlers, unbalanced-OnRep audit) |
 | [pipeline](#pipeline) | 2 | **New v0.17.0.** Reflection Intelligence — read-only composer actions (`pr_review`, `release_readiness`) |
-| **In-tree subtotal** | **1385** | (all default-active; +45 experimental town gen → 1430 when registered) |
+| [reflect](#reflect) | 1 | **New [Unreleased].** Reflection Intelligence — index maintenance (`rebuild_reflection_index`, project-only force-rebuild of the RI reflection tables; WRITE/maintenance) |
+| **In-tree subtotal** | **1386** | (all default-active; +45 experimental town gen → 1431 when registered) |
 | [Sibling plugins](#sibling-plugins) | varies | Separate plugins, separate distribution |
 
 ---
@@ -1338,13 +1339,16 @@ Find every UCLASS carrying a given specifier — substring match against the `fl
 
 ## network
 
-**New v0.17.0 (Reflection Intelligence, Phase 4a).** UE 5.7 replication inspection driven by a second UHT-artefact regex sweep (independent of Phase 3a's reader) over per-property `MetaData` blocks carrying `ReplicatedUsing` tags. Cross-joins against Phase 3a's `reflect_ufunctions`. Writes into `reflect_replicated_properties` on `EngineSource.db`. All 4 actions are read-only + idempotent. **4 actions.**
+**New v0.17.0 (Reflection Intelligence, Phase 4a).** UE 5.7 replication inspection driven by a second UHT-artefact regex sweep (independent of Phase 3a's reader) over per-property `MetaData` blocks plus the `CPF_Net` property-flag emission. Cross-joins against Phase 3a's `reflect_ufunctions`. Writes into `reflect_replicated_properties` on `EngineSource.db`. All 4 actions are read-only + idempotent. **4 actions.**
 
-> **Phase 4a known gaps:** bare `UPROPERTY(Replicated)` without `ReplicatedUsing` isn't detected (the signal lives in UHT's `PropPointers[]` block, not the metadata block the sweep walks); `COND_*` replication conditions aren't surfaced; RPC kind is derived from the name-prefix convention only (for flag-level fidelity, mask `function_flags` from `cppreflect_query("list_ufunctions")`).
+> **Status notes ([Unreleased] network-completeness workstream):**
+> - `list_replicated_classes` now captures bare `UPROPERTY(Replicated)` + `DOREPLIFETIME` (via `CPF_Net`) in addition to `ReplicatedUsing` — verified end-to-end (returned `ALeviathanCharacterBase` + `ULeviathanVitalsSet`).
+> - `list_rpc_functions` switched to specifier-based detection (`reflect_ufunctions.specifiers` from `EFunctionFlags`) instead of name-prefix, but **currently returns EMPTY**: the indexer scan scope is the project GAME MODULE only, and this project's RPCs live in project PLUGINS (e.g. InventorySystemX) outside that scope. This is a known scan-scope limitation, not a working RPC listing.
+> - `COND_*` replication conditions still aren't surfaced.
 
 ### `network_query.list_replicated_classes`
 
-Enumerate UCLASSes carrying at least one `ReplicatedUsing` property, sorted by replicated-property count. Cursor-paginated.
+Enumerate UCLASSes carrying at least one replicated property, sorted by replicated-property count. As of the [Unreleased] network-completeness workstream this captures bare `UPROPERTY(Replicated)` + `DOREPLIFETIME` (via `CPF_Net`) in addition to `ReplicatedUsing` — verified E2E. Cursor-paginated.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -1356,7 +1360,7 @@ Enumerate UCLASSes carrying at least one `ReplicatedUsing` property, sorted by r
 
 ### `network_query.list_rpc_functions`
 
-Filter `reflect_ufunctions` by name-prefix convention (`Server_*`, `Client_*`, `Multicast_*`, `NetMulticast_*`) to surface the project's RPC surface. Cursor-paginated.
+Filter `reflect_ufunctions` by replication specifier (`reflect_ufunctions.specifiers` parsed from `EFunctionFlags` — `FUNC_NetServer` / `FUNC_NetClient` / `FUNC_NetMulticast`) to surface the project's RPC surface. As of the [Unreleased] network-completeness workstream this is specifier-based, not name-prefix-based. **Currently returns EMPTY** — the scan scope is the project game module only, and this project's RPCs live in project plugins outside that scope (see status notes above). Cursor-paginated.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -1366,7 +1370,7 @@ Filter `reflect_ufunctions` by name-prefix convention (`Server_*`, `Client_*`, `
 | `limit` | integer | optional | Hard cap `500`. Default: `100` |
 | `cursor` | string | optional | Opaque cursor |
 
-**Returns:** `{ "rpcs": [ { "class_name", "module_name", "function_name", "rpc_kind", "function_flags", "return_type", "source_path", "source_line" } ], "total_estimate": N, "next_cursor": "<opaque>" }`. `rpc_kind` is derived from the name prefix at query time.
+**Returns:** `{ "rpcs": [ { "class_name", "module_name", "function_name", "rpc_kind", "function_flags", "return_type", "source_path", "source_line" } ], "total_estimate": N, "next_cursor": "<opaque>" }`. `rpc_kind` is derived from the replication specifier (`EFunctionFlags`) at query time. With the current game-module-only scan scope the array is empty for this project.
 
 ### `network_query.list_onrep_handlers`
 
@@ -1479,6 +1483,26 @@ Project-wide zero-reference scan across all asset classes (the general form; `ma
 
 ---
 
+## reflect
+
+**New [Unreleased] (Reflection Intelligence, network-completeness workstream).** One WRITE/maintenance action for repopulating the RI reflection tables. **1 action.**
+
+### `reflect_query.rebuild_reflection_index`
+
+Force-rebuild the RI reflection tables from PROJECT UHT artefacts — `reflect_uclasses`, `reflect_uproperties`, `reflect_ufunctions`, `reflect_uinterfaces`, `reflect_uinterface_impls`, `cpp_asset_edges`, and `reflect_replicated_properties`. Re-runs the RI indexers (`FCppReflectIndexer` + `FNetworkIndexer`) over the project's on-disk UHT artefacts. Scope is PROJECT only (`bIncludeEnginePlugins=false`, engine excluded).
+
+Exists because after an RI indexer code change there's no other clean repopulation trigger — the lazy bootstrap only fires on table-absence, `OnReloadComplete` only on Live Coding, and `source_query("trigger_reindex")` is the heavyweight full-engine reindex.
+
+**WRITE / maintenance action — NOT read-only.** Idempotent (wipe-and-rewrite per indexer inside a single transaction) and non-destructive (regenerates deterministically from on-disk artefacts; never touches source or non-RI tables).
+
+*No parameters.*
+
+**Returns:** a per-table row-count summary — `{ "ok": true, "rebuilt": { "reflect_uclasses": N, "reflect_uproperties": N, "reflect_ufunctions": N, "reflect_uinterfaces": N, "reflect_uinterface_impls": N, "cpp_asset_edges": N, "reflect_replicated_properties": N } }`.
+
+> Note: because the scan scope is the project game module only, a rebuild does NOT populate project-plugin RPCs — `network_query("list_rpc_functions")` stays empty after a rebuild (see the `network` namespace status notes).
+
+---
+
 <a id="sibling-plugins"></a>
 
 ## Sibling Plugins
@@ -1491,7 +1515,7 @@ If you're building a sibling plugin yourself, read `Plugins/Monolith/Docs/SIBLIN
 |---|---|---|---|---|
 | External sibling plugin | Custom | Varies | Registers its own namespace at startup and ships through its own repo/channel. | Outside `Plugins/Monolith/` |
 
-**Why these aren't in the in-tree count:** the in-tree 1385/24 figure counts only modules shipped inside the public `Monolith-vX.Y.Z.zip` release. Sibling plugins live in their own folders, ship via their own channels (or stay private), and may or may not be installed in any given consumer's project. Their absence is not a degraded state — Monolith is fully functional without them.
+**Why these aren't in the in-tree count:** the in-tree 1386/25 figure counts only modules shipped inside the public `Monolith-vX.Y.Z.zip` release. Sibling plugins live in their own folders, ship via their own channels (or stay private), and may or may not be installed in any given consumer's project. Their absence is not a degraded state — Monolith is fully functional without them.
 
 Private sibling bridges are intentionally omitted from the public API reference. Their action rosters, namespaces, and release notes belong in their own repos/channels; Monolith must not publish them as part of the public API surface.
 
