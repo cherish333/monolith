@@ -513,6 +513,87 @@ bool FMonolithReflectionIntelModule::RunRiskIndexersOnce(FString& OutStatus)
 	return bAllOk;
 }
 
+TArray<FString> FMonolithReflectionIntelModule::ResolveArtefactRoots(
+	bool bIncludeProjectPlugins, bool bIncludeMarketplacePlugins)
+{
+	TArray<FString> Roots;
+
+	// Game module root — ALWAYS scanned (preserves the original single-root
+	// behavior). FUHTArtefactReader / FNetworkRepIndexer descend
+	// <root>/<Platform>/<Target>/Inc/<Module>/UHT/ from here.
+	Roots.Add(FPaths::ProjectIntermediateDir() / TEXT("Build"));
+
+	// Fold in enabled plugins per the two scope flags. GetEnabledPlugins()
+	// returns enabled-only, so disabled plugins are never considered.
+	for (const TSharedRef<IPlugin>& Plugin : IPluginManager::Get().GetEnabledPlugins())
+	{
+		// Resolve the plugin base dir to an ABSOLUTE path at acquisition.
+		// ENGINE-loaded plugins (Epic built-ins AND launcher-installed
+		// marketplace plugins) return an ENGINE-RELATIVE GetBaseDir() like
+		// "../../../Engine/Plugins/Marketplace/<hash>" (relative to the engine
+		// Binaries/Win64 process dir). With no explicit base, ConvertRelative-
+		// PathToFull anchors against that process BaseDir — the correct anchor —
+		// yielding a real absolute on-disk root. Crucially, an absolute root
+		// makes FUHTArtefactReader::Run / FNetworkRepIndexer::Run take their
+		// IsRelative==false branch, bypassing the project-rebase that would
+		// otherwise collapse the "../../../" against the PROJECT dir and produce
+		// a non-existent path (silently skipped). Project plugins already have an
+		// absolute base dir, so this wrap is a harmless no-op for them.
+		const FString PluginBaseAbs = FPaths::ConvertRelativePathToFull(Plugin->GetBaseDir());
+
+		// PIN Win64/UnrealEditor: scanning the plugin's whole Build dir would
+		// multi-count the same UObjects across Android/IOS/Mac/UnrealGame
+		// variant trees. We only want the editor target's artefacts.
+		const FString PluginRoot =
+			PluginBaseAbs
+			/ TEXT("Intermediate") / TEXT("Build") / TEXT("Win64") / TEXT("UnrealEditor");
+
+		const EPluginLoadedFrom LoadedFrom = Plugin->GetLoadedFrom();
+
+		if (LoadedFrom == EPluginLoadedFrom::Project)
+		{
+			// Project plugins (default-on flag — the core value of this expansion).
+			if (bIncludeProjectPlugins)
+			{
+				Roots.Add(PluginRoot);
+			}
+			continue;
+		}
+
+		// LoadedFrom == EPluginLoadedFrom::Engine. This covers BOTH Epic
+		// built-ins AND launcher-installed marketplace plugins; the ONLY
+		// separator is whether the on-disk base dir lives under
+		// /Plugins/Marketplace/. Normalize slashes before the Contains check
+		// (GetBaseDir() may return backslashes on Windows).
+		if (bIncludeMarketplacePlugins)
+		{
+			FString NormalizedBaseDir = Plugin->GetBaseDir();
+			FPaths::MakeStandardFilename(NormalizedBaseDir);
+			NormalizedBaseDir.ReplaceInline(TEXT("\\"), TEXT("/"));
+
+			if (NormalizedBaseDir.Contains(TEXT("/Plugins/Marketplace/")))
+			{
+				Roots.Add(PluginRoot);
+			}
+		}
+		// Else: Epic built-in engine plugin (NOT under /Plugins/Marketplace/),
+		// or the marketplace flag is off → SKIP. NEVER scan engine built-in
+		// reflection (hard constraint: no engine reindex).
+	}
+
+	// De-duplicate. Some plugins can resolve to the same on-disk root (e.g. the
+	// DOUBLE-COPY hazard where a plugin exists under both Engine/Plugins/Marketplace
+	// and the project's Plugins/ — though GetBaseDir() of each ENABLED instance is
+	// distinct, this is a cheap belt-and-braces guard against any path collision).
+	TArray<FString> DedupedRoots;
+	DedupedRoots.Reserve(Roots.Num());
+	for (const FString& Root : Roots)
+	{
+		DedupedRoots.AddUnique(Root);
+	}
+	return DedupedRoots;
+}
+
 bool FMonolithReflectionIntelModule::RunCppReflectIndexersOnce(FString& OutStatus)
 {
 	// No settings gate in Phase 3a — the UHT-artefact reader is cheap when no
@@ -553,18 +634,41 @@ bool FMonolithReflectionIntelModule::RunCppReflectIndexersOnce(FString& OutStatu
 		return false;
 	}
 
-	// Resolve UHT artefact roots from settings. Empty = auto-resolve to
-	// ProjectIntermediateDir / Build inside FUHTArtefactReader::Run.
+	// Resolve UHT artefact roots from settings. The explicit UHTArtefactRoot
+	// override (when non-empty) REPLACES the auto-resolved set entirely
+	// (preserves prior single-root semantics). Otherwise ResolveArtefactRoots
+	// folds in the game module + enabled project plugins (default-on) +
+	// enabled marketplace plugins (gated). bIndexEnginePluginReflection stays
+	// the engine-builtin gate passed through to CollectArtefacts unchanged.
 	const UMonolithReflectionIntelSettings* Settings = UMonolithReflectionIntelSettings::Get();
 	TArray<FString> ArtefactRoots;
 	bool bIncludeEnginePlugins = false;
+	// bAllowMarketplacePaths opens the narrow /Plugins/Marketplace/ exception to
+	// the indexer's /Engine/ skip filter — marketplace artefacts live physically
+	// under /Engine/. Off unless the operator enabled marketplace scanning.
+	bool bAllowMarketplacePaths = false;
 	if (Settings)
 	{
 		bIncludeEnginePlugins = Settings->bIndexEnginePluginReflection;
+		bAllowMarketplacePaths = Settings->bIndexMarketplacePluginReflection;
 		if (!Settings->UHTArtefactRoot.IsEmpty())
 		{
 			ArtefactRoots.Add(Settings->UHTArtefactRoot);
 		}
+		else
+		{
+			ArtefactRoots = ResolveArtefactRoots(
+				Settings->bIndexProjectPluginReflection,
+				Settings->bIndexMarketplacePluginReflection);
+		}
+	}
+	else
+	{
+		// No settings CDO (defensive) — fall back to the project + project-plugin
+		// default surface (project-plugin scan is the default-on core value).
+		// Marketplace paths stay blocked (conservative) when no CDO is present.
+		ArtefactRoots = ResolveArtefactRoots(/*bIncludeProjectPlugins=*/true,
+			/*bIncludeMarketplacePlugins=*/false);
 	}
 
 	// Run both indexers sequentially under the shared DB lock. Each opens its own
@@ -587,7 +691,7 @@ bool FMonolithReflectionIntelModule::RunCppReflectIndexersOnce(FString& OutStatu
 			return false;
 		}
 		FUHTArtefactReader UhtReader;
-		bUhtOk = UhtReader.Run(*RawDb, ArtefactRoots, bIncludeEnginePlugins, UhtStatus);
+		bUhtOk = UhtReader.Run(*RawDb, ArtefactRoots, bIncludeEnginePlugins, bAllowMarketplacePaths, UhtStatus);
 
 		FAssetGraphJoiner Joiner;
 		bJoinerOk = Joiner.Run(*RawDb, JoinerStatus);
@@ -661,18 +765,41 @@ bool FMonolithReflectionIntelModule::RunNetworkIndexerOnce(FString& OutStatus)
 	}
 
 	// Resolve UHT artefact roots from settings — same shape as the Phase 3a
-	// cppreflect runner. Empty = auto-resolve to ProjectIntermediateDir/Build
-	// inside FNetworkRepIndexer::Run.
+	// cppreflect runner. The explicit UHTArtefactRoot override (when non-empty)
+	// REPLACES the auto-resolved set entirely (preserves prior single-root
+	// semantics). Otherwise ResolveArtefactRoots folds in the game module +
+	// enabled project plugins (default-on) + enabled marketplace plugins
+	// (gated). bIndexEnginePluginReflection stays the engine-builtin gate
+	// passed through to CollectArtefacts unchanged.
 	const UMonolithReflectionIntelSettings* Settings = UMonolithReflectionIntelSettings::Get();
 	TArray<FString> ArtefactRoots;
 	bool bIncludeEnginePlugins = false;
+	// bAllowMarketplacePaths opens the narrow /Plugins/Marketplace/ exception to
+	// the indexer's /Engine/ skip filter — marketplace artefacts live physically
+	// under /Engine/. Off unless the operator enabled marketplace scanning.
+	bool bAllowMarketplacePaths = false;
 	if (Settings)
 	{
 		bIncludeEnginePlugins = Settings->bIndexEnginePluginReflection;
+		bAllowMarketplacePaths = Settings->bIndexMarketplacePluginReflection;
 		if (!Settings->UHTArtefactRoot.IsEmpty())
 		{
 			ArtefactRoots.Add(Settings->UHTArtefactRoot);
 		}
+		else
+		{
+			ArtefactRoots = ResolveArtefactRoots(
+				Settings->bIndexProjectPluginReflection,
+				Settings->bIndexMarketplacePluginReflection);
+		}
+	}
+	else
+	{
+		// No settings CDO (defensive) — fall back to the project + project-plugin
+		// default surface (project-plugin scan is the default-on core value).
+		// Marketplace paths stay blocked (conservative) when no CDO is present.
+		ArtefactRoots = ResolveArtefactRoots(/*bIncludeProjectPlugins=*/true,
+			/*bIncludeMarketplacePlugins=*/false);
 	}
 
 	bool bOk = false;
@@ -690,7 +817,7 @@ bool FMonolithReflectionIntelModule::RunNetworkIndexerOnce(FString& OutStatus)
 			return false;
 		}
 		FNetworkRepIndexer Indexer;
-		bOk = Indexer.Run(*RawDb, ArtefactRoots, bIncludeEnginePlugins, OutStatus);
+		bOk = Indexer.Run(*RawDb, ArtefactRoots, bIncludeEnginePlugins, bAllowMarketplacePaths, OutStatus);
 	}
 
 	if (Self)

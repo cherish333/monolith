@@ -112,6 +112,12 @@ public:
 	 *                        directories (under the same Build root they
 	 *                        share with the project — UE 5.7's standard
 	 *                        layout merges them).  Off by default.
+	 * @param bAllowMarketplacePaths When true, the `/Engine/` skip filter makes
+	 *                        a narrow exception for `/Plugins/Marketplace/`
+	 *                        paths (engine-installed marketplace plugins live
+	 *                        physically under /Engine/ but are NOT Epic
+	 *                        built-ins). All OTHER /Engine/ paths stay blocked
+	 *                        unless bIncludeEnginePlugins is set. Off by default.
 	 * @param OutStatus       One-line summary printed to log + returned to MCP.
 	 * @return true on schema success and at least one artefact scanned
 	 *         (graceful degradation: zero artefacts = log warning + return
@@ -120,6 +126,7 @@ public:
 	bool Run(FSQLiteDatabase& DB,
 		const TArray<FString>& ArtefactRoots,
 		bool bIncludeEnginePlugins,
+		bool bAllowMarketplacePaths,
 		FString& OutStatus);
 
 private:
@@ -135,8 +142,11 @@ private:
 	bool WriteBatch(FSQLiteDatabase& DB, const FCppReflectArtefactBatch& Batch);
 
 	/** Helper — resolve `<Build>/<Platform>/<Target>/Inc/<Module>/UHT/`
-	 *  parents into a flat list of (ModuleName, AbsArtefactPath) pairs. */
+	 *  parents into a flat list of (ModuleName, AbsArtefactPath) pairs.
+	 *  bAllowMarketplacePaths opens a narrow /Plugins/Marketplace/ exception to
+	 *  the /Engine/ skip filter — see Run() docs. */
 	void CollectArtefacts(const FString& RootAbs, bool bIncludeEnginePlugins,
+		bool bAllowMarketplacePaths,
 		TArray<TPair<FString, FString>>& OutModuleAndArtefactPairs);
 
 	// Phase 2 code-quality non-negotiable item 4 — FRegexPattern hoisted to

@@ -144,7 +144,7 @@ bool FCppReflectUHTArtefactParseTest::RunTest(const FString& /*Parameters*/)
 
 	FUHTArtefactReader Reader;
 	FString Status;
-	const bool bOk = Reader.Run(Db, { WorkRoot }, /*bIncludeEnginePlugins=*/false, Status);
+	const bool bOk = Reader.Run(Db, { WorkRoot }, /*bIncludeEnginePlugins=*/false, /*bAllowMarketplacePaths=*/false, Status);
 	TestTrue(TEXT("FUHTArtefactReader::Run on staged fixture"), bOk);
 
 	TestTrue(TEXT("reflect_uclasses bootstrapped"), TableExists(Db, TEXT("reflect_uclasses")));
@@ -239,7 +239,7 @@ bool FCppReflectEmptyRootsDegradedTest::RunTest(const FString& /*Parameters*/)
 
 	FUHTArtefactReader Reader;
 	FString Status;
-	const bool bOk = Reader.Run(Db, { GhostRoot }, /*bIncludeEnginePlugins=*/false, Status);
+	const bool bOk = Reader.Run(Db, { GhostRoot }, /*bIncludeEnginePlugins=*/false, /*bAllowMarketplacePaths=*/false, Status);
 	TestTrue(TEXT("Run on missing root succeeds (graceful degradation)"), bOk);
 	TestTrue(TEXT("reflect_uclasses still bootstrapped"), TableExists(Db, TEXT("reflect_uclasses")));
 	TestEqual(TEXT("Zero UClass rows on missing root"), CountRows(Db, TEXT("reflect_uclasses")), 0);
@@ -281,7 +281,7 @@ bool FCppReflectCursorPaginationTest::RunTest(const FString& /*Parameters*/)
 	{
 		FUHTArtefactReader Reader;
 		FString Status;
-		Reader.Run(Db, {}, false, Status);
+		Reader.Run(Db, {}, false, /*bAllowMarketplacePaths=*/false, Status);
 	}
 
 	// Seed 150 synthetic UPROPERTY rows on a single class.
@@ -371,7 +371,7 @@ bool FCppReflectFindSpecifierTest::RunTest(const FString& /*Parameters*/)
 
 	FUHTArtefactReader Reader;
 	FString Status;
-	Reader.Run(Db, { WorkRoot }, false, Status);
+	Reader.Run(Db, { WorkRoot }, false, /*bAllowMarketplacePaths=*/false, Status);
 
 	// Run the same OR'd LIKE pattern the adapter uses. The exact arm carries
 	// COLLATE NOCASE to mirror the adapter's production SQL (FindClassSpecifier),

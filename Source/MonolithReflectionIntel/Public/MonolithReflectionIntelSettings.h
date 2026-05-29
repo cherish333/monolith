@@ -93,6 +93,35 @@ public:
 	bool bIndexEnginePluginReflection = false;
 
 	/**
+	 * Include ENABLED project-plugin UHT artefacts in the scan. Default ON —
+	 * this is the core value of the scan-scope expansion: cppreflect / network
+	 * reflection then covers the whole project surface (e.g. InventorySystemX
+	 * RPCs), not just the game module. Only plugins reporting
+	 * EPluginLoadedFrom::Project are folded in, and only the editor target's
+	 * Win64/UnrealEditor artefact tree under each plugin's base dir.
+	 *
+	 * Ignored when UHTArtefactRoot is set (explicit override replaces the
+	 * auto-resolved root set).
+	 */
+	UPROPERTY(EditAnywhere, config, Category="CppReflect")
+	bool bIndexProjectPluginReflection = true;
+
+	/**
+	 * Include ENABLED engine-installed MARKETPLACE-plugin UHT artefacts in the
+	 * scan. Default OFF — gated because source-shipping marketplace plugins can
+	 * be large (e.g. SMSystem / LogicDriver emit 90+ .gen.cpp). Only plugins
+	 * reporting EPluginLoadedFrom::Engine whose on-disk base dir lives under the
+	 * `/Plugins/Marketplace/` path segment are folded in; Epic built-in engine
+	 * plugins are NEVER scanned regardless of this flag (engine reflection is
+	 * owned by UE — no engine reindex).
+	 *
+	 * Ignored when UHTArtefactRoot is set (explicit override replaces the
+	 * auto-resolved root set).
+	 */
+	UPROPERTY(EditAnywhere, config, Category="CppReflect")
+	bool bIndexMarketplacePluginReflection = false;
+
+	/**
 	 * Override the UHT artefact root. Empty = auto-resolve via
 	 * FPaths::ProjectIntermediateDir() / "Build" / "<Platform>" / ... at
 	 * indexer runtime. Project-relative paths supported; absolute paths win.

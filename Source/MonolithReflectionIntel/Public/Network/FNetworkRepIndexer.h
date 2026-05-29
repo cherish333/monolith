@@ -79,6 +79,12 @@ public:
 	 *                        FPaths::ProjectIntermediateDir() / "Build".
 	 * @param bIncludeEnginePlugins When true, also sweeps engine plugin Inc/
 	 *                        directories.
+	 * @param bAllowMarketplacePaths When true, the `/Engine/` skip filter makes
+	 *                        a narrow exception for `/Plugins/Marketplace/`
+	 *                        paths (engine-installed marketplace plugins live
+	 *                        physically under /Engine/ but are NOT Epic
+	 *                        built-ins). All OTHER /Engine/ paths stay blocked
+	 *                        unless bIncludeEnginePlugins is set. Off by default.
 	 * @param OutStatus       One-line summary printed to log + returned to MCP.
 	 * @return true on schema success and at least one artefact scanned
 	 *         (graceful degradation: zero artefacts = log warning + return
@@ -87,6 +93,7 @@ public:
 	bool Run(FSQLiteDatabase& DB,
 		const TArray<FString>& ArtefactRoots,
 		bool bIncludeEnginePlugins,
+		bool bAllowMarketplacePaths,
 		FString& OutStatus);
 
 private:
@@ -103,8 +110,11 @@ private:
 
 	/** Walk a root for `<Anywhere>/Inc/<Module>/UHT/*.gen.cpp`. Mirrors
 	 *  Phase 3a's helper — duplication is intentional so Phase 4b can
-	 *  consolidate without coupling. */
+	 *  consolidate without coupling.
+	 *  bAllowMarketplacePaths opens a narrow /Plugins/Marketplace/ exception to
+	 *  the /Engine/ skip filter — see Run() docs. */
 	void CollectArtefacts(const FString& RootAbs, bool bIncludeEnginePlugins,
+		bool bAllowMarketplacePaths,
 		TArray<TPair<FString, FString>>& OutModuleAndArtefactPairs);
 
 	// Phase 2 code-quality non-negotiable item 4 — FRegexPattern hoisted to

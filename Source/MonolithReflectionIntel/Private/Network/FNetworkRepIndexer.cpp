@@ -97,6 +97,7 @@ namespace
 bool FNetworkRepIndexer::Run(FSQLiteDatabase& DB,
 	const TArray<FString>& ArtefactRoots,
 	bool bIncludeEnginePlugins,
+	bool bAllowMarketplacePaths,
 	FString& OutStatus)
 {
 	ensure(IsInGameThread());
@@ -143,7 +144,7 @@ bool FNetworkRepIndexer::Run(FSQLiteDatabase& DB,
 				TEXT("FNetworkRepIndexer: skipping missing root '%s'"), *Root);
 			continue;
 		}
-		CollectArtefacts(Root, bIncludeEnginePlugins, ModuleAndArtefactPairs);
+		CollectArtefacts(Root, bIncludeEnginePlugins, bAllowMarketplacePaths, ModuleAndArtefactPairs);
 	}
 
 	if (ModuleAndArtefactPairs.Num() == 0)
@@ -213,6 +214,7 @@ void FNetworkRepIndexer::WipeTables(FSQLiteDatabase& DB)
 
 void FNetworkRepIndexer::CollectArtefacts(
 	const FString& RootAbs, bool bIncludeEnginePlugins,
+	bool bAllowMarketplacePaths,
 	TArray<TPair<FString, FString>>& OutModuleAndArtefactPairs)
 {
 	class FCppGenVisitor : public IPlatformFile::FDirectoryVisitor
@@ -220,8 +222,9 @@ void FNetworkRepIndexer::CollectArtefacts(
 	public:
 		TArray<TPair<FString, FString>>& Out;
 		bool bIncludeEngine;
-		explicit FCppGenVisitor(TArray<TPair<FString, FString>>& InOut, bool bInIncludeEngine)
-			: Out(InOut), bIncludeEngine(bInIncludeEngine) {}
+		bool bAllowMarketplace;
+		explicit FCppGenVisitor(TArray<TPair<FString, FString>>& InOut, bool bInIncludeEngine, bool bInAllowMarketplace)
+			: Out(InOut), bIncludeEngine(bInIncludeEngine), bAllowMarketplace(bInAllowMarketplace) {}
 
 		virtual bool Visit(const TCHAR* FilenameOrDirectory, bool bIsDirectory) override
 		{
@@ -231,7 +234,13 @@ void FNetworkRepIndexer::CollectArtefacts(
 			Norm.ReplaceInline(TEXT("\\"), TEXT("/"));
 			if (!Norm.EndsWith(TEXT(".gen.cpp"), ESearchCase::IgnoreCase)) { return true; }
 			if (Norm.Find(TEXT("/UHT/")) == INDEX_NONE) { return true; }
-			if (!bIncludeEngine && Norm.Find(TEXT("/Engine/")) != INDEX_NONE)
+			// Engine-plugin filter: skip "/Engine/" paths unless opted in.
+			// Narrow exception: when bAllowMarketplace is set we permit
+			// "/Plugins/Marketplace/" paths (engine-installed marketplace
+			// plugins live under /Engine/ but are NOT Epic built-ins). All
+			// OTHER /Engine/ paths stay blocked.
+			if (!bIncludeEngine && Norm.Find(TEXT("/Engine/")) != INDEX_NONE
+				&& !(bAllowMarketplace && Norm.Contains(TEXT("/Plugins/Marketplace/"))))
 			{
 				return true;
 			}
@@ -241,7 +250,7 @@ void FNetworkRepIndexer::CollectArtefacts(
 			return true;
 		}
 	};
-	FCppGenVisitor Visitor(OutModuleAndArtefactPairs, bIncludeEnginePlugins);
+	FCppGenVisitor Visitor(OutModuleAndArtefactPairs, bIncludeEnginePlugins, bAllowMarketplacePaths);
 	IFileManager::Get().IterateDirectoryRecursively(*RootAbs, Visitor);
 }
 

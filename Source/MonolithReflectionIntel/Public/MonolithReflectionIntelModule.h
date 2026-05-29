@@ -118,10 +118,15 @@ public:
 	 * rebuild. On a transient failure the runners re-arm the cooldown/latch as
 	 * usual (the next adapter call retries), exactly as on the lazy path.
 	 *
-	 * PROJECT-ONLY: both runners resolve roots to FPaths::ProjectIntermediateDir()/Build
-	 * and pass bIncludeEnginePlugins = Settings->bIndexEnginePluginReflection
-	 * (default false). This force path adds no engine scope — engine artefacts and
-	 * the engine source-symbol index are untouched.
+	 * PROJECT-SCOPED: both runners resolve roots via ResolveArtefactRoots, which
+	 * ALWAYS includes the game module (FPaths::ProjectIntermediateDir()/Build),
+	 * folds in ENABLED project plugins when Settings->bIndexProjectPluginReflection
+	 * (default true), folds in ENABLED launcher marketplace plugins when
+	 * Settings->bIndexMarketplacePluginReflection (default false), and passes
+	 * bIncludeEnginePlugins = Settings->bIndexEnginePluginReflection (default
+	 * false) through unchanged. Epic built-in engine plugins are NEVER scanned and
+	 * the engine source-symbol index is never touched — this force path adds no
+	 * engine reindex scope.
 	 *
 	 * Game-thread only (the runners assert ensure(IsInGameThread()) transitively
 	 * via the indexers' Run()). Returns true iff BOTH runners reported success.
@@ -196,6 +201,40 @@ private:
 	// wholesale in ShutdownModule.
 	void RegisterMaintenanceActions();
 	void OnReloadComplete(EReloadCompleteReason Reason);
+
+	/**
+	 * Scan-scope resolver for the UHT-artefact runners (cppreflect + network).
+	 *
+	 * Builds the ordered, de-duplicated list of artefact roots passed to the
+	 * indexers' multi-root Run(). ALWAYS includes the game module root
+	 * (FPaths::ProjectIntermediateDir() / "Build"). Then, per the two flags,
+	 * folds in each ENABLED plugin's per-platform UHT artefact tree
+	 * (`<BaseDir>/Intermediate/Build/Win64/UnrealEditor`):
+	 *
+	 *   - bIncludeProjectPlugins     → EPluginLoadedFrom::Project plugins
+	 *                                  (default-on caller flag; the core value).
+	 *   - bIncludeMarketplacePlugins → EPluginLoadedFrom::Engine plugins whose
+	 *                                  on-disk base dir contains the
+	 *                                  `/Plugins/Marketplace/` segment
+	 *                                  (launcher-installed marketplace).
+	 *
+	 * ENGINE-SAFETY (hard constraint): Epic built-in engine plugins
+	 * (LoadedFrom==Engine but NOT under /Plugins/Marketplace/) are NEVER added,
+	 * regardless of flags — engine reflection is owned by UE, not us, and must
+	 * never trigger an engine reindex.
+	 *
+	 * The Win64/UnrealEditor leaf is PINNED so we never multi-count the same
+	 * UObjects across Android/IOS/Mac/UnrealGame variant trees under a plugin's
+	 * Build dir.
+	 *
+	 * If the operator set Settings->UHTArtefactRoot non-empty, that explicit
+	 * override REPLACES the auto-resolved set entirely (preserves prior
+	 * semantics — the runners previously fed only that one root).
+	 *
+	 * Missing/empty roots are tolerated by the indexers' own DirectoryExists
+	 * guard, so this resolver does not pre-stat them.
+	 */
+	static TArray<FString> ResolveArtefactRoots(bool bIncludeProjectPlugins, bool bIncludeMarketplacePlugins);
 
 	FDelegateHandle ReloadCompleteHandle;
 
