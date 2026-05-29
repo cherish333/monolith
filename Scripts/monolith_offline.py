@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-DEPRECATED: monolith_offline.py is superseded by the MonolithQueryCommandlet.
-  Preferred: UnrealEditor-Cmd.exe YourProject -run=MonolithQuery [args...]
-  New features in commandlet: --scope, --module, --kind, --no-header, --members-only,
-    --direction, --depth, --ref-kind, --json output mode, source indexing via 'index' namespace.
-  This script remains as a zero-dependency fallback (no UE installation required).
+Stdlib-only offline DEV FALLBACK for the canonical monolith_query.exe.
+  Kept byte-identical to the exe by Scripts/verify_offline_parity.py.
+  Serves source / project / monolith subcommands plus all 20 Reflection-Intelligence
+  actions (cppreflect, network, decision, risk), read-only against the on-disk SQLite.
+  No UE installation, no build, no editor required.
 
 Monolith Offline CLI — query EngineSource.db and ProjectIndex.db without the editor.
 
