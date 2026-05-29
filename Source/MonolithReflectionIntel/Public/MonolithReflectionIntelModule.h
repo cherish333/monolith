@@ -30,11 +30,16 @@ class FSQLiteDatabase;
  *
  * Loading phase: Default. Module type: Editor.
  *
- * DEVIATION (vs plan §0 "shared DB handle"): UMonolithSourceSubsystem does not
- * expose an accessor for its raw FSQLiteDatabase pointer, so this module owns
- * its own ReadOnly handle for queries (cached as a TUniquePtr member, torn
- * down explicitly in ShutdownModule) and opens a transient ReadWrite handle
- * for the indexer pass. See MonolithReflectionIntelModule.cpp for the policy.
+ * SHARED-HANDLE POLICY (corrected 2026-05-29, plan §0): the read-only query side
+ * BORROWS UMonolithSourceSubsystem's already-open FSQLiteDatabase handle (via
+ * FMonolithSourceDatabase::GetRawHandle) instead of opening a second handle on
+ * EngineSource.db. UE 5.7's custom `unreal-fs` SQLite VFS permits only ONE open
+ * of a file per process, so the previous "own ReadOnly handle" approach was
+ * rejected with SQLITE_IOERR ("disk I/O error") and broke all ~25 RI query
+ * actions. The transient ReadWrite handle opened during the indexer pass
+ * (Run*IndexerOnce) is unchanged — it is only ever opened while the subsystem's
+ * handle is NOT (the subsystem closes its handle for the duration of a reindex,
+ * and the indexer pass is brief), so it does not collide with the single-open VFS.
  */
 class FMonolithReflectionIntelModule : public IModuleInterface
 {
@@ -86,14 +91,27 @@ public:
 	static bool RunNetworkIndexerOnce(FString& OutStatus);
 
 	/**
-	 * Lazily open (or return) the cached ReadOnly handle on EngineSource.db.
-	 * Owned by this module instance (TUniquePtr); torn down in ShutdownModule
-	 * so the SQLite handle + file lock release cleanly on editor exit / Live
-	 * Coding module reload.
+	 * Return the SHARED EngineSource.db handle owned by UMonolithSourceSubsystem,
+	 * borrowed for read-only queries. This module no longer opens its own handle
+	 * (the UE 5.7 single-open `unreal-fs` VFS rejects a second open of the same
+	 * file with SQLITE_IOERR — that was the "disk I/O error" bug).
 	 *
-	 * Returns nullptr if EngineSource.db does not exist (caller should surface
-	 * "run source.trigger_reindex"). Path-changes between calls (e.g. plugin
-	 * re-mount) close the prior handle and open a fresh one.
+	 * Returns nullptr when the subsystem's handle is NOT open: editor not yet up,
+	 * EngineSource.db never indexed, or a reindex currently has it closed. Callers
+	 * MUST null-check and surface "run source.trigger_reindex", never crash.
+	 *
+	 * THREAD SAFETY (game-thread-only contract): the returned pointer is NOT
+	 * lock-protected. RI borrows the subsystem's open handle; ALL access must be on
+	 * the GAME THREAD. The subsystem's handle CLOSE runs on the game thread (its sole
+	 * caller is the source.trigger_reindex MCP handler, which is game-thread-dispatched;
+	 * only the REOPEN is marshaled via AsyncTask), and its async indexer uses a SEPARATE
+	 * handle on a worker — so game-thread-only RI reads are fully serialised against the
+	 * subsystem's close without any per-read lock. Every borrowing adapter's GetRawDB()
+	 * asserts ensure(IsInGameThread()) to enforce this; do NOT call read handlers off the
+	 * game thread.
+	 *
+	 * NAME: kept as GetOrOpenCachedQueryDb for call-site compatibility with the
+	 * four query adapters, even though it no longer "opens" anything itself.
 	 */
 	FSQLiteDatabase* GetOrOpenCachedQueryDb();
 
@@ -117,9 +135,10 @@ public:
 	bool HasAttemptedNetworkBootstrap() const { return bNetworkBootstrapAttempted; }
 	void MarkNetworkBootstrapAttempted()       { bNetworkBootstrapAttempted = true; }
 
-	/** Close + drop the cached query DB handle. Called from the lazy-bootstrap
-	 *  path in FDecisionQueryAdapter::GetRawDB before invoking the indexer
-	 *  (which opens its own RW handle on the same file). */
+	/** No-op under the shared-handle policy (retained for call-site compatibility).
+	 *  This module no longer owns a query handle, so there is nothing to close.
+	 *  The legacy lazy-bootstrap path in FDecisionQueryAdapter::GetRawDB still
+	 *  calls it; it must NOT touch the subsystem's handle (subsystem owns it). */
 	void ResetCachedQueryDb();
 
 private:
@@ -138,12 +157,11 @@ private:
 
 	FDelegateHandle ReloadCompleteHandle;
 
-	/** Cached ReadOnly handle on EngineSource.db. Owned by this module instance;
-	 *  Reset() explicitly in ShutdownModule before module unload to release the
-	 *  SQLite handle + file lock (TUniquePtr destruction order is not guaranteed
-	 *  during module teardown). */
-	TUniquePtr<FSQLiteDatabase> CachedQueryDb;
-	FString CachedQueryDbPath;
+	// NOTE (2026-05-29): the former `TUniquePtr<FSQLiteDatabase> CachedQueryDb` +
+	// `CachedQueryDbPath` members were removed. This module no longer opens its
+	// own handle on EngineSource.db — it borrows UMonolithSourceSubsystem's
+	// already-open handle (the UE 5.7 single-open `unreal-fs` VFS rejected the
+	// second open with SQLITE_IOERR). See GetOrOpenCachedQueryDb().
 
 	/** Replaces the prior function-static `bAttemptedBootstrap` in the adapter.
 	 *  Re-arms automatically on module reload because the module instance is

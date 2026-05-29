@@ -40,7 +40,18 @@ public class MonolithReflectionIntel : ModuleRules
 			// Verified UE 5.7 module name = "AssetRegistry"
 			// (C:/Program Files (x86)/UE_5.7/Engine/Source/Runtime/AssetRegistry/AssetRegistry.Build.cs).
 			// We do NOT depend on AssetTools — Phase 3a only READS the registry.
-			"AssetRegistry"
+			"AssetRegistry",
+			// Shared-handle fix (2026-05-29): borrow UMonolithSourceSubsystem's
+			// already-open EngineSource.db handle instead of opening a second
+			// handle (rejected by UE 5.7's single-open `unreal-fs` SQLite VFS).
+			//   MonolithSource   — UMonolithSourceSubsystem + FMonolithSourceDatabase.
+			//   UnrealEd         — GEditor (Editor.h).
+			//   EditorSubsystem  — GEditor->GetEditorSubsystem<>(). Dependency
+			//                      direction RI -> MonolithSource is non-circular
+			//                      (MonolithSource never references RI).
+			"MonolithSource",
+			"UnrealEd",
+			"EditorSubsystem"
 		});
 	}
 }

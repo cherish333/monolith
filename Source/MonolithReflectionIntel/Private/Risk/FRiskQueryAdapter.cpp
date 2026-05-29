@@ -184,6 +184,13 @@ void FRiskQueryAdapter::RegisterActions(FMonolithToolRegistry& Registry)
 
 FSQLiteDatabase* FRiskQueryAdapter::GetRawDB()
 {
+	// Thread-safety contract (matches FNetworkQueryAdapter and the other RI
+	// adapters): the borrowed EngineSource.db handle is game-thread-only. The
+	// subsystem's handle close runs on the game thread (its reindex trigger is
+	// game-thread-dispatched), so game-thread-only reads serialise against that
+	// close without a per-read lock.
+	ensure(IsInGameThread());
+
 	FMonolithReflectionIntelModule* Module =
 		FModuleManager::GetModulePtr<FMonolithReflectionIntelModule>(
 			TEXT("MonolithReflectionIntel"));

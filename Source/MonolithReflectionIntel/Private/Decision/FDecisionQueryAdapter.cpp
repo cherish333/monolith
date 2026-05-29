@@ -238,19 +238,23 @@ void FDecisionQueryAdapter::RegisterActions(FMonolithToolRegistry& Registry)
 
 FSQLiteDatabase* FDecisionQueryAdapter::GetRawDB()
 {
-	// DEVIATION (vs plan §0 "shared DB handle"):
-	// FMonolithSourceDatabase has no GetRawDatabase() accessor in the live
-	// codebase, so we cannot share its FSQLiteDatabase pointer. Instead, the
-	// module instance owns a TUniquePtr<FSQLiteDatabase> ReadOnly handle on
-	// the same file, torn down explicitly in ShutdownModule. The source
-	// subsystem opens its own handle ReadWrite; SQLite tolerates concurrent
-	// readers fine, and our ReadOnly handle takes no write lock.
+	// Thread-safety contract (matches FNetworkQueryAdapter / FAuditAdapter /
+	// FCppReflectQueryAdapter / FRiskQueryAdapter): RI borrows the subsystem's
+	// open EngineSource.db handle. All access must be game-thread-only — the
+	// subsystem's handle close runs on the game thread (its reindex trigger is
+	// game-thread-dispatched), so game-thread-only reads serialise against that
+	// close without any per-read lock.
+	ensure(IsInGameThread());
+
+	// SHARED-HANDLE POLICY (corrected 2026-05-29, plan §0): borrow
+	// UMonolithSourceSubsystem's already-open handle via GetOrOpenCachedQueryDb;
+	// the module no longer opens its own ReadOnly handle (the UE 5.7 single-open
+	// `unreal-fs` VFS rejected the second open with SQLITE_IOERR).
 	//
 	// On-demand bootstrap: if `decision_records` is missing from the DB, ask
-	// FMonolithReflectionIntelModule::RunDecisionIndexerOnce to run the
-	// indexer. That call opens a ReadWrite handle, creates the tables on
-	// first run, and closes immediately — leaving the file in a state our
-	// ReadOnly handle can open.
+	// FMonolithReflectionIntelModule::RunDecisionIndexerOnce to run the indexer.
+	// That transient ReadWrite open happens only while the subsystem's handle is
+	// closed (during a reindex), so it does not collide with the single-open VFS.
 
 	FMonolithReflectionIntelModule* Module =
 		FModuleManager::GetModulePtr<FMonolithReflectionIntelModule>(

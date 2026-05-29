@@ -120,19 +120,24 @@ bool FMonolithSourceDatabase::Open(const FString& DbPath)
 		return false;
 	}
 
-	// Force DELETE journal mode on EVERY open. Cross-process readers
-	// (e.g. MonolithReflectionIntel's cached ReadOnly handle) cannot replay
-	// a -wal/-shm sidecar on Windows and fail with SQLITE_IOERR
-	// ("disk I/O error"). Persisting DELETE mode eliminates the WAL files
-	// entirely; defensive idempotency on every open so we re-flip even if
-	// a prior session crashed mid-WAL or another process flipped it back.
-	// See .claude/rules/scoped/cpp-code.md § "Known Pitfalls":
-	// "SQLite WAL + ReadOnly: silent failure on Windows. Open ReadWrite,
-	// force journal_mode=DELETE".
+	// Force DELETE journal mode on EVERY open. This keeps the file free of
+	// -wal/-shm sidecars at rest — tidy, and defensive idempotency in case a
+	// prior session crashed mid-WAL or another tool flipped it back.
+	//
+	// NOTE (corrected 2026-05-29): an earlier theory blamed Reflection
+	// Intelligence's "disk I/O error" on WAL+ReadOnly cross-process replay. That
+	// was WRONG — this DB is in DELETE mode (no WAL involved) and the failure was
+	// SAME-process, not cross-process. The real cause was a second open of this
+	// same file by MonolithReflectionIntel: UE 5.7's custom `unreal-fs` SQLite VFS
+	// permits only ONE open of a file per process and reserves a write handle even
+	// for a "ReadOnly" open, so the second open returned SQLITE_IOERR. The fix is
+	// to STOP the second open — RI now borrows this handle via GetRawHandle().
+	// The journal_mode flip remains for hygiene only; it is no longer load-bearing
+	// for RI access.
 	if (!Database->Execute(TEXT("PRAGMA journal_mode=DELETE;")))
 	{
 		UE_LOG(LogMonolithSource, Warning,
-			TEXT("Open: PRAGMA journal_mode=DELETE failed on '%s' (continuing — ReadOnly handles may hit SQLITE_IOERR)"),
+			TEXT("Open: PRAGMA journal_mode=DELETE failed on '%s' (continuing — hygiene only)"),
 			*DbPath);
 	}
 
@@ -155,6 +160,16 @@ bool FMonolithSourceDatabase::IsOpen() const
 {
 	FScopeLock Lock(&DbLock);
 	return Database != nullptr && Database->IsValid();
+}
+
+FSQLiteDatabase* FMonolithSourceDatabase::GetRawHandle() const
+{
+	// Deliberately NOT locked here: the borrower (MonolithReflectionIntel) holds
+	// GetLock() across the whole fetch-prepare-step sequence, so taking DbLock
+	// here too would either deadlock (non-recursive FCriticalSection) or give a
+	// false sense of safety for a pointer that outlives this call. Return the
+	// raw pointer only when the handle is genuinely open; the borrower locks.
+	return (Database != nullptr && Database->IsValid()) ? Database : nullptr;
 }
 
 // ============================================================
@@ -912,19 +927,18 @@ bool FMonolithSourceDatabase::OpenForWriting(const FString& DbPath)
 		return false;
 	}
 
-	// Force DELETE journal mode on the writer handle. This is the AUTHORITATIVE
-	// flip — once it lands the DB persists in DELETE mode at rest, so the next
-	// MonolithReflectionIntel ReadOnly open succeeds (WAL + cross-process
-	// ReadOnly on Windows = SQLITE_IOERR). Check the return value so we surface
-	// the failure mode that previously presented as silent — Reflection
-	// Intelligence "disk I/O error" x28 with MonolithSource logging clean.
-	// See .claude/rules/scoped/cpp-code.md § "Known Pitfalls":
-	// "SQLite WAL + ReadOnly: silent failure on Windows. Open ReadWrite,
-	// force journal_mode=DELETE".
+	// Force DELETE journal mode on the writer handle so the DB persists in DELETE
+	// mode at rest (no -wal/-shm sidecars). NOTE (corrected 2026-05-29): this is
+	// hygiene, NOT the fix for Reflection Intelligence's "disk I/O error" x25 —
+	// that was a SAME-process double-open rejected by UE 5.7's single-open
+	// `unreal-fs` VFS, now resolved by RI borrowing the subsystem's open handle
+	// (FMonolithSourceDatabase::GetRawHandle) rather than opening its own. We keep
+	// the return-value check because a journal-mode failure here is still worth a
+	// visible warning.
 	if (!Database->Execute(TEXT("PRAGMA journal_mode=DELETE;")))
 	{
 		UE_LOG(LogMonolithSource, Warning,
-			TEXT("OpenForWriting: PRAGMA journal_mode=DELETE failed on '%s' (continuing — ReadOnly handles may hit SQLITE_IOERR)"),
+			TEXT("OpenForWriting: PRAGMA journal_mode=DELETE failed on '%s' (continuing — hygiene only)"),
 			*DbPath);
 	}
 	Database->Execute(TEXT("PRAGMA synchronous=NORMAL;"));

@@ -42,21 +42,23 @@
 #include "SQLiteDatabase.h"
 #include "UObject/UObjectGlobals.h"
 
+// Shared-handle borrow: route RI's read-only queries (and the bootstrap
+// indexer writes) through UMonolithSourceSubsystem's already-open EngineSource.db
+// handle, instead of opening a second handle that the UE 5.7 single-open
+// `unreal-fs` SQLite VFS rejects with SQLITE_IOERR.
+#include "MonolithSourceSubsystem.h"
+#include "MonolithSourceDatabase.h"
+#include "Editor.h"
+
 DEFINE_LOG_CATEGORY(LogMonolithReflectionIntel);
 
 #define LOCTEXT_NAMESPACE "FMonolithReflectionIntelModule"
 
 namespace
 {
-	FString GetEngineSourceDbPathStatic()
-	{
-		TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("Monolith"));
-		if (Plugin.IsValid())
-		{
-			return Plugin->GetBaseDir() / TEXT("Saved") / TEXT("EngineSource.db");
-		}
-		return FPaths::ProjectPluginsDir() / TEXT("Monolith") / TEXT("Saved") / TEXT("EngineSource.db");
-	}
+	// NOTE: the former GetEngineSourceDbPathStatic() helper was removed — RI no
+	// longer resolves the DB path itself, since it borrows the subsystem's
+	// already-open handle rather than opening EngineSource.db by path.
 
 	/**
 	 * Resolve the live FMonolithReflectionIntelModule instance from inside a
@@ -67,6 +69,28 @@ namespace
 	{
 		return FModuleManager::GetModulePtr<FMonolithReflectionIntelModule>(
 			TEXT("MonolithReflectionIntel"));
+	}
+
+	/**
+	 * Resolve the source subsystem's FMonolithSourceDatabase wrapper (NOT the raw
+	 * SQLite handle). Returns nullptr when the editor / subsystem / DB is not
+	 * available — every caller tolerates this and surfaces a clean
+	 * "run source.trigger_reindex" / "editor not running" state.
+	 *
+	 * Game-thread only: GEditor and editor subsystems must be touched on the game
+	 * thread. All RI action handlers and the bootstrap runners execute on the game
+	 * thread (FModuleDepRealityAdapter::GetRawDB ensure(IsInGameThread()) is the
+	 * canonical witness), so this is safe.
+	 */
+	FMonolithSourceDatabase* GetSharedSourceDatabase()
+	{
+		if (!GEditor)
+		{
+			return nullptr;
+		}
+		UMonolithSourceSubsystem* SourceSS =
+			GEditor->GetEditorSubsystem<UMonolithSourceSubsystem>();
+		return SourceSS ? SourceSS->GetDatabase() : nullptr;
 	}
 }
 
@@ -93,17 +117,17 @@ void FMonolithReflectionIntelModule::StartupModule()
 	RegisterPipelineActions();
 
 	// Bind hot-reload hook so the decision corpus refreshes after Live Coding /
-	// UBT rebuilds. The handler opens the DB ReadWrite only briefly (the
-	// indexer wipes+rewrites and closes immediately) — collision with the
-	// source subsystem's ReadWrite handle is avoided by only firing on
-	// reload-complete (subsystem closes its handle during reindex anyway,
-	// and outside of reindex SQLite tolerates a second briefly-open RW handle).
+	// UBT rebuilds. The indexer pass now WRITES THROUGH the subsystem's shared
+	// open handle (under its lock) rather than opening its own — so there is no
+	// second-handle collision with the single-open `unreal-fs` VFS. If a reindex
+	// is in progress the subsystem's handle is closed and the runners cleanly
+	// fast-return "source DB not open" (retry on a later signal).
 	ReloadCompleteHandle = FCoreUObjectDelegates::ReloadCompleteDelegate.AddRaw(
 		this, &FMonolithReflectionIntelModule::OnReloadComplete);
 
-	// NO eager bootstrap on StartupModule — the source subsystem's WAL handle
-	// may already be open on EngineSource.db at this point and our writer would
-	// race. All indexer bootstrap is LAZY:
+	// NO eager bootstrap on StartupModule — the source subsystem may not have
+	// finished opening its EngineSource.db handle at module-load time. All
+	// indexer bootstrap is LAZY and writes through the subsystem's shared handle:
 	//   - Decision:    driven on first decision_query call.
 	//   - Risk:        driven on first risk_query call.
 	//   - CppReflect:  driven on first cppreflect_query call.
@@ -125,12 +149,11 @@ void FMonolithReflectionIntelModule::ShutdownModule()
 		ReloadCompleteHandle.Reset();
 	}
 
-	// CRITICAL: tear down the cached SQLite handle BEFORE module unload. Plain
-	// TUniquePtr<T> member destruction order during module teardown is not
-	// guaranteed; an explicit Reset() ensures FSQLiteDatabase::Close() runs
-	// while the SQLiteCore module is still loaded, releasing the file lock
-	// cleanly. Without this, editor exit / module reload would leak the
-	// SQLite handle AND the underlying file lock on EngineSource.db.
+	// Shared-handle policy: this module no longer owns a SQLite handle on
+	// EngineSource.db (it borrows UMonolithSourceSubsystem's). Nothing to tear
+	// down here — the subsystem closes its own handle in Deinitialize(). The
+	// call is retained only because ResetCachedQueryDb() is part of the public
+	// surface used by the adapters' legacy bootstrap path; it is now a no-op.
 	ResetCachedQueryDb();
 
 	FMonolithToolRegistry::Get().UnregisterNamespace(TEXT("decision"));
@@ -155,50 +178,26 @@ void FMonolithReflectionIntelModule::ShutdownModule()
 
 FSQLiteDatabase* FMonolithReflectionIntelModule::GetOrOpenCachedQueryDb()
 {
-	const FString DbPath = GetEngineSourceDbPathStatic();
-
-	// Fast path: handle already open at the same path and still valid.
-	if (CachedQueryDb.IsValid() && CachedQueryDbPath == DbPath && CachedQueryDb->IsValid())
+	// Borrow the subsystem's already-open handle. We open NOTHING here — the UE
+	// 5.7 single-open `unreal-fs` SQLite VFS rejects a second open of the same
+	// file with SQLITE_IOERR ("disk I/O error"), which is exactly the bug that
+	// broke all ~25 RI query actions. Returns nullptr when the subsystem's handle
+	// is not open (editor down, never indexed, or reindex has it closed) — the
+	// caller surfaces "run source.trigger_reindex".
+	FMonolithSourceDatabase* SharedDb = GetSharedSourceDatabase();
+	if (!SharedDb)
 	{
-		return CachedQueryDb.Get();
-	}
-
-	// Drop any stale handle (path-change or invalidated) before opening a new one.
-	if (CachedQueryDb.IsValid())
-	{
-		CachedQueryDb->Close();
-		CachedQueryDb.Reset();
-	}
-
-	IPlatformFile& Pf = FPlatformFileManager::Get().GetPlatformFile();
-	if (!Pf.FileExists(*DbPath))
-	{
-		// EngineSource.db has not been bootstrapped — caller surfaces the
-		// "run source.trigger_reindex" error message.
 		return nullptr;
 	}
-
-	CachedQueryDb = MakeUnique<FSQLiteDatabase>();
-	// ReadOnly mode — pure query side, never writes. Avoids any WAL-mode
-	// silent-fail trap by NOT writing (cf. .claude/rules/scoped/cpp-code.md
-	// § "Known Pitfalls": SQLite WAL + ReadOnly silent failure on Windows).
-	if (!CachedQueryDb->Open(*DbPath, ESQLiteDatabaseOpenMode::ReadOnly))
-	{
-		CachedQueryDb.Reset();
-		return nullptr;
-	}
-	CachedQueryDbPath = DbPath;
-	return CachedQueryDb.Get();
+	return SharedDb->GetRawHandle();
 }
 
 void FMonolithReflectionIntelModule::ResetCachedQueryDb()
 {
-	if (CachedQueryDb.IsValid())
-	{
-		CachedQueryDb->Close();
-		CachedQueryDb.Reset();
-	}
-	CachedQueryDbPath.Reset();
+	// No-op under the shared-handle policy — this module no longer owns a query
+	// handle, so there is nothing to close. Retained for call-site compatibility
+	// (the adapters' legacy lazy-bootstrap path still calls it; it must not touch
+	// the subsystem's handle, which the subsystem alone owns).
 }
 
 void FMonolithReflectionIntelModule::RegisterDecisionActions()
@@ -306,55 +305,24 @@ bool FMonolithReflectionIntelModule::RunDecisionIndexerOnce(FString& OutStatus)
 		return false;
 	}
 
-	const FString DbPath = GetEngineSourceDbPathStatic();
-	IPlatformFile& Pf = FPlatformFileManager::Get().GetPlatformFile();
-	if (!Pf.FileExists(*DbPath))
+	// Borrow the subsystem's already-open ReadWrite handle for the indexer write
+	// pass — do NOT open a second handle. The UE 5.7 single-open `unreal-fs` VFS
+	// rejects a second open of EngineSource.db with SQLITE_IOERR, which is the
+	// very bug we are fixing. The subsystem opens its handle ReadWrite, so the
+	// indexer's CREATE TABLE / INSERT statements ride it fine.
+	FMonolithSourceDatabase* SharedDb = GetSharedSourceDatabase();
+	if (!SharedDb || !SharedDb->GetRawHandle())
 	{
-		OutStatus = FString::Printf(
-			TEXT("RunDecisionIndexerOnce: EngineSource.db not present at '%s' — bootstrap with source.trigger_reindex"),
-			*DbPath);
+		OutStatus = TEXT("RunDecisionIndexerOnce: source DB not open (editor down, never indexed, or reindex in progress) — bootstrap with source.trigger_reindex");
 		UE_LOG(LogMonolithReflectionIntel, Verbose, TEXT("%s"), *OutStatus);
-		// File-missing is TRANSIENT — source.trigger_reindex may create it later.
-		// Clear the latch so the next adapter call retries.
+		// Transient — the subsystem may open the handle later. Clear the latch
+		// so the next adapter call retries.
 		if (Self)
 		{
 			Self->bDecisionBootstrapAttempted = false;
 			Self->DecisionLastFailureTime = FPlatformTime::Seconds();
 		}
 		return false;
-	}
-
-	FSQLiteDatabase Db;
-	if (!Db.Open(*DbPath, ESQLiteDatabaseOpenMode::ReadWrite))
-	{
-		OutStatus = FString::Printf(
-			TEXT("RunDecisionIndexerOnce: RW open failed on '%s' (likely WAL+ReadOnly conflict; will retry on next call after MonolithSource normalizes file state)"),
-			*DbPath);
-		UE_LOG(LogMonolithReflectionIntel, Warning, TEXT("%s"), *OutStatus);
-		// RW open failure is TRANSIENT — MonolithSource's writer may flip the
-		// DB to a state we can open later. Clear the latch so a follow-up call
-		// (post-cooldown) retries.
-		if (Self)
-		{
-			Self->bDecisionBootstrapAttempted = false;
-			Self->DecisionLastFailureTime = FPlatformTime::Seconds();
-		}
-		return false;
-	}
-
-	// Force DELETE journal mode BEFORE any CREATE TABLE / INSERT runs. Opening
-	// a second handle (ours, RW) on a SQLite DB that the source subsystem may
-	// have left in WAL mode is exactly the silent-failure pattern documented
-	// in .claude/rules/scoped/cpp-code.md § "Known Pitfalls" (WAL + ReadOnly
-	// silent failure on Windows). Mirrors the pattern at
-	// MonolithSourceDatabase.cpp:124. Tolerate failure (warn + continue) per
-	// project convention — the indexer may still complete its work.
-	if (!Db.Execute(TEXT("PRAGMA journal_mode=DELETE;")))
-	{
-		UE_LOG(LogMonolithReflectionIntel, Warning,
-			TEXT("RunDecisionIndexerOnce: PRAGMA journal_mode=DELETE failed on '%s' (continuing)"),
-			*DbPath);
-		// Do NOT bail and do NOT mark failure — the indexer may still succeed.
 	}
 
 	TArray<FString> Roots = Settings->DecisionMarkdownRoots;
@@ -365,9 +333,27 @@ bool FMonolithReflectionIntelModule::RunDecisionIndexerOnce(FString& OutStatus)
 		Roots.Add(TEXT(".claude/rules"));
 	}
 
-	FDecisionRecordIndexer Indexer;
-	const bool bOk = Indexer.Run(Db, Roots, OutStatus);
-	Db.Close();
+	// Serialise the write pass against concurrent borrowed reads and the
+	// subsystem's own locked methods by holding the shared DB lock for the whole
+	// indexer Run. The journal mode is already DELETE (the subsystem flips it on
+	// every open) so we do not re-flip it here.
+	bool bOk = false;
+	{
+		FScopeLock Lock(&SharedDb->GetLock());
+		FSQLiteDatabase* RawDb = SharedDb->GetRawHandle();
+		if (!RawDb)
+		{
+			OutStatus = TEXT("RunDecisionIndexerOnce: source DB closed mid-bootstrap — will retry");
+			if (Self)
+			{
+				Self->bDecisionBootstrapAttempted = false;
+				Self->DecisionLastFailureTime = FPlatformTime::Seconds();
+			}
+			return false;
+		}
+		FDecisionRecordIndexer Indexer;
+		bOk = Indexer.Run(*RawDb, Roots, OutStatus);
+	}
 
 	if (Self)
 	{
@@ -419,13 +405,12 @@ bool FMonolithReflectionIntelModule::RunRiskIndexersOnce(FString& OutStatus)
 		return false;
 	}
 
-	const FString DbPath = GetEngineSourceDbPathStatic();
-	IPlatformFile& Pf = FPlatformFileManager::Get().GetPlatformFile();
-	if (!Pf.FileExists(*DbPath))
+	// Borrow the subsystem's open ReadWrite handle (see RunDecisionIndexerOnce
+	// for the single-open VFS rationale). No second open, no journal re-flip.
+	FMonolithSourceDatabase* SharedDb = GetSharedSourceDatabase();
+	if (!SharedDb || !SharedDb->GetRawHandle())
 	{
-		OutStatus = FString::Printf(
-			TEXT("RunRiskIndexersOnce: EngineSource.db not present at '%s' — bootstrap with source.trigger_reindex"),
-			*DbPath);
+		OutStatus = TEXT("RunRiskIndexersOnce: source DB not open (editor down, never indexed, or reindex in progress) — bootstrap with source.trigger_reindex");
 		UE_LOG(LogMonolithReflectionIntel, Verbose, TEXT("%s"), *OutStatus);
 		if (Self)
 		{
@@ -433,32 +418,6 @@ bool FMonolithReflectionIntelModule::RunRiskIndexersOnce(FString& OutStatus)
 			Self->RiskLastFailureTime = FPlatformTime::Seconds();
 		}
 		return false;
-	}
-
-	FSQLiteDatabase Db;
-	if (!Db.Open(*DbPath, ESQLiteDatabaseOpenMode::ReadWrite))
-	{
-		OutStatus = FString::Printf(
-			TEXT("RunRiskIndexersOnce: RW open failed on '%s' (likely WAL+ReadOnly conflict; will retry on next call after MonolithSource normalizes file state)"),
-			*DbPath);
-		UE_LOG(LogMonolithReflectionIntel, Warning, TEXT("%s"), *OutStatus);
-		if (Self)
-		{
-			Self->bRiskBootstrapAttempted = false;
-			Self->RiskLastFailureTime = FPlatformTime::Seconds();
-		}
-		return false;
-	}
-
-	// Same DELETE-journal discipline as the decision indexer — opening a
-	// second RW handle on a SQLite DB the source subsystem may have left in
-	// WAL mode is the documented silent-failure pattern. Cite the project rule.
-	if (!Db.Execute(TEXT("PRAGMA journal_mode=DELETE;")))
-	{
-		UE_LOG(LogMonolithReflectionIntel, Warning,
-			TEXT("RunRiskIndexersOnce: PRAGMA journal_mode=DELETE failed on '%s' (continuing)"),
-			*DbPath);
-		// Continue — the indexer suite may still succeed.
 	}
 
 	// Resolve git repo roots. Phase 2 mines NESTED git repos only — the
@@ -481,26 +440,43 @@ bool FMonolithReflectionIntelModule::RunRiskIndexersOnce(FString& OutStatus)
 	const int32 MaxFiles = Settings->MaxCommitFileCount > 0
 		? Settings->MaxCommitFileCount : 20;
 
-	FString GitStatus;
-	FGitCoChangeIndexer GitIndexer;
-	const bool bGitOk = GitIndexer.Run(Db, GitRoots, MaxWindow,
-		Settings->GitMiningNoiseFilter, MaxFiles, GitStatus);
-
-	FString HotspotStatus;
-	FHotspotScorer HotspotScorer;
-	const bool bHotspotOk = HotspotScorer.Run(Db, HotspotStatus);
-
 	// Conditional gates — scan project Source/ + Plugins/<plugin>/Source/.
 	// We do NOT scan the Plugins/Monolith folder root — only its Source/ —
 	// because `.uplugin` / `.uproject` files are not C++.
 	TArray<FString> GateRoots;
 	GateRoots.Add(TEXT("Source"));
 	GateRoots.Add(TEXT("Plugins"));
-	FString GateStatus;
-	FConditionalGateIndexer GateIndexer;
-	const bool bGateOk = GateIndexer.Run(Db, GateRoots, GateStatus);
 
-	Db.Close();
+	// Serialise all three sub-indexers' writes against concurrent borrowed reads
+	// and the subsystem's own locked methods by holding the shared DB lock for the
+	// whole suite. FGitCoChangeIndexer spawns `git log` (slow) under the lock —
+	// acceptable because RI reads are game-thread and the subsystem only touches
+	// its handle on the game thread, so nothing else contends during the borrow.
+	FString GitStatus, HotspotStatus, GateStatus;
+	bool bGitOk = false, bHotspotOk = false, bGateOk = false;
+	{
+		FScopeLock Lock(&SharedDb->GetLock());
+		FSQLiteDatabase* RawDb = SharedDb->GetRawHandle();
+		if (!RawDb)
+		{
+			OutStatus = TEXT("RunRiskIndexersOnce: source DB closed mid-bootstrap — will retry");
+			if (Self)
+			{
+				Self->bRiskBootstrapAttempted = false;
+				Self->RiskLastFailureTime = FPlatformTime::Seconds();
+			}
+			return false;
+		}
+		FGitCoChangeIndexer GitIndexer;
+		bGitOk = GitIndexer.Run(*RawDb, GitRoots, MaxWindow,
+			Settings->GitMiningNoiseFilter, MaxFiles, GitStatus);
+
+		FHotspotScorer HotspotScorer;
+		bHotspotOk = HotspotScorer.Run(*RawDb, HotspotStatus);
+
+		FConditionalGateIndexer GateIndexer;
+		bGateOk = GateIndexer.Run(*RawDb, GateRoots, GateStatus);
+	}
 
 	OutStatus = FString::Printf(
 		TEXT("RunRiskIndexersOnce: git=%s | hotspot=%s | gates=%s"),
@@ -551,13 +527,12 @@ bool FMonolithReflectionIntelModule::RunCppReflectIndexersOnce(FString& OutStatu
 		Self->CppReflectLastFailureTime = 0.0;
 	}
 
-	const FString DbPath = GetEngineSourceDbPathStatic();
-	IPlatformFile& Pf = FPlatformFileManager::Get().GetPlatformFile();
-	if (!Pf.FileExists(*DbPath))
+	// Borrow the subsystem's open ReadWrite handle (single-open VFS rationale in
+	// RunDecisionIndexerOnce). No second open, no journal re-flip.
+	FMonolithSourceDatabase* SharedDb = GetSharedSourceDatabase();
+	if (!SharedDb || !SharedDb->GetRawHandle())
 	{
-		OutStatus = FString::Printf(
-			TEXT("RunCppReflectIndexersOnce: EngineSource.db not present at '%s' — bootstrap with source.trigger_reindex"),
-			*DbPath);
+		OutStatus = TEXT("RunCppReflectIndexersOnce: source DB not open (editor down, never indexed, or reindex in progress) — bootstrap with source.trigger_reindex");
 		UE_LOG(LogMonolithReflectionIntel, Verbose, TEXT("%s"), *OutStatus);
 		if (Self)
 		{
@@ -565,32 +540,6 @@ bool FMonolithReflectionIntelModule::RunCppReflectIndexersOnce(FString& OutStatu
 			Self->CppReflectLastFailureTime = FPlatformTime::Seconds();
 		}
 		return false;
-	}
-
-	FSQLiteDatabase Db;
-	if (!Db.Open(*DbPath, ESQLiteDatabaseOpenMode::ReadWrite))
-	{
-		OutStatus = FString::Printf(
-			TEXT("RunCppReflectIndexersOnce: RW open failed on '%s' (likely WAL+ReadOnly conflict; will retry on next call after MonolithSource normalizes file state)"),
-			*DbPath);
-		UE_LOG(LogMonolithReflectionIntel, Warning, TEXT("%s"), *OutStatus);
-		if (Self)
-		{
-			Self->bCppReflectBootstrapAttempted = false;
-			Self->CppReflectLastFailureTime = FPlatformTime::Seconds();
-		}
-		return false;
-	}
-
-	// Same DELETE-journal discipline as Phase 1 + Phase 2 — opening a second
-	// RW handle on a SQLite DB the source subsystem may have left in WAL mode
-	// is the documented silent-failure pattern.
-	if (!Db.Execute(TEXT("PRAGMA journal_mode=DELETE;")))
-	{
-		UE_LOG(LogMonolithReflectionIntel, Warning,
-			TEXT("RunCppReflectIndexersOnce: PRAGMA journal_mode=DELETE failed on '%s' (continuing)"),
-			*DbPath);
-		// Continue — the indexers may still succeed.
 	}
 
 	// Resolve UHT artefact roots from settings. Empty = auto-resolve to
@@ -607,19 +556,31 @@ bool FMonolithReflectionIntelModule::RunCppReflectIndexersOnce(FString& OutStatu
 		}
 	}
 
-	// Run both indexers sequentially. Each opens its own internal transaction
-	// so we do not need to wrap them in an outer BEGIN/COMMIT — but ordering
-	// matters: FUHTArtefactReader populates reflect_uclasses before
+	// Run both indexers sequentially under the shared DB lock. Each opens its own
+	// internal transaction so we do not need to wrap them in an outer BEGIN/COMMIT
+	// — but ordering matters: FUHTArtefactReader populates reflect_uclasses before
 	// FAssetGraphJoiner reads it.
-	FString UhtStatus;
-	FUHTArtefactReader UhtReader;
-	const bool bUhtOk = UhtReader.Run(Db, ArtefactRoots, bIncludeEnginePlugins, UhtStatus);
+	FString UhtStatus, JoinerStatus;
+	bool bUhtOk = false, bJoinerOk = false;
+	{
+		FScopeLock Lock(&SharedDb->GetLock());
+		FSQLiteDatabase* RawDb = SharedDb->GetRawHandle();
+		if (!RawDb)
+		{
+			OutStatus = TEXT("RunCppReflectIndexersOnce: source DB closed mid-bootstrap — will retry");
+			if (Self)
+			{
+				Self->bCppReflectBootstrapAttempted = false;
+				Self->CppReflectLastFailureTime = FPlatformTime::Seconds();
+			}
+			return false;
+		}
+		FUHTArtefactReader UhtReader;
+		bUhtOk = UhtReader.Run(*RawDb, ArtefactRoots, bIncludeEnginePlugins, UhtStatus);
 
-	FString JoinerStatus;
-	FAssetGraphJoiner Joiner;
-	const bool bJoinerOk = Joiner.Run(Db, JoinerStatus);
-
-	Db.Close();
+		FAssetGraphJoiner Joiner;
+		bJoinerOk = Joiner.Run(*RawDb, JoinerStatus);
+	}
 
 	OutStatus = FString::Printf(
 		TEXT("RunCppReflectIndexersOnce: uht=%s | asset_graph=%s"),
@@ -673,13 +634,12 @@ bool FMonolithReflectionIntelModule::RunNetworkIndexerOnce(FString& OutStatus)
 		Self->NetworkLastFailureTime = 0.0;
 	}
 
-	const FString DbPath = GetEngineSourceDbPathStatic();
-	IPlatformFile& Pf = FPlatformFileManager::Get().GetPlatformFile();
-	if (!Pf.FileExists(*DbPath))
+	// Borrow the subsystem's open ReadWrite handle (single-open VFS rationale in
+	// RunDecisionIndexerOnce). No second open, no journal re-flip.
+	FMonolithSourceDatabase* SharedDb = GetSharedSourceDatabase();
+	if (!SharedDb || !SharedDb->GetRawHandle())
 	{
-		OutStatus = FString::Printf(
-			TEXT("RunNetworkIndexerOnce: EngineSource.db not present at '%s' — bootstrap with source.trigger_reindex"),
-			*DbPath);
+		OutStatus = TEXT("RunNetworkIndexerOnce: source DB not open (editor down, never indexed, or reindex in progress) — bootstrap with source.trigger_reindex");
 		UE_LOG(LogMonolithReflectionIntel, Verbose, TEXT("%s"), *OutStatus);
 		if (Self)
 		{
@@ -687,32 +647,6 @@ bool FMonolithReflectionIntelModule::RunNetworkIndexerOnce(FString& OutStatus)
 			Self->NetworkLastFailureTime = FPlatformTime::Seconds();
 		}
 		return false;
-	}
-
-	FSQLiteDatabase Db;
-	if (!Db.Open(*DbPath, ESQLiteDatabaseOpenMode::ReadWrite))
-	{
-		OutStatus = FString::Printf(
-			TEXT("RunNetworkIndexerOnce: RW open failed on '%s' (likely WAL+ReadOnly conflict; will retry on next call after MonolithSource normalizes file state)"),
-			*DbPath);
-		UE_LOG(LogMonolithReflectionIntel, Warning, TEXT("%s"), *OutStatus);
-		if (Self)
-		{
-			Self->bNetworkBootstrapAttempted = false;
-			Self->NetworkLastFailureTime = FPlatformTime::Seconds();
-		}
-		return false;
-	}
-
-	// Same DELETE-journal discipline as Phase 1/2/3a — opening a second RW
-	// handle on a SQLite DB the source subsystem may have left in WAL mode is
-	// the documented silent-failure pattern on Windows.
-	if (!Db.Execute(TEXT("PRAGMA journal_mode=DELETE;")))
-	{
-		UE_LOG(LogMonolithReflectionIntel, Warning,
-			TEXT("RunNetworkIndexerOnce: PRAGMA journal_mode=DELETE failed on '%s' (continuing)"),
-			*DbPath);
-		// Continue — the indexer may still succeed.
 	}
 
 	// Resolve UHT artefact roots from settings — same shape as the Phase 3a
@@ -730,9 +664,23 @@ bool FMonolithReflectionIntelModule::RunNetworkIndexerOnce(FString& OutStatus)
 		}
 	}
 
-	FNetworkRepIndexer Indexer;
-	const bool bOk = Indexer.Run(Db, ArtefactRoots, bIncludeEnginePlugins, OutStatus);
-	Db.Close();
+	bool bOk = false;
+	{
+		FScopeLock Lock(&SharedDb->GetLock());
+		FSQLiteDatabase* RawDb = SharedDb->GetRawHandle();
+		if (!RawDb)
+		{
+			OutStatus = TEXT("RunNetworkIndexerOnce: source DB closed mid-bootstrap — will retry");
+			if (Self)
+			{
+				Self->bNetworkBootstrapAttempted = false;
+				Self->NetworkLastFailureTime = FPlatformTime::Seconds();
+			}
+			return false;
+		}
+		FNetworkRepIndexer Indexer;
+		bOk = Indexer.Run(*RawDb, ArtefactRoots, bIncludeEnginePlugins, OutStatus);
+	}
 
 	if (Self)
 	{

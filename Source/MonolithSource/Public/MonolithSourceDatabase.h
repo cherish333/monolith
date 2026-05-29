@@ -86,6 +86,39 @@ public:
 	void Close();
 	bool IsOpen() const;
 
+	/**
+	 * Borrowable access to the underlying open SQLite handle.
+	 *
+	 * MonolithReflectionIntel's read-only query adapters (decision / risk /
+	 * cppreflect / network — ~25 actions) borrow THIS handle instead of opening
+	 * a SECOND handle on the same EngineSource.db file. UE 5.7 builds SQLite with
+	 * a custom `unreal-fs` VFS that permits only ONE open of a given file per
+	 * process (and grabs a write reservation even on a "ReadOnly" open), so a
+	 * second open in the same process is rejected with SQLITE_IOERR
+	 * ("disk I/O error"). Routing the read-only SELECTs through the subsystem's
+	 * already-open ReadWrite handle sidesteps the single-open VFS entirely — a
+	 * read-only SELECT rides a ReadWrite handle perfectly well.
+	 *
+	 * Returns nullptr when the DB is not open (e.g. before the first index, or
+	 * while a reindex has the handle closed). Callers MUST null-check and surface
+	 * a clean "not yet indexed — run source.trigger_reindex" state, never crash.
+	 *
+	 * THREAD SAFETY: the returned raw pointer is NOT self-synchronising. A caller
+	 * that prepares/steps statements on it MUST hold this database's lock for the
+	 * duration of the borrow — take it via GetLock() / FScopeLock. All of this
+	 * class's own query/write methods already lock the same FCriticalSection, so
+	 * a borrower that locks correctly is serialised against them.
+	 */
+	FSQLiteDatabase* GetRawHandle() const;
+
+	/**
+	 * Expose the database lock so an external borrower of GetRawHandle() can
+	 * serialise its statement use against this class's own locked methods.
+	 * Hold an FScopeLock on this for the full borrow (handle fetch through the
+	 * last Step()/Destroy() on the prepared statement).
+	 */
+	FCriticalSection& GetLock() const { return DbLock; }
+
 	// --- Symbol queries ---
 	TArray<FMonolithSourceSymbol> SearchSymbolsFTS(const FString& Query, int32 Limit = 20);
 	TArray<FMonolithSourceSymbol> GetSymbolsByName(const FString& Name, const FString& Kind = TEXT(""));
