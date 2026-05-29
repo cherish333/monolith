@@ -234,7 +234,7 @@ Standalone C++ executable. No UE runtime, no Python, instant startup. Queries `E
 
 > **LEGACY:** `monolith_offline.py` is superseded by `monolith_query.exe`. It remains functional as a zero-dependency fallback requiring only Python stdlib and no UE installation.
 
-**Location:** `Saved/monolith_offline.py`
+**Location:** `Scripts/monolith_offline.py`
 **Dependencies:** Python stdlib only (sqlite3, argparse, json, re, pathlib) — no pip installs required
 **Python version:** 3.8+
 
@@ -245,7 +245,7 @@ A companion CLI that queries `EngineSource.db` and `ProjectIndex.db` directly wi
 ### Usage
 
 ```
-python Saved/monolith_offline.py <namespace> <action> [args...]
+python Scripts/monolith_offline.py <namespace> <action> [args...]
 ```
 
 ### Namespaces and Actions

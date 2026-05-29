@@ -1091,10 +1091,32 @@ public:
 // representative read actions that need nothing but on-disk SQLite. Table and
 // column names verified against the *Schema.cpp CREATE TABLE statements. Stays
 // behaviourally consistent with ReflectionActions in monolith_offline.py.
+//
+// FIELD-NAME SOURCE OF TRUTH: the live F*QueryAdapter.cpp handlers (the
+// SetStringField/SetNumberField/SetBoolField calls) define the canonical JSON
+// row field names. Offline output MUST be byte-identical to live — when a live
+// handler renames a field, mirror it here AND in monolith_offline.py. See e.g.
+// FNetworkQueryAdapter::HandleListReplicatedClasses (replicated_property_count),
+// FCppReflectQueryAdapter::HandleGetUClass (uproperty/ufunction cpp_module),
+// FDecisionQueryAdapter::RowToJson (rationale + source_mtime).
 // ============================================================
 
 class ReflectionActions {
     Database db;
+
+    // Item C — best-effort source-line auto-join, mirroring the live
+    // FCppReflectQueryAdapter::LookupClassSourceLine. UHT artefacts discard the
+    // header line, so reflect_* rows carry source_line=0. The same EngineSource.db
+    // symbol index (already powering source actions) has the real line. Name-only
+    // lookup, kind-restricted to class/struct. Returns 0 on miss (the caller
+    // tolerates 0 — "0 means unknown").
+    int lookup_class_source_line(const std::string& class_name) {
+        if (class_name.empty()) return 0;
+        auto rows = query(db,
+            "SELECT line_start FROM symbols "
+            "WHERE name = ? AND kind IN ('class','struct') LIMIT 1", {class_name});
+        return rows.empty() ? 0 : rows[0].get_int("line_start");
+    }
 
 public:
     void open(const std::string& path) { db.open(path); }
@@ -1122,33 +1144,41 @@ public:
         std::string cn = r.get("class_name");
         std::string mn = r.get("module_name");
 
+        // Item C — auto-join the real header line when the stored value is 0.
+        int src_line = r.get_int("source_line");
+        if (src_line == 0) src_line = lookup_class_source_line(cn);
+
         json uclass = {
             {"class_name", cn}, {"module_name", mn},
             {"parent_class", r.get("parent_class")},
             {"source_path", r.get("source_path")},
-            {"source_line", r.get_int("source_line")},
+            {"source_line", src_line},
             {"flags", r.get("flags")},
         };
 
+        // Field names mirror FCppReflectQueryAdapter::HandleGetUClass: each
+        // uproperty carries cpp_module; blueprint_callable is a bool on ufunctions.
         auto props = query(db,
-            "SELECT property_name, property_type, blueprint_visibility, specifiers "
+            "SELECT property_name, property_type, cpp_module, blueprint_visibility, specifiers "
             "FROM reflect_uproperties WHERE owning_class = ? AND cpp_module = ?", {cn, mn});
         json jprops = json::array();
         for (auto& p : props)
             jprops.push_back({{"property_name", p.get("property_name")},
                               {"property_type", p.get("property_type")},
+                              {"cpp_module", p.get("cpp_module")},
                               {"blueprint_visibility", p.get("blueprint_visibility")},
                               {"specifiers", p.get("specifiers")}});
         uclass["uproperties"] = jprops;
 
         auto funcs = query(db,
-            "SELECT function_name, return_type, blueprint_callable, specifiers "
+            "SELECT function_name, return_type, blueprint_callable, cpp_module, specifiers "
             "FROM reflect_ufunctions WHERE owning_class = ? AND cpp_module = ?", {cn, mn});
         json jfuncs = json::array();
         for (auto& f : funcs)
             jfuncs.push_back({{"function_name", f.get("function_name")},
                               {"return_type", f.get("return_type")},
-                              {"blueprint_callable", f.get_int("blueprint_callable")},
+                              {"blueprint_callable", f.get_int("blueprint_callable") != 0},
+                              {"cpp_module", f.get("cpp_module")},
                               {"specifiers", f.get("specifiers")}});
         uclass["ufunctions"] = jfuncs;
 
@@ -1159,15 +1189,17 @@ public:
     // --- network list_replicated_classes ---
     void list_replicated_classes(const Args& args) {
         int limit = args.opt_int("limit", 50);
+        // Field name mirrors FNetworkQueryAdapter::HandleListReplicatedClasses:
+        // the per-class count is "replicated_property_count" (NOT "replicated_count").
         auto rows = query(db,
-            "SELECT owning_class, cpp_module, COUNT(*) AS replicated_count "
+            "SELECT owning_class, cpp_module, COUNT(*) AS replicated_property_count "
             "FROM reflect_replicated_properties GROUP BY owning_class, cpp_module "
-            "ORDER BY replicated_count DESC, owning_class LIMIT " + std::to_string(limit));
+            "ORDER BY replicated_property_count DESC, owning_class LIMIT " + std::to_string(limit));
         json arr = json::array();
         for (auto& r : rows)
             arr.push_back({{"owning_class", r.get("owning_class")},
                            {"cpp_module", r.get("cpp_module")},
-                           {"replicated_count", r.get_int("replicated_count")}});
+                           {"replicated_property_count", r.get_int("replicated_property_count")}});
         json out = {{"success", true}, {"count", arr.size()}, {"classes", arr}};
         std::cout << out.dump(2) << std::endl;
     }
@@ -1176,8 +1208,10 @@ public:
     void list_decisions(const Args& args) {
         int limit = args.opt_int("limit", 50);
         std::string status = args.opt("status");
-        std::string sql = "SELECT decision_id, title, status, source_path, source_line, confidence "
-                          "FROM decision_records";
+        // Field names + column set mirror FDecisionQueryAdapter::RowToJson:
+        // each row carries rationale + source_mtime in addition to the basics.
+        std::string sql = "SELECT decision_id, title, status, source_path, source_line, "
+                          "confidence, rationale, source_mtime FROM decision_records";
         std::vector<std::string> params;
         if (!status.empty()) { sql += " WHERE status = ?"; params.push_back(status); }
         sql += " ORDER BY source_path LIMIT " + std::to_string(limit);
@@ -1190,7 +1224,9 @@ public:
                            {"status", r.get("status")},
                            {"source_path", r.get("source_path")},
                            {"source_line", r.get_int("source_line")},
-                           {"confidence", r.get_double("confidence")}});
+                           {"confidence", r.get_double("confidence")},
+                           {"rationale", r.get("rationale")},
+                           {"source_mtime", r.get_int64("source_mtime")}});
         json out = {{"success", true}, {"count", arr.size()}, {"decisions", arr}};
         std::cout << out.dump(2) << std::endl;
     }

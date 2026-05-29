@@ -521,4 +521,150 @@ bool FMonolithResponseShapingPathFieldsMissingTest::RunTest(const FString& /*Par
 	return true;
 }
 
+// ---------------------------------------------------------------------------
+// Test 12: _row_fields with ALL-wrong keys — rows emptied AND "matched no keys"
+// warning fires with the available-keys list. Guards the silent "[{},{}]" bug.
+// ---------------------------------------------------------------------------
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMonolithResponseShapingRowFieldsNoMatchTest,
+	"Monolith.ResponseShaping.RowFieldsNoMatch",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FMonolithResponseShapingRowFieldsNoMatchTest::RunTest(const FString& /*Parameters*/)
+{
+	using namespace MonolithResponseShapingTestDetail;
+
+	TSharedPtr<FJsonObject> Response = MakeListPayloadResponse();
+	TSharedPtr<FJsonObject> Params = MakeParams();
+	// Real row keys are title/source_path/rationale/score — request keys that
+	// match NONE of them (the live risk.list_conditional_gates failure mode).
+	SetStringArray(Params, TEXT("_row_fields"), {TEXT("file_path"), TEXT("gate_macro")});
+
+	TArray<FString> Warnings;
+	ApplyResponseShaping(Response, Params, Warnings);
+
+	// Every row should now be an empty object (all real keys dropped).
+	const TArray<TSharedPtr<FJsonValue>>* Rows = nullptr;
+	TestTrue(TEXT("decisions[] still present"),
+		Response->TryGetArrayField(TEXT("decisions"), Rows) && Rows != nullptr);
+	if (Rows)
+	{
+		for (const TSharedPtr<FJsonValue>& RowVal : *Rows)
+		{
+			const TSharedPtr<FJsonObject>* RowObj = nullptr;
+			if (RowVal.IsValid() && RowVal->TryGetObject(RowObj) && RowObj && (*RowObj).IsValid())
+			{
+				TestEqual(TEXT("row emptied (no requested key matched)"), (*RowObj)->Values.Num(), 0);
+			}
+		}
+	}
+
+	// The no-match warning must fire and surface the available keys.
+	bool bSawNoMatch = false;
+	bool bSawAvailableKeys = false;
+	for (const FString& W : Warnings)
+	{
+		if (W.Contains(TEXT("matched no keys")))
+		{
+			bSawNoMatch = true;
+			// Available-keys list should name at least one real row key.
+			bSawAvailableKeys = W.Contains(TEXT("available row keys"))
+				&& W.Contains(TEXT("source_path"));
+		}
+	}
+	TestTrue(TEXT("warning mentions `matched no keys`"), bSawNoMatch);
+	TestTrue(TEXT("warning lists available row keys incl. source_path"), bSawAvailableKeys);
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// Test 13: _row_fields with SOME-right-some-wrong — partial match is success,
+// NO no-match warning. (Only the total miss is confusing enough to warn on.)
+// ---------------------------------------------------------------------------
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMonolithResponseShapingRowFieldsPartialMatchTest,
+	"Monolith.ResponseShaping.RowFieldsPartialMatch",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FMonolithResponseShapingRowFieldsPartialMatchTest::RunTest(const FString& /*Parameters*/)
+{
+	using namespace MonolithResponseShapingTestDetail;
+
+	TSharedPtr<FJsonObject> Response = MakeListPayloadResponse();
+	TSharedPtr<FJsonObject> Params = MakeParams();
+	// One real key (title), one bogus key (nonexistent) — partial match.
+	SetStringArray(Params, TEXT("_row_fields"), {TEXT("title"), TEXT("nonexistent")});
+
+	TArray<FString> Warnings;
+	ApplyResponseShaping(Response, Params, Warnings);
+
+	// The real key survives in each row; the bogus one simply never existed.
+	const TArray<TSharedPtr<FJsonValue>>* Rows = nullptr;
+	TestTrue(TEXT("decisions[] still present"),
+		Response->TryGetArrayField(TEXT("decisions"), Rows) && Rows != nullptr);
+	if (Rows)
+	{
+		for (const TSharedPtr<FJsonValue>& RowVal : *Rows)
+		{
+			const TSharedPtr<FJsonObject>* RowObj = nullptr;
+			if (RowVal.IsValid() && RowVal->TryGetObject(RowObj) && RowObj && (*RowObj).IsValid())
+			{
+				TestTrue (TEXT("row retains title (matched)"),  (*RowObj)->HasField(TEXT("title")));
+				TestFalse(TEXT("row drops rationale (unmatched)"), (*RowObj)->HasField(TEXT("rationale")));
+			}
+		}
+	}
+
+	// Partial match must NOT raise the no-match warning.
+	bool bSawNoMatch = false;
+	for (const FString& W : Warnings)
+	{
+		if (W.Contains(TEXT("matched no keys")))
+		{
+			bSawNoMatch = true;
+			break;
+		}
+	}
+	TestFalse(TEXT("partial match emits NO `matched no keys` warning"), bSawNoMatch);
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// Test 14: _path_fields with ALL-wrong paths — "matched no paths" warning fires
+// and lists the top-level keys available.
+// ---------------------------------------------------------------------------
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMonolithResponseShapingPathFieldsNoMatchTest,
+	"Monolith.ResponseShaping.PathFieldsNoMatch",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FMonolithResponseShapingPathFieldsNoMatchTest::RunTest(const FString& /*Parameters*/)
+{
+	using namespace MonolithResponseShapingTestDetail;
+
+	TSharedPtr<FJsonObject> Response = MakeNestedEnvelopeResponse();
+	TSharedPtr<FJsonObject> Params = MakeParams();
+	// Top-level keys are uclass/envelope_field — request paths that resolve to none.
+	SetStringArray(Params, TEXT("_path_fields"),
+		{TEXT("wrong_root.class_name"), TEXT("also_wrong.child")});
+
+	TArray<FString> Warnings;
+	ApplyResponseShaping(Response, Params, Warnings);
+
+	bool bSawNoMatch = false;
+	bool bSawTopLevelKeys = false;
+	for (const FString& W : Warnings)
+	{
+		if (W.Contains(TEXT("matched no paths")))
+		{
+			bSawNoMatch = true;
+			bSawTopLevelKeys = W.Contains(TEXT("top-level keys available"))
+				&& W.Contains(TEXT("uclass"));
+		}
+	}
+	TestTrue(TEXT("warning mentions `matched no paths`"), bSawNoMatch);
+	TestTrue(TEXT("warning lists top-level keys incl. uclass"), bSawTopLevelKeys);
+	return true;
+}
+
 #endif // WITH_DEV_AUTOMATION_TESTS

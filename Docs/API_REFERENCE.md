@@ -1614,7 +1614,7 @@ Before writing any client code:
 When the editor is closed but you still need to query Monolith:
 
 - **`Plugins/Monolith/Binaries/monolith_query.exe`** — standalone C++ tool, read-only. Same actions for read-only namespaces (project, source, config).
-- **`python Plugins/Monolith/Saved/monolith_offline.py`** — same actions, stdlib-only.
+- **`python Plugins/Monolith/Scripts/monolith_offline.py`** — same actions, stdlib-only.
 
 Both invoke the same SQLite indexes the live MCP uses.
 

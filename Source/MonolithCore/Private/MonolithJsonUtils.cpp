@@ -226,6 +226,12 @@ namespace MonolithResponseShapingDetail
 			return;
 		}
 
+		// Track the union of all keys present across rows, and whether any
+		// requested field actually matched a row key, so we can warn on a
+		// total miss (the confusing "[{},{}]" case).
+		TSet<FString> UnionKeys;
+		bool bAnyRequestedKeyMatched = false;
+
 		for (const TSharedPtr<FJsonValue>& RowVal : *RowsPtr)
 		{
 			if (!RowVal.IsValid() || RowVal->Type != EJson::Object)
@@ -243,11 +249,27 @@ namespace MonolithResponseShapingDetail
 			RowObj->Values.GetKeys(ExistingKeys);
 			for (const FString& K : ExistingKeys)
 			{
-				if (!RowFieldsSet.Contains(K))
+				UnionKeys.Add(K);
+				if (RowFieldsSet.Contains(K))
+				{
+					bAnyRequestedKeyMatched = true;
+				}
+				else
 				{
 					RowObj->RemoveField(K);
 				}
 			}
+		}
+
+		// Total miss: not one requested field matched any row key. This is the
+		// silent-failure case (rows collapse to empty objects with no signal).
+		if (!bAnyRequestedKeyMatched && UnionKeys.Num() > 0)
+		{
+			TArray<FString> SortedKeys = UnionKeys.Array();
+			SortedKeys.Sort();
+			Warnings.Add(FString::Printf(
+				TEXT("_row_fields matched no keys in the list payload; available row keys: [%s]"),
+				*FString::Join(SortedKeys, TEXT(", "))));
 		}
 	}
 
@@ -371,6 +393,7 @@ namespace MonolithResponseShapingDetail
 		}
 
 		TSharedPtr<FJsonObject> Built = MakeShared<FJsonObject>();
+		bool bAnyPathResolved = false;
 		for (const FString& Path : PathFieldsSet)
 		{
 			TArray<FString> Segments;
@@ -385,7 +408,20 @@ namespace MonolithResponseShapingDetail
 			{
 				continue; // Missing path — clean drop, no warning.
 			}
+			bAnyPathResolved = true;
 			InsertAtDottedPath(Built, Segments, Leaf);
+		}
+
+		// Total miss: not one requested dotted path resolved. List the
+		// top-level keys so the caller can correct their path names.
+		if (!bAnyPathResolved)
+		{
+			TArray<FString> TopLevelKeys;
+			Response->Values.GetKeys(TopLevelKeys);
+			TopLevelKeys.Sort();
+			Warnings.Add(FString::Printf(
+				TEXT("_path_fields matched no paths; top-level keys available: [%s]"),
+				*FString::Join(TopLevelKeys, TEXT(", "))));
 		}
 
 		// Swap Response contents with Built. Keep the same object handle.

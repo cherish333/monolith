@@ -19,15 +19,21 @@ namespace MonolithCppReflectSchema
 		// owns the class (e.g. "Leviathan", "InventorySystemX"). `parent_class`
 		// is the immediate Super observed in the UHT `DependentSingletons[]`
 		// list — bare C++ name without prefix-stripping (`ACharacter`,
-		// `UObject`, ...). `source_path` is project-relative forward-slashed
-		// (e.g. "Source/Leviathan/Public/Characters/LeviathanCharacterBase.h").
-		// `source_line` is 0 at write time — UHT artefacts do not carry the
-		// declaration line. The cppreflect query adapter (FCppReflectQueryAdapter)
-		// now best-effort joins the line from the source-symbol index (the same
-		// EngineSource.db `symbols` table that powers source_query) when the
-		// stored value is 0, so `get_uclass` / `list_ufunctions` responses
-		// surface real lines without forcing a separate `source_query` call. The
-		// tree-sitter Phase 3b pass will fill the column itself.
+		// `UObject`, ...). `source_path` is the UHT ModuleRelativePath when UHT
+		// supplies one (e.g. "Public/Characters/LeviathanCharacterBase.h"), but is
+		// frequently empty at write time. `source_line` is 0 at write time — UHT
+		// artefacts do not carry the declaration line. The cppreflect query
+		// adapter (FCppReflectQueryAdapter) now best-effort joins BOTH the line
+		// AND the file path from the source-symbol index (the same EngineSource.db
+		// `symbols`/`files` tables that power source_query) when the stored value
+		// is missing, so `get_uclass` / `list_ufunctions` responses surface real
+		// lines and an absolute file path without forcing a separate
+		// `source_query` call. The joined path is ABSOLUTE (e.g.
+		// "D:/Unreal Projects/.../Foo.h") because the symbol index stores full
+		// paths; engine files outside the project dir don't relativise cleanly.
+		// The join is name-only, so for two classes sharing a name it may surface
+		// the wrong file/line. Empty path / 0 line still means "unknown". The
+		// tree-sitter Phase 3b pass will fill the columns itself.
 		// `flags` is a colon-joined metadata-key list (UHT Class_MetaDataParams
 		// keys, e.g. "IsBlueprintBase:BlueprintType") — NOT C++ specifiers. UHT
 		// rewrites some specifiers into metadata keys (UCLASS(Blueprintable) is

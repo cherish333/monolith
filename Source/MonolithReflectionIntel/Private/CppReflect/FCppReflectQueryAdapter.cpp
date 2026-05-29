@@ -114,33 +114,44 @@ namespace
 	 * 'class' or 'struct'). For UCLASS rows this matches the class_name field
 	 * 1:1.
 	 *
-	 * `source_path` join is NOT used: cppreflect rows store the UHT
-	 * ModuleRelativePath ("Public/Foo/Bar.h") while symbols.files.path stores
-	 * the absolute / project-relative path from IFileManager::FindFilesRecursive,
-	 * so a direct equality JOIN would never match. Name-only lookup is a
-	 * best-effort compromise (same-named classes in different modules collapse
-	 * to the first hit; acceptable per the "0 means unknown" contract — caller
-	 * always tolerates 0).
+	 * source_path resolution (handover doc item E): the UHT-derived
+	 * reflect_uclasses.source_path stores the ModuleRelativePath
+	 * ("Public/Foo/Bar.h") while symbols.file_id -> files.path stores the
+	 * ABSOLUTE path from IFileManager::FindFilesRecursive over the
+	 * ConvertRelativePathToFull module root (verified MonolithSourceIndexer.cpp
+	 * IndexModule/IndexCppFile + MonolithSourceSubsystem.cpp:282-292). A direct
+	 * equality JOIN of the two path forms would never match, so we instead reuse
+	 * the SAME name-only symbol match that already powers the line lookup and
+	 * additionally read the joined absolute path. The path is returned verbatim
+	 * (absolute, e.g. "D:/Unreal Projects/.../Foo.h") — not relativised, because
+	 * engine-source files live outside the project dir and would relativise to
+	 * fragile "../../../" forms; an absolute path stays unambiguously navigable.
 	 *
-	 * Returns 0 on miss. Caller must already hold the shared DB lock (the
-	 * borrowed source-symbol DB is the SAME handle this query uses).
+	 * Name-only lookup is a best-effort compromise: same-named classes in
+	 * different modules collapse to the first symbol hit, so both the line AND the
+	 * path may point at the wrong same-named class. Acceptable per the
+	 * "empty/0 means unknown" contract — caller always tolerates a miss.
+	 *
+	 * Both out-params are left untouched (caller pre-zeros / pre-empties) on miss.
+	 * Caller must already hold the shared DB lock (the borrowed source-symbol DB
+	 * is the SAME handle this query uses).
 	 */
-	int32 LookupClassSourceLine(FSQLiteDatabase& DB, const FString& ClassName)
+	void LookupClassSource(FSQLiteDatabase& DB, const FString& ClassName, int32& OutLine, FString& OutPath)
 	{
-		if (ClassName.IsEmpty()) { return 0; }
+		if (ClassName.IsEmpty()) { return; }
 		FSQLitePreparedStatement Stmt;
 		if (!Stmt.Create(DB, TEXT(
-			"SELECT line_start FROM symbols "
-			"WHERE name = ? AND kind IN ('class','struct') "
+			"SELECT s.line_start, f.path FROM symbols s "
+			"JOIN files f ON f.id = s.file_id "
+			"WHERE s.name = ? AND s.kind IN ('class','struct') "
 			"LIMIT 1;")))
 		{
-			return 0;
+			return;
 		}
 		Stmt.SetBindingValueByIndex(1, ClassName);
-		if (Stmt.Step() != ESQLitePreparedStatementStepResult::Row) { return 0; }
-		int32 Line = 0;
-		Stmt.GetColumnValueByIndex(0, Line);
-		return Line;
+		if (Stmt.Step() != ESQLitePreparedStatementStepResult::Row) { return; }
+		Stmt.GetColumnValueByIndex(0, OutLine);
+		Stmt.GetColumnValueByIndex(1, OutPath);
 	}
 
 	/** Variant for UFUNCTION rows: scope the function-name lookup to the owning
@@ -460,12 +471,19 @@ FMonolithActionResult FCppReflectQueryAdapter::HandleGetUClass(const TSharedPtr<
 	ClassStmt.GetColumnValueByIndex(4, SrcLine);
 	ClassStmt.GetColumnValueByIndex(5, Flags);
 
-	// Handover doc item #10 — best-effort auto-join the original source line
-	// when the stored value is 0 (UHT discards header line numbers; the
-	// source-symbol index has them).
-	if (SrcLine == 0)
+	// Handover doc items #10 + E — best-effort auto-join the original source
+	// line AND file path when the stored values are missing (UHT discards header
+	// line numbers and the reflect_uclasses.source_path is the ModuleRelativePath
+	// form, often empty; the source-symbol index carries both). A single joined
+	// lookup fills whichever of the two is unknown. The name-only match may pick
+	// the wrong file/line when two classes share a name (see LookupClassSource).
+	if (SrcLine == 0 || SrcPath.IsEmpty())
 	{
-		SrcLine = LookupClassSourceLine(*DB, CName);
+		int32 JoinedLine = 0;
+		FString JoinedPath;
+		LookupClassSource(*DB, CName, JoinedLine, JoinedPath);
+		if (SrcLine == 0)       { SrcLine = JoinedLine; }
+		if (SrcPath.IsEmpty())  { SrcPath = JoinedPath; }
 	}
 
 	TSharedPtr<FJsonObject> UClassObj = MakeShared<FJsonObject>();
