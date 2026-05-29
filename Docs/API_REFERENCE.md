@@ -1261,6 +1261,8 @@ List `#if WITH_*` macros, `bHas*` 3-location probe variables, and `MONOLITH_RELE
 
 **New v0.17.0 (Reflection Intelligence, Phase 3a).** UE 5.7 reflection-edge queries driven by a regex sweep over UHT artefacts (`Intermediate/Build/Win64/.../Inc/<Module>/UHT/*.gen.cpp`) cross-joined with `IAssetRegistry::GetDependencies`. No tree-sitter dependency, no ThirdParty vendoring. Writes into `reflect_uclasses`, `reflect_uproperties`, `reflect_ufunctions`, `reflect_uinterfaces`, `reflect_uinterface_impls`, and `cpp_asset_edges` on `EngineSource.db`. All 6 actions are read-only + idempotent. **6 actions** (5 shipped in v0.17.0 Phase 3a; `list_class_specifiers` added [Unreleased]).
 
+> **Scan scope ([Unreleased]):** the indexers scan your project plugins (InventorySystemX, CarnageFX, etc.) by default, not just the game module. Scope follows a game-module → project-plugin → marketplace ladder driven by `IPluginManager::GetEnabledPlugins()`: `bIndexProjectPluginReflection` (default `true`) walks enabled `LoadedFrom == Project` plugins; `bIndexMarketplacePluginReflection` (default `false`) also walks enabled engine-installed marketplace plugins (LogicDriver/SMSystem, GASCompanion); Epic engine built-ins stay excluded (`bIndexEnginePluginReflection`, default off).
+
 > **Phase 3a caller-contract notes:** `source_path` is UHT's `ModuleRelativePath` (not project-relative); `source_line` is `0` everywhere (UHT discards the original-header line — pair with `source_query("search_source")` for per-line precision); `reflect_uproperties.blueprint_visibility` / `.specifiers` are empty strings (Phase 3b populates them); `cpp_asset_edges.edge_kind` is the coarse `'package_dep'`.
 
 ### `cppreflect_query.get_uclass`
@@ -1342,8 +1344,9 @@ Find every UCLASS carrying a given specifier — substring match against the `fl
 **New v0.17.0 (Reflection Intelligence, Phase 4a).** UE 5.7 replication inspection driven by a second UHT-artefact regex sweep (independent of Phase 3a's reader) over per-property `MetaData` blocks plus the `CPF_Net` property-flag emission. Cross-joins against Phase 3a's `reflect_ufunctions`. Writes into `reflect_replicated_properties` on `EngineSource.db`. All 4 actions are read-only + idempotent. **4 actions.**
 
 > **Status notes ([Unreleased] network-completeness workstream):**
+> - The indexer now scans project plugins by default (the scan-scope ladder — see the `cppreflect` header note), so replicated classes and RPCs declared in plugins like InventorySystemX are in scope, not just the game module.
 > - `list_replicated_classes` now captures bare `UPROPERTY(Replicated)` + `DOREPLIFETIME` (via `CPF_Net`) in addition to `ReplicatedUsing` — verified end-to-end (returned `ALeviathanCharacterBase` + `ULeviathanVitalsSet`).
-> - `list_rpc_functions` switched to specifier-based detection (`reflect_ufunctions.specifiers` from `EFunctionFlags`) instead of name-prefix, but **currently returns EMPTY**: the indexer scan scope is the project GAME MODULE only, and this project's RPCs live in project PLUGINS (e.g. InventorySystemX) outside that scope. This is a known scan-scope limitation, not a working RPC listing.
+> - `list_rpc_functions` switched to specifier-based detection (`reflect_ufunctions.specifiers` from `EFunctionFlags`) instead of name-prefix, and with project plugins in scope it now returns the project's actual RPCs — verified E2E (the InventorySystemX `UInventoryComponent` / `UWeaponBase_ISX` Server RPCs). The prior "empty because game-module-only" status is resolved.
 > - `COND_*` replication conditions still aren't surfaced.
 
 ### `network_query.list_replicated_classes`
@@ -1360,7 +1363,7 @@ Enumerate UCLASSes carrying at least one replicated property, sorted by replicat
 
 ### `network_query.list_rpc_functions`
 
-Filter `reflect_ufunctions` by replication specifier (`reflect_ufunctions.specifiers` parsed from `EFunctionFlags` — `FUNC_NetServer` / `FUNC_NetClient` / `FUNC_NetMulticast`) to surface the project's RPC surface. As of the [Unreleased] network-completeness workstream this is specifier-based, not name-prefix-based. **Currently returns EMPTY** — the scan scope is the project game module only, and this project's RPCs live in project plugins outside that scope (see status notes above). Cursor-paginated.
+Filter `reflect_ufunctions` by replication specifier (`reflect_ufunctions.specifiers` parsed from `EFunctionFlags` — `FUNC_NetServer` / `FUNC_NetClient` / `FUNC_NetMulticast`) to surface the project's RPC surface. As of the [Unreleased] network-completeness workstream this is specifier-based, not name-prefix-based, and the scan covers project plugins by default (see the scan-scope note in the `cppreflect` header). The project's actual RPCs — which live in project plugins like InventorySystemX — are therefore in scope; E2E returned 28 RPCs including `UInventoryComponent` / `UWeaponBase_ISX` Server RPCs. Cursor-paginated.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -1370,7 +1373,7 @@ Filter `reflect_ufunctions` by replication specifier (`reflect_ufunctions.specif
 | `limit` | integer | optional | Hard cap `500`. Default: `100` |
 | `cursor` | string | optional | Opaque cursor |
 
-**Returns:** `{ "rpcs": [ { "class_name", "module_name", "function_name", "rpc_kind", "function_flags", "return_type", "source_path", "source_line" } ], "total_estimate": N, "next_cursor": "<opaque>" }`. `rpc_kind` is derived from the replication specifier (`EFunctionFlags`) at query time. With the current game-module-only scan scope the array is empty for this project.
+**Returns:** `{ "rpcs": [ { "class_name", "module_name", "function_name", "rpc_kind", "function_flags", "return_type", "source_path", "source_line" } ], "total_estimate": N, "next_cursor": "<opaque>" }`. `rpc_kind` is derived from the replication specifier (`EFunctionFlags`) at query time. With project plugins in scope by default the array populates from project-plugin RPCs — e.g. the InventorySystemX Server RPCs.
 
 ### `network_query.list_onrep_handlers`
 
@@ -1489,7 +1492,7 @@ Project-wide zero-reference scan across all asset classes (the general form; `ma
 
 ### `reflect_query.rebuild_reflection_index`
 
-Force-rebuild the RI reflection tables from PROJECT UHT artefacts — `reflect_uclasses`, `reflect_uproperties`, `reflect_ufunctions`, `reflect_uinterfaces`, `reflect_uinterface_impls`, `cpp_asset_edges`, and `reflect_replicated_properties`. Re-runs the RI indexers (`FCppReflectIndexer` + `FNetworkIndexer`) over the project's on-disk UHT artefacts. Scope is PROJECT only (`bIncludeEnginePlugins=false`, engine excluded).
+Force-rebuild the RI reflection tables from PROJECT UHT artefacts — `reflect_uclasses`, `reflect_uproperties`, `reflect_ufunctions`, `reflect_uinterfaces`, `reflect_uinterface_impls`, `cpp_asset_edges`, and `reflect_replicated_properties`. Re-runs the RI indexers (`FCppReflectIndexer` + `FNetworkIndexer`) over the project's on-disk UHT artefacts. Scope is PROJECT only (Epic engine built-ins excluded) — and, as of the [Unreleased] scan-scope ladder, "project" includes enabled `LoadedFrom == Project` plugins by default (and marketplace plugins when enabled), so a rebuild repopulates project-plugin reflection.
 
 Exists because after an RI indexer code change there's no other clean repopulation trigger — the lazy bootstrap only fires on table-absence, `OnReloadComplete` only on Live Coding, and `source_query("trigger_reindex")` is the heavyweight full-engine reindex.
 
@@ -1499,7 +1502,7 @@ Exists because after an RI indexer code change there's no other clean repopulati
 
 **Returns:** a per-table row-count summary — `{ "ok": true, "rebuilt": { "reflect_uclasses": N, "reflect_uproperties": N, "reflect_ufunctions": N, "reflect_uinterfaces": N, "reflect_uinterface_impls": N, "cpp_asset_edges": N, "reflect_replicated_properties": N } }`.
 
-> Note: because the scan scope is the project game module only, a rebuild does NOT populate project-plugin RPCs — `network_query("list_rpc_functions")` stays empty after a rebuild (see the `network` namespace status notes).
+> Note: with the [Unreleased] scan-scope ladder, a rebuild repopulates project-plugin reflection by default — so `network_query("list_rpc_functions")` returns the project's RPCs (the InventorySystemX Server RPCs) after a rebuild (see the `network` namespace status notes).
 
 ---
 
