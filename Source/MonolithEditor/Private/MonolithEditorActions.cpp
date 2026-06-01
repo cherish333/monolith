@@ -52,6 +52,11 @@
 #include "LevelEditorViewport.h"
 #include "PixelFormat.h"
 #include "ObjectTools.h"
+// delete_assets: unattended-guard pattern so non-interactive deletes never raise
+// a modal Slate dialog (which would freeze the game thread / in-process MCP server).
+#include "CoreGlobals.h"                     // GIsRunningUnattendedScript
+#include "UObject/Package.h"                 // UPackage::SetDirtyFlag
+#include "Subsystems/AssetEditorSubsystem.h" // CloseAllEditorsForAsset
 
 // Scripting action includes (HOFF 7)
 #include "IPythonScriptPlugin.h"
@@ -513,6 +518,7 @@ void FMonolithEditorActions::RegisterActions(FMonolithLogCapture* LogCapture)
 		FParamSchemaBuilder()
 			.Required(TEXT("asset_paths"), TEXT("array"), TEXT("Array of UE asset paths to delete"))
 			.Optional(TEXT("allowed_prefixes"), TEXT("array"), TEXT("If set, only paths starting with one of these prefixes can be deleted (e.g. [\"/Game/AgentTraining/\"])"))
+			.Optional(TEXT("force"), TEXT("bool"), TEXT("When true, force-delete even if referenced (nulls referencers, including EXTERNAL ones, silently). Default false: soft-delete after closing open asset editors. Use allowed_prefixes as a sandbox when force=true."), TEXT("false"))
 			.Build());
 
 	Registry.RegisterAction(TEXT("editor"), TEXT("get_viewport_info"),
@@ -2717,6 +2723,11 @@ FMonolithActionResult FMonolithEditorActions::HandleDeleteAssets(
 		}
 	}
 
+	// Optional force flag: when true, route through ForceDeleteObjects (nulls
+	// referencers). Default false preserves the conservative soft-delete path.
+	bool bForce = false;
+	Params->TryGetBoolField(TEXT("force"), bForce);
+
 	// Load and delete each asset
 	TArray<UObject*> ObjectsToDelete;
 	TArray<FString> NotFound;
@@ -2734,10 +2745,59 @@ FMonolithActionResult FMonolithEditorActions::HandleDeleteAssets(
 		}
 	}
 
+	// A non-interactive MCP action must NEVER raise a modal Slate dialog: that
+	// blocks the game thread and freezes the in-process MCP HTTP server. The
+	// ObjectTools delete paths can raise TWO classes of modal — a "Save changes?"
+	// prompt on a dirty open asset, and an Error_InUse reference-check dialog
+	// (ObjectTools.cpp:3446) when a target is open in an editor. Both branches
+	// (soft DeleteObjects and hard ForceDeleteObjects) can hit Error_InUse, and
+	// /*bShowConfirmation=*/false does NOT gate it.
+	//
+	// The fix has two halves:
+	//   1. Per-asset preparation (below): clear the package dirty flag so closing
+	//      an open editor cannot trigger a save prompt, then force-close any open
+	//      editors to drop transient editor referencers that would otherwise
+	//      cause the reference check to fail.
+	//   2. A tightly-scoped TGuardValue<bool>(GIsRunningUnattendedScript, true)
+	//      around the delete call only. FMessageDialog::Open
+	//      (MessageDialog.cpp:172) shows UI only when
+	//      !FApp::IsUnattended() && !GIsRunningUnattendedScript; under the guard
+	//      every ObjectTools modal auto-dismisses to its safe default and the
+	//      delete proceeds non-interactively. The guard restores on scope exit.
+	for (UObject* Asset : ObjectsToDelete)
+	{
+		if (UPackage* Pkg = Asset->GetOutermost())
+		{
+			Pkg->SetDirtyFlag(false);
+		}
+		if (GEditor)
+		{
+			if (UAssetEditorSubsystem* AES = GEditor->GetEditorSubsystem<UAssetEditorSubsystem>())
+			{
+				AES->CloseAllEditorsForAsset(Asset);
+			}
+		}
+	}
+
+	// Capture paths BEFORE deletion: the UObject* pointers dangle once the
+	// objects are deleted, so failed_to_delete must be built from these strings.
+	TArray<FString> AttemptedPaths;
+	AttemptedPaths.Reserve(ObjectsToDelete.Num());
+	for (const UObject* Obj : ObjectsToDelete)
+	{
+		AttemptedPaths.Add(Obj->GetPathName());
+	}
+
 	int32 NumDeleted = 0;
 	if (ObjectsToDelete.Num() > 0)
 	{
-		NumDeleted = ObjectTools::DeleteObjects(ObjectsToDelete, /*bShowConfirmation=*/false);
+		// Scope the unattended guard tightly around the synchronous delete call
+		// ONLY so any modal both branches could raise auto-dismisses to its safe
+		// default. The guard restores GIsRunningUnattendedScript on scope exit.
+		TGuardValue<bool> UnattendedGuard(GIsRunningUnattendedScript, true);
+		NumDeleted = bForce
+			? ObjectTools::ForceDeleteObjects(ObjectsToDelete, /*ShowConfirmation=*/false)
+			: ObjectTools::DeleteObjects(ObjectsToDelete, /*bShowConfirmation=*/false);
 	}
 
 	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
@@ -2745,6 +2805,20 @@ FMonolithActionResult FMonolithEditorActions::HandleDeleteAssets(
 	Result->SetNumberField(TEXT("deleted"), NumDeleted);
 	Result->SetNumberField(TEXT("requested"), AssetPaths.Num());
 	Result->SetNumberField(TEXT("found"), ObjectsToDelete.Num());
+
+	// Surface partial failures. The ObjectTools API returns only a count, not
+	// which objects survived, so this is count-derived: when fewer objects were
+	// deleted than were found, report the requested-and-found paths (pass
+	// force=true to delete referenced assets the soft path refuses).
+	if (NumDeleted < ObjectsToDelete.Num())
+	{
+		TArray<TSharedPtr<FJsonValue>> FailedArr;
+		for (const FString& P : AttemptedPaths)
+		{
+			FailedArr.Add(MakeShared<FJsonValueString>(P));
+		}
+		Result->SetArrayField(TEXT("failed_to_delete"), FailedArr);
+	}
 
 	if (NotFound.Num() > 0)
 	{
