@@ -3522,7 +3522,7 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandlePromotePinToVariable(
 //  get_timeline_data  (Phase 3A)
 // ============================================================
 
-static FString InterpModeToString(ERichCurveInterpMode Mode)
+static FString NodeInterpModeToString(ERichCurveInterpMode Mode)
 {
 	switch (Mode)
 	{
@@ -3551,7 +3551,7 @@ static TSharedPtr<FJsonObject> SerializeRichCurveKeys(const FRichCurve& Curve)
 		TSharedPtr<FJsonObject> KeyObj = MakeShared<FJsonObject>();
 		KeyObj->SetNumberField(TEXT("time"), Key.Time);
 		KeyObj->SetNumberField(TEXT("value"), Key.Value);
-		KeyObj->SetStringField(TEXT("interp_mode"), InterpModeToString(Key.InterpMode));
+		KeyObj->SetStringField(TEXT("interp_mode"), NodeInterpModeToString(Key.InterpMode));
 		KeysArr.Add(MakeShared<FJsonValueObject>(KeyObj));
 	}
 
