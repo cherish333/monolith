@@ -145,6 +145,12 @@ public:
 	static FMonolithActionResult HandleAddTransition(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleSetTransitionRule(const TSharedPtr<FJsonObject>& Params);
 
+	// --- Wave 16: State Machine Authoring (#13/#14) ---
+	// create_state_machine — spawn a UAnimGraphNode_StateMachine into an ABP's anim graph.
+	// build_state_machine  — declarative builder composing create + add states/transitions/rules.
+	static FMonolithActionResult HandleCreateStateMachine(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleBuildStateMachine(const TSharedPtr<FJsonObject>& Params);
+
 	// --- Wave 14: Notify Properties (1) ---
 	static FMonolithActionResult HandleSetNotifyProperties(const TSharedPtr<FJsonObject>& Params);
 

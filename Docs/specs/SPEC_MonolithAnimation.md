@@ -20,9 +20,9 @@
 | `FMonolithControlRigWriteActions` | ControlRig write actions: 3 actions (graph node creation, pin configuration, variable management) |
 | `FMonolithAnimLayoutActions` | `auto_layout` for AnimBP graphs |
 
-### Actions (130 — namespace: "animation")
+### Actions (133 — namespace: "animation")
 
-**Note (2026-04-26 audit):** The detailed per-category tables below cover the 103 baseline actions. The remaining **27 actions** (5 ABP write + 13 PoseSearch + 3 ControlRig + 1 layout + 5 graph-surgery) are documented in their own sections at the bottom of this spec. The ABP write actions landed in v0.14.3 (PR #34 by @MaxenceEpitech). No Phase J changes touched this module. v0.14.9 added `copy_bone_pose_between_sequences` (PR #51 by @MaxenceEpitech). v0.14.10 added `list_bone_tracks` (PR #54 by @MaxenceEpitech) and rewrote `get_bone_track_keys` to use the non-deprecated `IsValidBoneTrackName` + `GetBoneTrackTransforms` API path. v0.14.10 also added `get_skeleton_preview_attached_assets` + `get_bone_ref_pose` (PR #55 by @MaxenceEpitech) and the three `CompatibleSkeletons` actions (`get_compatible_skeletons` / `add_compatible_skeleton` / `remove_compatible_skeleton` — PR #56 by @MaxenceEpitech), bringing the module total to 125. The Warband Harness Wave 2 added the 5 graph-surgery actions, bringing the module total to 130 (103 baseline + 27 wave-actions).
+**Note (2026-04-26 audit):** The detailed per-category tables below cover the 103 baseline actions. The remaining **27 actions** (5 ABP write + 13 PoseSearch + 3 ControlRig + 1 layout + 5 graph-surgery) are documented in their own sections at the bottom of this spec. The ABP write actions landed in v0.14.3 (PR #34 by @MaxenceEpitech). No Phase J changes touched this module. v0.14.9 added `copy_bone_pose_between_sequences` (PR #51 by @MaxenceEpitech). v0.14.10 added `list_bone_tracks` (PR #54 by @MaxenceEpitech) and rewrote `get_bone_track_keys` to use the non-deprecated `IsValidBoneTrackName` + `GetBoneTrackTransforms` API path. v0.14.10 also added `get_skeleton_preview_attached_assets` + `get_bone_ref_pose` (PR #55 by @MaxenceEpitech) and the three `CompatibleSkeletons` actions (`get_compatible_skeletons` / `add_compatible_skeleton` / `remove_compatible_skeleton` — PR #56 by @MaxenceEpitech), bringing the module total to 125. The Warband Harness Wave 2 added the 5 graph-surgery actions, bringing the module total to 130 (103 baseline + 27 wave-actions). Wave 16 added 3 actions — `create_state_machine` + `build_state_machine` (state-machine authoring, in `MonolithAnimationActions.cpp`) and `sample_pie_anim_instance` (PIE runtime telemetry, in the new `MonolithAnimationRuntimeActions.cpp`) — bringing the module total to 133.
 
 **Sequence Info (5) — read-only**
 | Action | Description |
@@ -187,6 +187,19 @@ Node-level write operations over Animation Blueprint graphs, built for reparenti
 | `duplicate_reparent_and_sanitize` | Duplicate an ABP and reparent it to `new_parent_class`, then classify every node against the new parent's reflected surface into `safe` / `requires_guard` / `requires_rebuild` / `remove_for_smoke` (node kinds: cast, variable_get, function-call, Evaluate-Chooser). A self-context `variable_get` is classified `safe` when its variable exists on the new parent OR is defined locally on the duplicate (locals survive reparenting); `requires_guard` only when neither holds. `dry_run` defaults to `true`. |
 | `find_node_slice` | Compute a directional (`upstream` / `downstream`) node slice from a seed node, honoring `stop_rules`. Reports the slice set, before/after node counts, and orphaned pins. Read-only. |
 | `remove_node_slice` | Remove a directional node slice. Reports counts, orphaned pins, and any broken required-exec continuity — surfaced in the response, never auto-rewired. `dry_run` defaults to `true`. |
+
+**State Machine Authoring (2) — Wave 16**
+
+| Action | Description |
+|--------|-------------|
+| `create_state_machine` | Spawn a `UAnimGraphNode_StateMachine` into an ABP's anim graph via `FEdGraphSchemaAction_NewStateNode::SpawnNodeFromTemplate` (auto-creates the SM graph + entry node through `PostPlacedNewNode`). Renames the auto-created `EditorStateMachineGraph` (the SM node title derives from it). Picks the first graph with a `UAnimationGraphSchema` by default; optional `graph_name` targets a specific anim graph for layered ABPs. Compiles + marks dirty. Returns the SM node title + SM graph name + a state/transition readback. |
+| `build_state_machine` | Declarative builder composing `create_state_machine` + state/transition/rule mutators in one transaction from `{states:[{name, animation?}], transitions:[{from,to,rule?}], entry_state}`. States optionally wire a `UAnimGraphNode_SequencePlayer` to the state result pose pin. Rules support bool variables and `auto`/`automatic` (`bAutomaticRuleBasedOnSequencePlayerInState`); any other rule expression is reported as `unsupported rule expression (deferred)` per-element without failing the build. Returns a per-element states/transitions report. Compiles + saves once at the end. |
+
+**Runtime Telemetry (1) — Wave 16, `MonolithAnimationRuntimeActions.cpp`**
+
+| Action | Description |
+|--------|-------------|
+| `sample_pie_anim_instance` | Sample a live PIE actor's animation state. Resolves actor → `USkeletalMeshComponent` → `GetAnimInstance()`. Reports anim-instance class path, mesh `AnimClass` path, skeletal mesh path, animation mode, active state-machine state(s) (`GetStateMachineIndex` + `GetCurrentStateName` + `GetInstanceMachineWeight`; enumerates all baked machines via `IAnimClassInterface::GetBakedStateMachines` when `state_machines` omitted), active montage (`GetCurrentActiveMontage` + current section), requested anim-instance variables (live reflection), and requested bone/socket world transforms. Bone names are resolved to indices via `GetBoneIndex(FName)` before `GetBoneTransform(index)`; sockets via `GetSocketTransform(FName, RTS_World)`. Per-asset-player weights have no direct public getter (deferred); state/machine weights ARE reported. |
 
 ### Bulk Fill & Describe Surface (2026-05-11)
 

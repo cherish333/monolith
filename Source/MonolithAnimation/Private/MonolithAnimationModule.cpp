@@ -1,6 +1,7 @@
 #include "MonolithAnimationModule.h"
 #include "MonolithJsonUtils.h"
 #include "MonolithAnimationActions.h"
+#include "MonolithAnimationRuntimeActions.h"
 #include "MonolithPoseSearchActions.h"
 #include "MonolithControlRigWriteActions.h"
 #include "MonolithAbpWriteActions.h"
@@ -15,6 +16,7 @@
 void FMonolithAnimationModule::StartupModule()
 {
 	FMonolithAnimationActions::RegisterActions(FMonolithToolRegistry::Get());
+	FMonolithAnimationRuntimeActions::RegisterActions(FMonolithToolRegistry::Get());
 	FMonolithPoseSearchActions::RegisterActions(FMonolithToolRegistry::Get());
 	FMonolithControlRigWriteActions::RegisterActions(FMonolithToolRegistry::Get());
 	FMonolithAbpWriteActions::RegisterActions(FMonolithToolRegistry::Get());
@@ -27,7 +29,7 @@ void FMonolithAnimationModule::StartupModule()
 	// round-trips per locomotion set (design B.3 pain point).
 	FMonolithAnimationBulkFillAdapter::Register();
 
-	UE_LOG(LogMonolith, Verbose, TEXT("Monolith — Animation module loaded (81 actions)"));
+	UE_LOG(LogMonolith, Verbose, TEXT("Monolith - Animation module loaded"));
 }
 
 void FMonolithAnimationModule::ShutdownModule()

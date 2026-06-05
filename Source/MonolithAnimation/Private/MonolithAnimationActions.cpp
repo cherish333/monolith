@@ -55,6 +55,10 @@
 #include "Serialization/JsonReader.h"
 #include "Editor.h"
 #include "AnimationStateMachineSchema.h"
+#include "AnimationGraphSchema.h"
+#include "AnimationStateGraph.h"
+#include "AnimGraphNode_StateResult.h"
+#include "AnimGraphNode_SequencePlayer.h"
 #include "AnimGraphNode_TransitionResult.h"
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "Kismet2/KismetEditorUtilities.h"
@@ -653,6 +657,29 @@ void FMonolithAnimationActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Required(TEXT("from_state"), TEXT("string"), TEXT("Source state name"))
 			.Required(TEXT("to_state"), TEXT("string"), TEXT("Destination state name"))
 			.Required(TEXT("variable_name"), TEXT("string"), TEXT("Boolean variable name to use as transition condition"))
+			.Build());
+
+	// Wave 16 — State Machine Authoring (#13 / #14)
+	Registry.RegisterAction(TEXT("animation"), TEXT("create_state_machine"),
+		TEXT("Spawn a new state machine node into an Animation Blueprint's anim graph (auto-creates the SM graph + entry node)"),
+		FMonolithActionHandler::CreateStatic(&HandleCreateStateMachine),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Animation Blueprint asset path"))
+			.Optional(TEXT("state_machine_name"), TEXT("string"), TEXT("Name for the new state machine (default: 'New State Machine')"))
+			.Optional(TEXT("graph_name"), TEXT("string"), TEXT("Target anim graph name when the ABP has multiple anim graphs (e.g. layered ABPs). Default: the first graph with an AnimationGraphSchema"))
+			.Optional(TEXT("position_x"), TEXT("integer"), TEXT("Node X position (default: 200)"), TEXT("200"))
+			.Optional(TEXT("position_y"), TEXT("integer"), TEXT("Node Y position (default: 200)"), TEXT("200"))
+			.Build());
+	Registry.RegisterAction(TEXT("animation"), TEXT("build_state_machine"),
+		TEXT("Declarative state-machine builder: creates the SM then adds states, transitions, and rules in one transaction"),
+		FMonolithActionHandler::CreateStatic(&HandleBuildStateMachine),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Animation Blueprint asset path"))
+			.Optional(TEXT("state_machine_name"), TEXT("string"), TEXT("Name for the state machine (default: 'New State Machine')"))
+			.Optional(TEXT("graph_name"), TEXT("string"), TEXT("Target anim graph name for layered ABPs (default: first AnimationGraphSchema graph)"))
+			.Required(TEXT("states"), TEXT("array"), TEXT("Array of {name, animation?} state specs"))
+			.Optional(TEXT("transitions"), TEXT("array"), TEXT("Array of {from, to, rule?} transition specs. rule may be a bool variable name or 'auto'/'automatic' for the sequence-player auto rule"))
+			.Optional(TEXT("entry_state"), TEXT("string"), TEXT("State to wire as the initial/entry state"))
 			.Build());
 
 	// Wave 9 — ABP Read Enhancements
@@ -5096,6 +5123,469 @@ FMonolithActionResult FMonolithAnimationActions::HandleSetTransitionRule(const T
 	if (!bWired)
 	{
 		Root->SetStringField(TEXT("warning"), TEXT("Variable getter node was created but output pin could not be found. Manual wiring may be needed."));
+	}
+	return FMonolithActionResult::Success(Root);
+}
+
+// ---------------------------------------------------------------------------
+// Wave 16 — State Machine Authoring (#13 create_state_machine / #14 build_state_machine)
+// ---------------------------------------------------------------------------
+
+// Find the top-level anim graph in an ABP. If GraphName is non-empty, require an
+// exact name match; otherwise return the first graph whose schema is a
+// UAnimationGraphSchema (handles layered ABPs that have multiple anim graphs).
+static UEdGraph* FindAnimGraph(UAnimBlueprint* ABP, const FString& GraphName)
+{
+	for (UEdGraph* Graph : ABP->FunctionGraphs)
+	{
+		if (!Graph) continue;
+		const UEdGraphSchema* Schema = Graph->GetSchema();
+		if (!Schema || !Schema->IsA<UAnimationGraphSchema>()) continue;
+		if (GraphName.IsEmpty() || Graph->GetName() == GraphName)
+		{
+			return Graph;
+		}
+	}
+	return nullptr;
+}
+
+// Spawn a state machine node into AnimGraph. Renames the auto-created
+// EditorStateMachineGraph (the SM node title derives from it) to DesiredName.
+// Caller owns the transaction / compile / save. Returns the spawned node.
+static UAnimGraphNode_StateMachine* SpawnStateMachineNode(UEdGraph* AnimGraph, const FString& DesiredName, int32 PosX, int32 PosY)
+{
+	UAnimGraphNode_StateMachine* SMNode = FEdGraphSchemaAction_NewStateNode::SpawnNodeFromTemplate<UAnimGraphNode_StateMachine>(
+		AnimGraph,
+		NewObject<UAnimGraphNode_StateMachine>(AnimGraph),
+		FVector2f(static_cast<float>(PosX), static_cast<float>(PosY)),
+		/*bSelectNewNode=*/false);
+
+	if (!SMNode || !SMNode->EditorStateMachineGraph)
+	{
+		return nullptr;
+	}
+
+	if (!DesiredName.IsEmpty())
+	{
+		TSharedPtr<INameValidatorInterface> NameValidator = FNameValidatorFactory::MakeValidator(SMNode);
+		FBlueprintEditorUtils::RenameGraphWithSuggestion(SMNode->EditorStateMachineGraph, NameValidator, DesiredName);
+	}
+	return SMNode;
+}
+
+// Best-effort readback of a state machine graph's states + transitions for result JSON.
+static void StateMachineGraphToJson(UAnimationStateMachineGraph* SMGraph, TSharedPtr<FJsonObject>& OutRoot)
+{
+	TArray<TSharedPtr<FJsonValue>> StatesArr;
+	TArray<TSharedPtr<FJsonValue>> TransArr;
+	for (UEdGraphNode* Node : SMGraph->Nodes)
+	{
+		if (UAnimStateNode* StateNode = Cast<UAnimStateNode>(Node))
+		{
+			StatesArr.Add(MakeShared<FJsonValueString>(StateNode->GetStateName()));
+		}
+		else if (UAnimStateTransitionNode* TN = Cast<UAnimStateTransitionNode>(Node))
+		{
+			UAnimStateNodeBase* Prev = TN->GetPreviousState();
+			UAnimStateNodeBase* Next = TN->GetNextState();
+			if (Prev && Next)
+			{
+				TSharedPtr<FJsonObject> T = MakeShared<FJsonObject>();
+				T->SetStringField(TEXT("from"), Prev->GetStateName());
+				T->SetStringField(TEXT("to"), Next->GetStateName());
+				TransArr.Add(MakeShared<FJsonValueObject>(T));
+			}
+		}
+	}
+	OutRoot->SetArrayField(TEXT("states"), StatesArr);
+	OutRoot->SetArrayField(TEXT("transitions"), TransArr);
+}
+
+FMonolithActionResult FMonolithAnimationActions::HandleCreateStateMachine(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	FString SMName    = Params->HasField(TEXT("state_machine_name")) ? Params->GetStringField(TEXT("state_machine_name")) : TEXT("New State Machine");
+	FString GraphName = Params->HasField(TEXT("graph_name")) ? Params->GetStringField(TEXT("graph_name")) : FString();
+
+	double TempVal;
+	int32 PosX = 200;
+	int32 PosY = 200;
+	if (Params->TryGetNumberField(TEXT("position_x"), TempVal)) PosX = static_cast<int32>(TempVal);
+	if (Params->TryGetNumberField(TEXT("position_y"), TempVal)) PosY = static_cast<int32>(TempVal);
+
+	UAnimBlueprint* ABP = FMonolithAssetUtils::LoadAssetByPath<UAnimBlueprint>(AssetPath);
+	if (!ABP) return FMonolithActionResult::Error(FString::Printf(TEXT("AnimBlueprint not found: %s"), *AssetPath));
+
+	UEdGraph* AnimGraph = FindAnimGraph(ABP, GraphName);
+	if (!AnimGraph)
+	{
+		return FMonolithActionResult::Error(GraphName.IsEmpty()
+			? FString::Printf(TEXT("No anim graph (UAnimationGraphSchema) found in ABP '%s'"), *AssetPath)
+			: FString::Printf(TEXT("Anim graph '%s' not found in ABP '%s'"), *GraphName, *AssetPath));
+	}
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("Create State Machine")));
+	AnimGraph->Modify();
+
+	UAnimGraphNode_StateMachine* SMNode = SpawnStateMachineNode(AnimGraph, SMName, PosX, PosY);
+	if (!SMNode)
+	{
+		GEditor->EndTransaction();
+		return FMonolithActionResult::Error(TEXT("Failed to spawn state machine node (SpawnNodeFromTemplate returned null or EditorStateMachineGraph was not created)"));
+	}
+
+	GEditor->EndTransaction();
+
+	FKismetEditorUtilities::CompileBlueprint(ABP);
+	ABP->MarkPackageDirty();
+
+	UAnimationStateMachineGraph* SMGraph = Cast<UAnimationStateMachineGraph>(SMNode->EditorStateMachineGraph);
+
+	// The SM node's display title derives from the SM graph name.
+	FString FinalTitle = SMNode->GetNodeTitle(ENodeTitleType::FullTitle).ToString();
+	int32 NL;
+	if (FinalTitle.FindChar(TEXT('\n'), NL)) FinalTitle.LeftInline(NL);
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetStringField(TEXT("anim_graph"), AnimGraph->GetName());
+	Root->SetStringField(TEXT("state_machine_name"), FinalTitle);
+	Root->SetStringField(TEXT("state_machine_graph"), SMGraph ? SMGraph->GetName() : TEXT(""));
+	if (SMGraph)
+	{
+		StateMachineGraphToJson(SMGraph, Root);
+	}
+	return FMonolithActionResult::Success(Root);
+}
+
+// Add a state into SMGraph and rename its BoundGraph to StateName. Mirrors
+// HandleAddStateToMachine. Caller owns transaction/compile/save.
+static UAnimStateNode* BuilderAddState(UAnimationStateMachineGraph* SMGraph, const FString& StateName)
+{
+	UAnimStateNode* NewNode = FEdGraphSchemaAction_NewStateNode::SpawnNodeFromTemplate<UAnimStateNode>(
+		SMGraph,
+		NewObject<UAnimStateNode>(SMGraph),
+		FVector2f(0.0f, 0.0f),
+		/*bSelectNewNode=*/false);
+	if (!NewNode || !NewNode->BoundGraph) return nullptr;
+
+	TSharedPtr<INameValidatorInterface> NameValidator = FNameValidatorFactory::MakeValidator(NewNode);
+	FBlueprintEditorUtils::RenameGraphWithSuggestion(NewNode->BoundGraph, NameValidator, StateName);
+	return NewNode;
+}
+
+// Wire a sequence player into a state's inner anim graph and connect it to the
+// state result pose pin. Returns true on full wire-up.
+static bool BuilderSetStateAnimation(UAnimStateNode* StateNode, UAnimSequenceBase* Sequence)
+{
+	UEdGraph* StateGraph = StateNode->GetBoundGraph();
+	if (!StateGraph) return false;
+
+	UEdGraphPin* PoseSinkPin = StateNode->GetPoseSinkPinInsideState();
+	if (!PoseSinkPin) return false;
+
+	UAnimGraphNode_SequencePlayer* SeqNode = NewObject<UAnimGraphNode_SequencePlayer>(StateGraph, NAME_None, RF_Transactional);
+	StateGraph->AddNode(SeqNode, /*bUserAction=*/false, /*bSelectNewNode=*/false);
+	SeqNode->CreateNewGuid();
+	SeqNode->NodePosX = PoseSinkPin->GetOwningNode()->NodePosX - 300;
+	SeqNode->NodePosY = PoseSinkPin->GetOwningNode()->NodePosY;
+	// Bind the sequence before pin generation (mirrors the surgery-file ordering).
+	SeqNode->Node.SetSequence(Sequence);
+	SeqNode->AllocateDefaultPins();
+	SeqNode->PostPlacedNewNode(); // UEdGraphNode::PostPlacedNewNode() takes no args in UE 5.7
+
+	// Anim asset players expose a single output pose pin.
+	UEdGraphPin* OutputPosePin = nullptr;
+	for (UEdGraphPin* Pin : SeqNode->Pins)
+	{
+		if (Pin && Pin->Direction == EGPD_Output)
+		{
+			OutputPosePin = Pin;
+			break;
+		}
+	}
+	if (!OutputPosePin) return false;
+
+	const UEdGraphSchema* Schema = StateGraph->GetSchema();
+	return Schema ? Schema->TryCreateConnection(OutputPosePin, PoseSinkPin) : false;
+}
+
+FMonolithActionResult FMonolithAnimationActions::HandleBuildStateMachine(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	FString SMName    = Params->HasField(TEXT("state_machine_name")) ? Params->GetStringField(TEXT("state_machine_name")) : TEXT("New State Machine");
+	FString GraphName = Params->HasField(TEXT("graph_name")) ? Params->GetStringField(TEXT("graph_name")) : FString();
+	FString EntryState = Params->HasField(TEXT("entry_state")) ? Params->GetStringField(TEXT("entry_state")) : FString();
+
+	const TArray<TSharedPtr<FJsonValue>>* StatesJson = nullptr;
+	if (!Params->TryGetArrayField(TEXT("states"), StatesJson) || !StatesJson || StatesJson->Num() == 0)
+	{
+		return FMonolithActionResult::Error(TEXT("Missing or empty required parameter: states (array of {name, animation?})"));
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* TransJson = nullptr;
+	Params->TryGetArrayField(TEXT("transitions"), TransJson);
+
+	UAnimBlueprint* ABP = FMonolithAssetUtils::LoadAssetByPath<UAnimBlueprint>(AssetPath);
+	if (!ABP) return FMonolithActionResult::Error(FString::Printf(TEXT("AnimBlueprint not found: %s"), *AssetPath));
+
+	UEdGraph* AnimGraph = FindAnimGraph(ABP, GraphName);
+	if (!AnimGraph)
+	{
+		return FMonolithActionResult::Error(GraphName.IsEmpty()
+			? FString::Printf(TEXT("No anim graph (UAnimationGraphSchema) found in ABP '%s'"), *AssetPath)
+			: FString::Printf(TEXT("Anim graph '%s' not found in ABP '%s'"), *GraphName, *AssetPath));
+	}
+
+	TArray<TSharedPtr<FJsonValue>> StatesReport;
+	TArray<TSharedPtr<FJsonValue>> TransReport;
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("Build State Machine")));
+	AnimGraph->Modify();
+
+	// 1. Create the state machine.
+	UAnimGraphNode_StateMachine* SMNode = SpawnStateMachineNode(AnimGraph, SMName, 200, 200);
+	if (!SMNode || !SMNode->EditorStateMachineGraph)
+	{
+		GEditor->EndTransaction();
+		return FMonolithActionResult::Error(TEXT("Failed to spawn state machine node"));
+	}
+	UAnimationStateMachineGraph* SMGraph = Cast<UAnimationStateMachineGraph>(SMNode->EditorStateMachineGraph);
+	if (!SMGraph)
+	{
+		GEditor->EndTransaction();
+		return FMonolithActionResult::Error(TEXT("State machine graph has unexpected type"));
+	}
+	SMGraph->Modify();
+
+	// 2. Add states (+ optional animation).
+	for (const TSharedPtr<FJsonValue>& SV : *StatesJson)
+	{
+		const TSharedPtr<FJsonObject>* StateObj = nullptr;
+		if (!SV.IsValid() || !SV->TryGetObject(StateObj) || !StateObj || !(*StateObj)->HasField(TEXT("name")))
+		{
+			continue;
+		}
+		FString StateName = (*StateObj)->GetStringField(TEXT("name"));
+
+		TSharedPtr<FJsonObject> Rep = MakeShared<FJsonObject>();
+		Rep->SetStringField(TEXT("name"), StateName);
+
+		if (FindStateNodeByName(SMGraph, StateName))
+		{
+			Rep->SetBoolField(TEXT("created"), false);
+			Rep->SetStringField(TEXT("note"), TEXT("duplicate state name skipped"));
+			StatesReport.Add(MakeShared<FJsonValueObject>(Rep));
+			continue;
+		}
+
+		UAnimStateNode* StateNode = BuilderAddState(SMGraph, StateName);
+		if (!StateNode)
+		{
+			Rep->SetBoolField(TEXT("created"), false);
+			Rep->SetStringField(TEXT("note"), TEXT("spawn failed"));
+			StatesReport.Add(MakeShared<FJsonValueObject>(Rep));
+			continue;
+		}
+		Rep->SetBoolField(TEXT("created"), true);
+
+		// Optional animation wiring.
+		if ((*StateObj)->HasField(TEXT("animation")))
+		{
+			FString AnimPath = (*StateObj)->GetStringField(TEXT("animation"));
+			if (!AnimPath.IsEmpty())
+			{
+				UAnimSequenceBase* Seq = FMonolithAssetUtils::LoadAssetByPath<UAnimSequenceBase>(AnimPath);
+				if (!Seq)
+				{
+					Rep->SetStringField(TEXT("animation_note"), FString::Printf(TEXT("animation asset not found: %s"), *AnimPath));
+				}
+				else
+				{
+					bool bWired = BuilderSetStateAnimation(StateNode, Seq);
+					Rep->SetBoolField(TEXT("animation_wired"), bWired);
+					if (!bWired)
+					{
+						Rep->SetStringField(TEXT("animation_note"), TEXT("sequence player created but pose pin wiring failed"));
+					}
+				}
+			}
+		}
+		StatesReport.Add(MakeShared<FJsonValueObject>(Rep));
+	}
+
+	// 3. Entry state wiring.
+	bool bEntryWired = false;
+	if (!EntryState.IsEmpty())
+	{
+		UAnimStateNode* EntryTarget = FindStateNodeByName(SMGraph, EntryState);
+		UAnimStateEntryNode* EntryNode = nullptr;
+		for (UEdGraphNode* N : SMGraph->Nodes)
+		{
+			EntryNode = Cast<UAnimStateEntryNode>(N);
+			if (EntryNode) break;
+		}
+		if (EntryTarget && EntryNode)
+		{
+			UEdGraphPin* EntryOut = EntryNode->GetOutputPin();
+			UEdGraphPin* StateIn  = EntryTarget->GetInputPin();
+			const UAnimationStateMachineSchema* Schema = Cast<UAnimationStateMachineSchema>(SMGraph->GetSchema());
+			if (EntryOut && StateIn && Schema)
+			{
+				bEntryWired = Schema->TryCreateConnection(EntryOut, StateIn);
+			}
+		}
+	}
+
+	// 4. Transitions (+ optional rule).
+	if (TransJson)
+	{
+		const UAnimationStateMachineSchema* SMSchema = Cast<UAnimationStateMachineSchema>(SMGraph->GetSchema());
+		for (const TSharedPtr<FJsonValue>& TV : *TransJson)
+		{
+			const TSharedPtr<FJsonObject>* TObj = nullptr;
+			if (!TV.IsValid() || !TV->TryGetObject(TObj) || !TObj) continue;
+			FString From = (*TObj)->HasField(TEXT("from")) ? (*TObj)->GetStringField(TEXT("from")) : FString();
+			FString To   = (*TObj)->HasField(TEXT("to"))   ? (*TObj)->GetStringField(TEXT("to"))   : FString();
+
+			TSharedPtr<FJsonObject> Rep = MakeShared<FJsonObject>();
+			Rep->SetStringField(TEXT("from"), From);
+			Rep->SetStringField(TEXT("to"), To);
+
+			UAnimStateNode* FromNode = FindStateNodeByName(SMGraph, From);
+			UAnimStateNode* ToNode   = FindStateNodeByName(SMGraph, To);
+			if (!FromNode || !ToNode)
+			{
+				Rep->SetBoolField(TEXT("created"), false);
+				Rep->SetStringField(TEXT("note"), TEXT("from/to state not found"));
+				TransReport.Add(MakeShared<FJsonValueObject>(Rep));
+				continue;
+			}
+
+			UEdGraphPin* OutPin = FromNode->GetOutputPin();
+			UEdGraphPin* InPin  = ToNode->GetInputPin();
+			bool bConnected = (OutPin && InPin && SMSchema) ? SMSchema->TryCreateConnection(OutPin, InPin) : false;
+			Rep->SetBoolField(TEXT("created"), bConnected);
+			if (!bConnected)
+			{
+				Rep->SetStringField(TEXT("note"), TEXT("TryCreateConnection failed (states may already be connected)"));
+				TransReport.Add(MakeShared<FJsonValueObject>(Rep));
+				continue;
+			}
+
+			// Locate the just-created transition node.
+			UAnimStateTransitionNode* TransNode = nullptr;
+			for (UEdGraphNode* N : SMGraph->Nodes)
+			{
+				UAnimStateTransitionNode* TN = Cast<UAnimStateTransitionNode>(N);
+				if (!TN) continue;
+				UAnimStateNodeBase* P = TN->GetPreviousState();
+				UAnimStateNodeBase* Nx = TN->GetNextState();
+				if (P && Nx && P->GetStateName() == From && Nx->GetStateName() == To)
+				{
+					TransNode = TN;
+					break;
+				}
+			}
+
+			// Optional rule.
+			if ((*TObj)->HasField(TEXT("rule")) && TransNode)
+			{
+				FString Rule = (*TObj)->GetStringField(TEXT("rule"));
+				if (Rule.Equals(TEXT("auto"), ESearchCase::IgnoreCase) || Rule.Equals(TEXT("automatic"), ESearchCase::IgnoreCase))
+				{
+					// Sequence-player auto rule — no graph logic required.
+					TransNode->Modify();
+					TransNode->bAutomaticRuleBasedOnSequencePlayerInState = true;
+					Rep->SetStringField(TEXT("rule_applied"), TEXT("automatic"));
+				}
+				else
+				{
+					// Treat as a boolean variable name. Validate it is a bool var
+					// (mirrors HandleSetTransitionRule's policy); anything else is deferred.
+					const FBPVariableDescription* VarDesc = nullptr;
+					for (const FBPVariableDescription& V : ABP->NewVariables)
+					{
+						if (V.VarName.ToString() == Rule) { VarDesc = &V; break; }
+					}
+					if (!VarDesc)
+					{
+						Rep->SetStringField(TEXT("rule_deferred"), FString::Printf(TEXT("unsupported rule expression (deferred): '%s' is not a known ABP variable. Only bool variables and 'auto' are supported this pass."), *Rule));
+					}
+					else if (!VarDesc->VarType.PinCategory.ToString().Equals(TEXT("bool"), ESearchCase::IgnoreCase))
+					{
+						Rep->SetStringField(TEXT("rule_deferred"), FString::Printf(TEXT("unsupported rule expression (deferred): variable '%s' is type '%s', not bool."), *Rule, *VarDesc->VarType.PinCategory.ToString()));
+					}
+					else
+					{
+						UEdGraph* RuleGraph = TransNode->GetBoundGraph();
+						UAnimGraphNode_TransitionResult* ResultNode = nullptr;
+						if (RuleGraph)
+						{
+							for (UEdGraphNode* N : RuleGraph->Nodes)
+							{
+								ResultNode = Cast<UAnimGraphNode_TransitionResult>(N);
+								if (ResultNode) break;
+							}
+						}
+						UEdGraphPin* ResultPin = ResultNode ? ResultNode->FindPin(TEXT("bCanEnterTransition"), EGPD_Input) : nullptr;
+						bool bRuleWired = false;
+						if (RuleGraph && ResultPin)
+						{
+							RuleGraph->Modify();
+							ResultPin->BreakAllPinLinks();
+							UK2Node_VariableGet* VarGetNode = NewObject<UK2Node_VariableGet>(RuleGraph);
+							VarGetNode->VariableReference.SetSelfMember(FName(*Rule));
+							RuleGraph->AddNode(VarGetNode, /*bFromUI=*/false, /*bSelectNewNode=*/false);
+							VarGetNode->NodePosX = ResultNode->NodePosX - 200;
+							VarGetNode->NodePosY = ResultNode->NodePosY;
+							VarGetNode->AllocateDefaultPins();
+
+							UEdGraphPin* GetterOut = VarGetNode->FindPin(FName(*Rule), EGPD_Output);
+							if (!GetterOut)
+							{
+								for (UEdGraphPin* Pin : VarGetNode->Pins)
+								{
+									if (Pin && Pin->Direction == EGPD_Output && Pin->PinName != TEXT("self")) { GetterOut = Pin; break; }
+								}
+							}
+							const UEdGraphSchema* RuleSchema = RuleGraph->GetSchema();
+							if (GetterOut && RuleSchema)
+							{
+								bRuleWired = RuleSchema->TryCreateConnection(GetterOut, ResultPin);
+							}
+						}
+						Rep->SetStringField(TEXT("rule_applied"), bRuleWired
+							? FString::Printf(TEXT("bool variable '%s'"), *Rule)
+							: FString::Printf(TEXT("bool variable '%s' (getter created, wiring uncertain)"), *Rule));
+					}
+				}
+			}
+
+			TransReport.Add(MakeShared<FJsonValueObject>(Rep));
+		}
+	}
+
+	GEditor->EndTransaction();
+
+	FKismetEditorUtilities::CompileBlueprint(ABP);
+	ABP->MarkPackageDirty();
+
+	FString FinalTitle = SMNode->GetNodeTitle(ENodeTitleType::FullTitle).ToString();
+	int32 NL2;
+	if (FinalTitle.FindChar(TEXT('\n'), NL2)) FinalTitle.LeftInline(NL2);
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetStringField(TEXT("anim_graph"), AnimGraph->GetName());
+	Root->SetStringField(TEXT("state_machine_name"), FinalTitle);
+	Root->SetStringField(TEXT("state_machine_graph"), SMGraph->GetName());
+	Root->SetArrayField(TEXT("states_report"), StatesReport);
+	Root->SetArrayField(TEXT("transitions_report"), TransReport);
+	if (!EntryState.IsEmpty())
+	{
+		Root->SetStringField(TEXT("entry_state"), EntryState);
+		Root->SetBoolField(TEXT("entry_wired"), bEntryWired);
 	}
 	return FMonolithActionResult::Success(Root);
 }
