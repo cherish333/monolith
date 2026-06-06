@@ -35,7 +35,7 @@
 | `get_execution_flow` | `asset_path`, `entry_point` | Linearized exec trace from entry point. Handles branching (multiple exec outputs). MaxDepth=100 |
 | `search_nodes` | `asset_path`, `query` | Case-insensitive search by title, class name, or function name |
 | `get_components` | `asset_path` | List all components in the component hierarchy |
-| `get_component_details` | `asset_path`, `component_name` | Full property reflection for a named component |
+| `get_component_details` | `asset_path`, `component_name` | Full property reflection for a named component. When the component is not an SCS node, **falls back to the inherited native component** off the parent-class CDO subobject (same `GetComponents()` enumeration as `get_components`) and reflects its defaults — including `skeletal_mesh`, `anim_class`, `animation_mode`, and `is_inherited_native` for `USkeletalMeshComponent`-derived natives (2026-06-07). Previously returned nothing for inherited natives (e.g. a data-only child's inherited `Mesh`). |
 | `get_functions` | `asset_path` | List all functions with signatures, access, and purity flags |
 | `get_event_dispatchers` | `asset_path` | List all event dispatchers with parameter signatures |
 | `get_parent_class` | `asset_path` | Return the parent class of the Blueprint |
@@ -141,7 +141,14 @@
 *DataAsset (1)*
 | Action | Params | Description |
 |--------|--------|-------------|
-| `seed_data_asset` | `save_path`, `class_name`, `tree` (nested JSON), `dry_run`?, `strict`?, `skip_save`? | Create a DataAsset AND populate it from a nested `tree` in one atomic call — sugar over `create_data_asset` + `bulk_fill apply`. Create body reuses `HandleCreateDataAsset`; fill reuses `FMonolithReflectionWalker::WriteTree`. Returns `asset_path`, `actual_class`, `field_writes[]`, `errors`, `saved`. (For populating an *existing* DataAsset, use `bulk_fill_query("apply")` / `set_cdo_properties` instead — this action is for the create-then-populate scaffold case.) |
+| `seed_data_asset` | `save_path`, `class_name`, `tree` (nested JSON), `dry_run`?, `strict`?, `skip_save`?, `read_back_values`? | Create a DataAsset AND populate it from a nested `tree` in one atomic call — sugar over `create_data_asset` + `bulk_fill apply`. Create body reuses `HandleCreateDataAsset`; fill reuses `FMonolithReflectionWalker::WriteTree`. Returns `asset_path`, `actual_class`, `field_writes[]`, `errors`, `saved`. **`read_back_values` (default false, 2026-06-07):** after the write transaction completes, re-walk the written top-level props through `FMonolithReflectionReader` (the read-side serializer in `MonolithCore`) and attach `values: { field: <json> }` to the success payload — inline verify-after-write in the same call. The readback runs *after* the transaction and never re-opens it or dirties the package. (For populating an *existing* DataAsset, use `bulk_fill_query("apply")` / `set_cdo_properties` instead — this action is for the create-then-populate scaffold case.) |
+
+> **Verifying a DataAsset's live field values (two paths, 2026-06-07).** There are two ways to read a DataAsset's live values — use the right one:
+> - **`seed_data_asset` with `read_back_values:true`** — verify *inline with the write* (one round trip; confirms exactly what was just written, in the same call).
+> - **`get_cdo_properties`** — the canonical verify path for a *standalone or pre-existing* DataAsset you did NOT just write through `seed_data_asset` (independent live read of any DataAsset's values; routes through the same shared `FMonolithReflectionReader` serializer).
+> - `project.get_asset_details` is **neither** — it is the stale indexed snapshot, not a live verify, and should not be used to confirm a write.
+
+> **Inherited native component count (2026-06-07).** `get_blueprint_info` now reports `native_component_count` alongside the existing SCS-node `component_count` — a data-only child of a C++ `ACharacter`-like parent (no SCS nodes) previously reported `component_count: 0` despite inheriting native components. Pairs with `get_component_details`' inherited-native fallback above.
 
 *CurveTable (5) — first CurveTable surface in Monolith*
 | Action | Params | Description |

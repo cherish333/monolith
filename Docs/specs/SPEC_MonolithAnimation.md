@@ -14,15 +14,17 @@
 
 | Class | Responsibility |
 |-------|---------------|
-| `FMonolithAnimationModule` | Registers 133 animation actions across `MonolithAnimationActions.cpp` (103 + the 2 Wave 16 state-machine authoring actions `create_state_machine` / `build_state_machine`), `MonolithPoseSearchActions.cpp` (13), `MonolithAbpWriteActions.cpp` (5), `MonolithControlRigWriteActions.cpp` (3), `MonolithAnimLayoutActions.cpp` (1), `MonolithAnimationRuntimeActions.cpp` (1 — `sample_pie_anim_instance`), and the 5 graph-surgery actions (`rebuild_evaluate_chooser_node`, `replace_evaluate_chooser_nodes`, `duplicate_reparent_and_sanitize`, `find_node_slice`, `remove_node_slice`). The `WITH_CHOOSER`-gated `chooser` namespace (6 actions) is registered from this module but counted under its own namespace |
+| `FMonolithAnimationModule` | Registers ~135 animation actions across `MonolithAnimationActions.cpp` (incl. the state-machine authoring actions `create_state_machine` / `build_state_machine`, plus 2026-06-07 readback actions `get_anim_graph_choosers` / `get_transition_rule`), `MonolithPoseSearchActions.cpp` (13), `MonolithAbpWriteActions.cpp` (5), `MonolithControlRigWriteActions.cpp` (3), `MonolithAnimLayoutActions.cpp` (1), `MonolithAnimationRuntimeActions.cpp` (1 — `sample_pie_anim_instance`), and the 5 graph-surgery actions (`rebuild_evaluate_chooser_node`, `replace_evaluate_chooser_nodes`, `duplicate_reparent_and_sanitize`, `find_node_slice`, `remove_node_slice`). The `WITH_CHOOSER`-gated `chooser` namespace (6 actions) is registered from this module but counted under its own namespace |
 | `FMonolithAnimationActions` | Static handlers organized in 15 groups (the original action handlers) |
 | `FMonolithAbpWriteActions` | ABP graph write actions (Phase v0.14.3 PR #34): `add_anim_graph_node` (built-in aliases plus generic `UAnimGraphNode_Base` class path/name resolution, with TwoBoneIK / ModifyBone helpers and auto-pin exposure), `connect_anim_graph_pins`, `set_state_animation`, `add_variable_get`, `set_anim_graph_node_property` |
 | `FMonolithControlRigWriteActions` | ControlRig write actions: 3 actions (graph node creation, pin configuration, variable management) |
 | `FMonolithAnimLayoutActions` | `auto_layout` for AnimBP graphs |
 
-### Actions (133 — namespace: "animation")
+### Actions (~135 — namespace: "animation")
 
-**Note (2026-04-26 audit):** The detailed per-category tables below cover the 103 baseline actions. The remaining **27 actions** (5 ABP write + 13 PoseSearch + 3 ControlRig + 1 layout + 5 graph-surgery) are documented in their own sections at the bottom of this spec. The ABP write actions landed in v0.14.3 (PR #34 by @MaxenceEpitech). No Phase J changes touched this module. v0.14.9 added `copy_bone_pose_between_sequences` (PR #51 by @MaxenceEpitech). v0.14.10 added `list_bone_tracks` (PR #54 by @MaxenceEpitech) and rewrote `get_bone_track_keys` to use the non-deprecated `IsValidBoneTrackName` + `GetBoneTrackTransforms` API path. v0.14.10 also added `get_skeleton_preview_attached_assets` + `get_bone_ref_pose` (PR #55 by @MaxenceEpitech) and the three `CompatibleSkeletons` actions (`get_compatible_skeletons` / `add_compatible_skeleton` / `remove_compatible_skeleton` — PR #56 by @MaxenceEpitech), bringing the module total to 125. The Warband Harness Wave 2 added the 5 graph-surgery actions, bringing the module total to 130 (103 baseline + 27 wave-actions). Wave 16 added 3 actions — `create_state_machine` + `build_state_machine` (state-machine authoring, in `MonolithAnimationActions.cpp`) and `sample_pie_anim_instance` (PIE runtime telemetry, in the new `MonolithAnimationRuntimeActions.cpp`) — bringing the module total to 133.
+> **Counts are approximate.** Exact integers are no longer tracked to the unit — query `monolith_discover("animation")` for the live figure.
+
+**Note (2026-04-26 audit):** The detailed per-category tables below cover the 103 baseline actions. The remaining **27 actions** (5 ABP write + 13 PoseSearch + 3 ControlRig + 1 layout + 5 graph-surgery) are documented in their own sections at the bottom of this spec. The ABP write actions landed in v0.14.3 (PR #34 by @MaxenceEpitech). No Phase J changes touched this module. v0.14.9 added `copy_bone_pose_between_sequences` (PR #51 by @MaxenceEpitech). v0.14.10 added `list_bone_tracks` (PR #54 by @MaxenceEpitech) and rewrote `get_bone_track_keys` to use the non-deprecated `IsValidBoneTrackName` + `GetBoneTrackTransforms` API path. v0.14.10 also added `get_skeleton_preview_attached_assets` + `get_bone_ref_pose` (PR #55 by @MaxenceEpitech) and the three `CompatibleSkeletons` actions (`get_compatible_skeletons` / `add_compatible_skeleton` / `remove_compatible_skeleton` — PR #56 by @MaxenceEpitech), bringing the module total to 125. The test/profiling harness Wave 2 added the 5 graph-surgery actions, bringing the module total to ~130. Wave 16 added 3 actions — `create_state_machine` + `build_state_machine` (state-machine authoring, in `MonolithAnimationActions.cpp`) and `sample_pie_anim_instance` (PIE runtime telemetry, in the new `MonolithAnimationRuntimeActions.cpp`). The 2026-06-07 gap-closure pass added 2 readback actions — `get_anim_graph_choosers` + `get_transition_rule` — plus a structured `set_transition_rule.rule` object and `get_nodes.include_anim_graph`, bringing the module total to ~135.
 
 **Sequence Info (5) — read-only**
 | Action | Description |
@@ -79,7 +81,8 @@
 | `get_blend_nodes` | Blend nodes in an ABP graph |
 | `get_linked_layers` | Linked animation layers |
 | `get_graphs` | All graphs in an ABP |
-| `get_nodes` | Animation nodes with optional class and graph_name filters |
+| `get_nodes` | Animation nodes with optional class and graph_name filters. **`include_anim_graph` (bool, 2026-06-07):** when set, also traverses the main AnimGraph (default behavior covers function graphs only) and emits `LinkedTo` endpoints (default output reports connection counts only). Opt-in to preserve the existing output shape by default. |
+| `get_anim_graph_choosers` | **(2026-06-07)** Walk an AnimBP's graphs (main AnimGraph + function graphs) for chooser-evaluating nodes (Evaluate-Chooser K2 nodes, resolved reflectively by class-name prefix). Reports `{ node_guid, node_title, chooser_asset, output_pin_links: [...] }` per node. Optional `recursive` expands each referenced chooser tree via the shared chooser-tree collector (the same walk `chooser::inspect_chooser recursive:true` uses). `WITH_CHOOSER` + editor-only. |
 
 **Montage Operations (8)**
 | Action | Description |
@@ -176,9 +179,9 @@ Wraps `USkeleton::CompatibleSkeletons` — the canonical UE5 mechanism that lets
 |--------|-------------|
 | `auto_layout` | Auto-arrange nodes in an Animation Blueprint graph. `formatter`: `"auto"` (default) — uses Blueprint Assist if available, falls back to built-in hierarchical layout; `"blueprint_assist"` — requires BA; `"builtin"` — built-in only. Optional `graph_name` to target a specific graph |
 
-**Graph Surgery (5) — Warband Harness Wave 2**
+**Graph Surgery (5) — Test/Profiling Harness Wave 2**
 
-Node-level write operations over Animation Blueprint graphs, built for reparenting and Chooser-node rewiring during the Warband recruit-ABP pipeline. The two batch / reparent / slice-removal actions default to `dry_run=true`.
+Node-level write operations over Animation Blueprint graphs, built for AnimBP reparenting and Chooser-node rewiring. The two batch / reparent / slice-removal actions default to `dry_run=true`.
 
 | Action | Description |
 |--------|-------------|
@@ -188,14 +191,30 @@ Node-level write operations over Animation Blueprint graphs, built for reparenti
 | `find_node_slice` | Compute a directional (`upstream` / `downstream`) node slice from a seed node, honoring `stop_rules`. Reports the slice set, before/after node counts, and orphaned pins. Read-only. |
 | `remove_node_slice` | Remove a directional node slice. Reports counts, orphaned pins, and any broken required-exec continuity — surfaced in the response, never auto-rewired. `dry_run` defaults to `true`. |
 
-**State Machine Authoring (2) — Wave 16**
+**State Machine Authoring (2) — Test/Profiling Harness Wave 16**
 
 | Action | Description |
 |--------|-------------|
 | `create_state_machine` | Spawn a `UAnimGraphNode_StateMachine` into an ABP's anim graph via `FEdGraphSchemaAction_NewStateNode::SpawnNodeFromTemplate` (auto-creates the SM graph + entry node through `PostPlacedNewNode`). Renames the auto-created `EditorStateMachineGraph` (the SM node title derives from it). Picks the first graph with a `UAnimationGraphSchema` by default; optional `graph_name` targets a specific anim graph for layered ABPs. Compiles + marks dirty. Returns the SM node title + SM graph name + a state/transition readback. |
 | `build_state_machine` | Declarative builder composing `create_state_machine` + state/transition/rule mutators in one transaction from `{states:[{name, animation?}], transitions:[{from,to,rule?}], entry_state}`. States optionally wire a `UAnimGraphNode_SequencePlayer` to the state result pose pin. Rules support bool variables and `auto`/`automatic` (`bAutomaticRuleBasedOnSequencePlayerInState`); any other rule expression is reported as `unsupported rule expression (deferred)` per-element without failing the build. Returns a per-element states/transitions report. Compiles + saves once at the end. |
 
-**Runtime Telemetry (1) — Wave 16, `MonolithAnimationRuntimeActions.cpp`**
+**Transition Rules (2026-06-07)**
+
+`set_transition_rule` accepts a structured **`rule`** object so callers don't author rule-graph nodes by hand:
+
+| `rule.kind` | Shape | Notes |
+|---|---|---|
+| `bool` | `{ kind: "bool", variable: <name> }` | Existing behavior. The variable may be an inherited `BlueprintReadOnly`/`BlueprintVisible` bool on the parent AnimInstance class — validation now walks the skeleton/generated/parent class chain instead of `NewVariables` only, so inherited native bools are accepted. |
+| `auto` | `{ kind: "auto" }` | Existing — sequence-completion automatic rule. |
+| `compare` | `{ kind: "compare", lhs: <variable\|expr>, op: ">"\|"<"\|">="\|"<="\|"=="\|"!=", rhs: <number> }` | Float/numeric comparison against an AnimInstance property (inherited float props validate via the same class-chain walk). |
+
+Full free-form **expression-graph** authoring (e.g. `Abs(X) > 45.0`) is **deferred** — it is the multi-node graph-authoring + compile surface, not yet shipped.
+
+| Action | Description |
+|--------|-------------|
+| `get_transition_rule` | **(2026-06-07)** Read back an authored transition rule: its kind + operands + compile status. Read-only. |
+
+**Runtime Telemetry (1) — Test/Profiling Harness Wave 16, `MonolithAnimationRuntimeActions.cpp`**
 
 | Action | Description |
 |--------|-------------|
@@ -255,7 +274,7 @@ A dedicated namespace for inspecting and editing `UChooserTable` assets, registe
 
 | Action | Description |
 |--------|-------------|
-| `inspect_chooser` | Read-only inspection of a `UChooserTable`: result type and result class, ContextData parameters (class/struct requirements), row count, column count + types, referenced assets, and compile/validation status. **`referenced_assets` walks only direct `FAssetChooser` / `FSoftAssetChooser` result rows** — `NestedChooser` and `FObjectChooser` result rows return empty by design (the reference lives behind an indirection the walk does not follow). |
+| `inspect_chooser` | Read-only inspection of a `UChooserTable`: result type and result class, ContextData parameters (class/struct requirements), row count, column count + types, referenced assets, and compile/validation status. **`referenced_assets` walks only direct `FAssetChooser` / `FSoftAssetChooser` result rows** — `NestedChooser` and `FObjectChooser` result rows return empty by default (the reference lives behind an indirection the default walk does not follow). **`recursive` (bool, default false, 2026-06-07):** when set, resolves the FULL nested chooser tree via the shared chooser-tree collector — emits a `child_tables[]` tree with each row's resolved asset path AND row kind (`asset` / `soft_asset` / `evaluate_chooser` / `nested_chooser`), plus `nested_objects`, `parent_table`, `root_chooser`, fallback, and output-object cells. A mandatory visited-set guards against cyclic ParentTable/Nested references. Non-recursive output shape is unchanged. |
 | `duplicate_chooser_tree` | Duplicate one or more chooser tables into a destination folder; sources are never mutated. Params: `source_assets[]` (required), `destination_folder` (required), optional `remap_rules` (map of old-asset-path → new-asset-path). When `remap_rules` is supplied the action runs a **two-pass duplicate-then-remap** (all duplicates are created first, then references are rewritten — making the result order-independent of how nested tables reference each other) and rewrites `RootChooser` / `ParentTable` / `NestedChoosers` plus result `FInstancedStruct` asset references in each duplicate. The remap now also recurses through **nested `FEvaluateChooser` + `FNestedChooser` references** — `ResultsStructs` / `FallbackResult` / `FOutputObjectColumn`, recursing into `NestedObjects` — using normalized path matching so trailing-slash / case / `.uasset` variants resolve. Each duplicate reports a per-row `row_remap_report` of what was rewritten, and all duplicates are saved to disk. |
 | `set_context_object_class` | Rewrite the `Class` on a ContextData parameter entry (`FContextObjectTypeClass`), e.g. to retarget a chooser at a new ABP class. Marks the package dirty and recompiles (`Compile(true)`). |
 | `set_result_asset_reference` | Rewrite the `Asset` reference on a result row (`FAssetChooser` / `FSoftAssetChooser`), e.g. a PoseSearch database. Rejects non-asset result rows (e.g. `NestedChooser` / EvaluateChooser) with a precise error — use `set_evaluate_chooser_result_reference` for those. Marks the package dirty and recompiles (`Compile(true)`). |

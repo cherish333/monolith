@@ -9,7 +9,7 @@
 ## MonolithAI
 
 **Dependencies:** Core, CoreUObject, Engine, MonolithCore, UnrealEd, AIModule, GameplayTasks, NavigationSystem, Json, JsonUtilities
-**Namespace:** `ai` | **Tool:** `ai_query(action, params)` | **Actions:** 223 (Phase J F8: +`add_perception_to_actor`, +`get_bt_graph`; Warband harness Wave 1: +`rebuild_navigation`, +`validate_nav_points`)
+**Namespace:** `ai` | **Tool:** `ai_query(action, params)` | **Actions:** ~223 (Phase J F8: +`add_perception_to_actor`, +`get_bt_graph`; test/profiling harness Wave 1: +`rebuild_navigation`, +`validate_nav_points`). Counts approximate — query `monolith_discover("ai")` for the live figure.
 **Conditional:** State Trees (`#if WITH_STATETREE`) and Smart Objects (`#if WITH_SMARTOBJECTS`) are required dependencies. Mass Entity (`#if WITH_MASSENTITY`) and Zone Graph (`#if WITH_ZONEGRAPH`) are optional extensions. When required deps are absent, the module compiles to an empty stub (0 actions registered).
 **Settings toggle:** `bEnableAI` (default: True)
 
@@ -29,7 +29,7 @@ Counts below are the **actual** registrations from `Source/MonolithAI/Private/Mo
 | AI Controllers | 10 | `MonolithAIControllerActions.cpp` | Controller configuration, team assignment, focus management |
 | Perception | 11 | `MonolithAIPerceptionActions.cpp` | Sight/hearing/damage/team sense configuration, stimulus management (AIController-only) |
 | Perception Scaffold | 1 | `MonolithAIPerceptionScaffoldActions.cpp` | **F8** `add_perception_to_actor` — accepts ANY actor BP (not just AIControllers) plus a `senses` array |
-| Navigation | 26 | `MonolithAINavigationActions.cpp` | NavMesh queries, path finding, nav link management, nav modifier volumes. **Warband harness Wave 1:** +`rebuild_navigation`, +`validate_nav_points` |
+| Navigation | 26 | `MonolithAINavigationActions.cpp` | NavMesh queries, path finding, nav link management, nav modifier volumes. **Test/profiling harness Wave 1:** +`rebuild_navigation`, +`validate_nav_points` |
 | Runtime/PIE | 14 | `MonolithAIRuntimeActions.cpp` | Runtime BT/ST inspection, active task queries, blackboard value read/write in PIE |
 | Scaffolding | 23 | `MonolithAIScaffoldActions.cpp` | Pre-built AI patterns: patrol, guard, investigate, flee, horror stalker, search area |
 | Discovery | 11 | `MonolithAIDiscoveryActions.cpp` | AI asset overview, explain, compare, validate, search |
@@ -37,9 +37,9 @@ Counts below are the **actual** registrations from `Source/MonolithAI/Private/Mo
 
 **Total:** 32 + 12 + 35 + 20 + 16 + 10 + 11 + 1 + 26 + 14 + 23 + 11 + 12 = **223**.
 
-### Warband Harness — Wave 1 nav actions
+### Test/Profiling Harness — Wave 1 nav actions
 
-Two navigation actions added for the Warband harness workflow (`MonolithAINavigationActions.cpp`):
+Two navigation actions added for the test/profiling harness workflow (`MonolithAINavigationActions.cpp`):
 
 | Action | Params | Description |
 |--------|--------|-------------|

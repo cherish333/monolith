@@ -14,7 +14,7 @@
 
 | Class | Responsibility |
 |-------|---------------|
-| `FMonolithIndexModule` | Registers 11 project actions (7 baseline + 1 v0.17.0 cross-module `audit_orphan_assets` + 3 Warband harness Wave 1) |
+| `FMonolithIndexModule` | Registers 11 project actions (7 baseline + 1 v0.17.0 cross-module `audit_orphan_assets` + 3 test/profiling harness Wave 1) |
 | `FMonolithIndexDatabase` | RAII SQLite wrapper. 13 tables + 2 FTS5 + 6 triggers + 1 meta. DELETE journal mode, 64MB cache. Schema v2: `saved_hash` column (Blake3 `FIoHash` hex), `schema_version` meta key |
 | `UMonolithIndexSubsystem` | UEditorSubsystem. 3-layer indexing (startup delta, live AR callbacks, full fallback). Hash-based startup catch-up. Live batched AR delegates on 2s timer. Deep asset indexing with game-thread batching. Batches every 100 assets. Progress notifications |
 | `IMonolithIndexer` | Pure virtual interface: GetSupportedClasses(), IndexAsset(), GetName(), IsSentinel(), SupportsIncrementalIndex(), IndexScoped() |
@@ -31,6 +31,8 @@
 | `FDependencyIndexer` | Hard + Soft package dependencies (runs after all other indexers) |
 | `FMonolithIndexNotification` | Slate notification bar with throbber + percentage |
 
+> **Shared read-side serializer (2026-06-07).** The DataAsset indexer's `PropertyToJsonValue` field serializer was deduplicated into the new `FMonolithReflectionReader` helper in `MonolithCore` (see [`SPEC_MonolithCore.md`](SPEC_MonolithCore.md)). The indexer now calls the shared reader instead of carrying its own copy — the same single implementation the Blueprint CDO actions (`get_cdo_properties`) and `seed_data_asset`'s `read_back_values` use, so indexed DataAsset field JSON and live verify-after-write JSON are produced by one code path.
+
 ### Actions (11 — namespace: "project")
 
 | Action | Params | Description |
@@ -44,7 +46,7 @@
 | `search_gameplay_tags` | `query` (required) | Search gameplay tags and return referencing assets |
 | `audit_orphan_assets` | `asset_class_filter` (optional), `limit` (50, cap 200), `cursor` (optional) | **v0.17.0 (cross-module from `MonolithReflectionIntel`).** List `/Game/.../*.uasset` assets with ZERO `IAssetRegistry` referencers AND zero entries in `cpp_asset_edges`. Strictest orphan signal for pre-release cleanup. Excludes `/Engine/*` + `/Memory/*`. Read-only, cursor-paginated |
 
-**Warband Harness — Wave 1 (3 — post-save freshness / disk state / sandboxed cleanup)**
+**Test/Profiling Harness — Wave 1 (3 — post-save freshness / disk state / sandboxed cleanup)**
 
 | Action | Params | Description |
 |--------|--------|-------------|
