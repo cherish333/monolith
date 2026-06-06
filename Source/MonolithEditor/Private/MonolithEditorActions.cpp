@@ -523,13 +523,13 @@ void FMonolithEditorActions::RegisterActions(FMonolithLogCapture* LogCapture)
 		FMonolithActionHandler::CreateStatic(&HandleStopPIE),
 		MakeShared<FJsonObject>());
 
-	// --- Package state (F1: warband-harness plan 2026-06-04) ---
+	// --- Package state (F1: PIE/profiling harness plan 2026-06-04) ---
 
 	Registry.RegisterAction(TEXT("editor"), TEXT("list_dirty_packages"),
 		TEXT("Report loaded packages with unsaved changes (UPackage::IsDirty), optionally scoped to one or more /Game path prefixes. Returns per-package {package, is_map, disk_path, transient}. Use to audit what a save_packages call would touch."),
 		FMonolithActionHandler::CreateStatic(&HandleListDirtyPackages),
 		FParamSchemaBuilder()
-			.Optional(TEXT("scope_paths"), TEXT("array"), TEXT("Array of /Game path prefixes to filter by (e.g. [\"/Game/Tests/Monolith/Warband\"]). Omit for all dirty packages. Transient/in-memory packages are excluded unless include_transient=true."))
+			.Optional(TEXT("scope_paths"), TEXT("array"), TEXT("Array of /Game path prefixes to filter by (e.g. [\"/Game/Tests/Monolith\"]). Omit for all dirty packages. Transient/in-memory packages are excluded unless include_transient=true."))
 			.Optional(TEXT("include_transient"), TEXT("bool"), TEXT("Include /Engine/Transient and other non-disk packages. Default false."), TEXT("false"))
 			.Optional(TEXT("include_maps"), TEXT("bool"), TEXT("Include dirty map packages (UPackage::ContainsMap). Default true."), TEXT("true"))
 			.Optional(TEXT("include_content"), TEXT("bool"), TEXT("Include dirty non-map (content) packages. Default true."), TEXT("true"))
@@ -539,20 +539,20 @@ void FMonolithEditorActions::RegisterActions(FMonolithLogCapture* LogCapture)
 		TEXT("Save the requested packages to disk (UPackage::SavePackage + FSavePackageArgs). When fail_on_unrequested_dirty=true, errors before saving anything if any dirty package exists outside the requested set (within scope_paths if given). Returns per-package save status."),
 		FMonolithActionHandler::CreateStatic(&HandleSavePackages),
 		FParamSchemaBuilder()
-			.Required(TEXT("packages"), TEXT("array"), TEXT("Array of long package names (e.g. [\"/Game/Tests/Monolith/Warband/DA_Foo\"]) to save."))
+			.Required(TEXT("packages"), TEXT("array"), TEXT("Array of long package names (e.g. [\"/Game/Tests/Monolith/DA_Foo\"]) to save."))
 			.Optional(TEXT("fail_on_unrequested_dirty"), TEXT("bool"), TEXT("If true, abort (saving nothing) when a dirty package outside the request set is found. Default false."), TEXT("false"))
 			.Optional(TEXT("scope_paths"), TEXT("array"), TEXT("Path prefixes that bound the unrequested-dirty pre-scan (only used with fail_on_unrequested_dirty). Omit to scan all dirty packages."))
 			.Optional(TEXT("dry_run"), TEXT("bool"), TEXT("If true, report which packages WOULD be saved (per-package would_save status) without writing anything to disk. Default false."), TEXT("false"))
 			.Build());
 
-	// --- PIE smoke + capture (F2/F3: warband-harness plan 2026-06-04) ---
+	// --- PIE smoke + capture (F2/F3: PIE/profiling harness plan 2026-06-04) ---
 
 	Registry.RegisterAction(TEXT("editor"), TEXT("run_pie_smoke"),
 		TEXT("Start an ASYNC PIE smoke session on a map and RETURN IMMEDIATELY. Loads the map, starts PIE (synchronously), emits a UE_LOG marker, and registers a session that the editor's REAL frame loop advances over real frames (sampling the target pawn's AnimInstance vars). Returns {session_id, status:'running', started:true}. Poll progress / the final report with poll_pie_smoke; force-end with stop_pie_smoke. Does NOT block the editor frame (the old synchronous pump re-entered UWorld::Tick and crashed)."),
 		FMonolithActionHandler::CreateStatic(&HandleRunPieSmoke),
 		FParamSchemaBuilder()
 			.OptionalAssetPath(TEXT("map"), TEXT("Level asset path to load before PIE (e.g. /Game/Tests/Monolith/Maps/M_Harness). Omit to use the current editor level."))
-			.Optional(TEXT("marker"), TEXT("string"), TEXT("Marker token emitted to the log; post-marker pattern matching counts only lines after it. Default WARBAND_SMOKE."), TEXT("WARBAND_SMOKE"))
+			.Optional(TEXT("marker"), TEXT("string"), TEXT("Marker token emitted to the log; post-marker pattern matching counts only lines after it. Default MONOLITH_SMOKE."), TEXT("MONOLITH_SMOKE"))
 			.Optional(TEXT("duration"), TEXT("number"), TEXT("Seconds the editor loop advances PIE before the session auto-completes (clamped 0-120). Default 5."), TEXT("5"))
 			.Optional(TEXT("sample_vars"), TEXT("array"), TEXT("AnimInstance variable names sampled each frame. Default [GroundSpeed, bShouldMove, DesiredYawDelta]."))
 			.Optional(TEXT("pawn_class"), TEXT("string"), TEXT("Substring of the target pawn's class name to sample (resolves a matching pawn). Omit to use the first player controller's pawn."))
@@ -594,7 +594,7 @@ void FMonolithEditorActions::RegisterActions(FMonolithLogCapture* LogCapture)
 		FMonolithActionHandler::CreateStatic(&HandleCapturePieMovementClip),
 		FParamSchemaBuilder()
 			.OptionalAssetPath(TEXT("map"), TEXT("Level asset path to load before PIE. Omit to use the current editor level."))
-			.Optional(TEXT("marker"), TEXT("string"), TEXT("Log marker token. Default WARBAND_CLIP."), TEXT("WARBAND_CLIP"))
+			.Optional(TEXT("marker"), TEXT("string"), TEXT("Log marker token. Default MONOLITH_CLIP."), TEXT("MONOLITH_CLIP"))
 			.Optional(TEXT("duration"), TEXT("number"), TEXT("Seconds the editor loop advances PIE before the session auto-completes (clamped 0-120). Default 5."), TEXT("5"))
 			.Optional(TEXT("capture_interval"), TEXT("number"), TEXT("Seconds between captured frames (clamped 0.05-5). Default 0.25."), TEXT("0.25"))
 			.Optional(TEXT("sample_vars"), TEXT("array"), TEXT("AnimInstance variable names sampled each frame. Default [GroundSpeed, bShouldMove, DesiredYawDelta]."))
@@ -615,7 +615,7 @@ void FMonolithEditorActions::RegisterActions(FMonolithLogCapture* LogCapture)
 			.Optional(TEXT("trace_channels"), TEXT("array"), TEXT("Channel names (e.g. [\"cpu\",\"frame\",\"gpu\"]) for an Unreal Insights trace started on session start and stopped on completion, bracketing the capture to the PIE window. The .utrace is written to <project>/Saved/Profiling and its path is reported under 'profiling.trace_path'. Stopped on EVERY end path. Omit/empty to disable tracing. If a trace is already connected, this session does not start (or later stop) it."))
 			.Build());
 
-	// --- Nav harness map builder (F4: warband-harness plan 2026-06-04) ---
+	// --- Nav harness map builder (F4: PIE/profiling harness plan 2026-06-04) ---
 
 	Registry.RegisterAction(TEXT("editor"), TEXT("create_nav_harness_map"),
 		TEXT("Build a navigation test map from a JSON spec: blank UWorld, floor, nav bounds, camera, target points, and BP/actor instances with reflective UPROPERTY defaults (scalars, FSoftObjectPath, object/soft-object refs, CLASS/SOFTCLASS refs `_C`-normalized, and arrays of those). Optional WorldSettings GameMode override + APlayerStart spawns. All spawned actors get a SetFolderPath. Rebuilds + validates nav via runtime `ai` dispatch and saves. Writes to a throwaway map path only."),
@@ -4213,7 +4213,7 @@ FMonolithActionResult FMonolithEditorActions::HandleLoadLevel(const TSharedPtr<F
 
 // ---------------------------------------------------------------------------
 // F1: list_dirty_packages / save_packages — scoped dirty report + scoped saver
-// (warband-harness plan 2026-06-04)
+// (PIE/profiling harness plan 2026-06-04)
 // ---------------------------------------------------------------------------
 
 namespace MonolithEditorPackages
@@ -4474,7 +4474,7 @@ FMonolithActionResult FMonolithEditorActions::HandleSavePackages(const TSharedPt
 }
 
 // ---------------------------------------------------------------------------
-// F2/F3 shared PIE-smoke scaffolding (warband-harness plan 2026-06-04)
+// F2/F3 shared PIE-smoke scaffolding (PIE/profiling harness plan 2026-06-04)
 // ---------------------------------------------------------------------------
 
 namespace MonolithEditorPieSmoke
@@ -5432,7 +5432,7 @@ FMonolithActionResult FMonolithEditorActions::HandleRunPieSmoke(const TSharedPtr
 		return FMonolithActionResult::Error(TEXT("A PIE session is already running — stop it before run_pie_smoke."));
 	}
 
-	FString Marker = TEXT("WARBAND_SMOKE");
+	FString Marker = TEXT("MONOLITH_SMOKE");
 	Params->TryGetStringField(TEXT("marker"), Marker);
 
 	double Duration = 5.0;
@@ -5596,7 +5596,7 @@ FMonolithActionResult FMonolithEditorActions::HandleListErroredBlueprints(const 
 
 // ---------------------------------------------------------------------------
 // F3: capture_pie_movement_clip — async session + per-interval frame capture +
-// AnimInstance sampling (warband-harness plan 2026-06-04)
+// AnimInstance sampling (PIE/profiling harness plan 2026-06-04)
 // ---------------------------------------------------------------------------
 
 FMonolithActionResult FMonolithEditorActions::HandleCapturePieMovementClip(const TSharedPtr<FJsonObject>& Params)
@@ -5612,7 +5612,7 @@ FMonolithActionResult FMonolithEditorActions::HandleCapturePieMovementClip(const
 		return FMonolithActionResult::Error(TEXT("A PIE session is already running — stop it before capture_pie_movement_clip."));
 	}
 
-	FString Marker = TEXT("WARBAND_CLIP");
+	FString Marker = TEXT("MONOLITH_CLIP");
 	Params->TryGetStringField(TEXT("marker"), Marker);
 
 	double Duration = 5.0;
@@ -5694,7 +5694,7 @@ FMonolithActionResult FMonolithEditorActions::HandleCapturePieMovementClip(const
 
 // ---------------------------------------------------------------------------
 // F4: create_nav_harness_map — build a nav test map from a JSON spec
-// (warband-harness plan 2026-06-04)
+// (PIE/profiling harness plan 2026-06-04)
 //
 // Nav rebuild + validation are delegated to the registered `ai` actions via
 // runtime string dispatch (FMonolithToolRegistry::ExecuteAction) so MonolithEditor
@@ -5967,8 +5967,15 @@ namespace MonolithEditorNavHarness
 	// Idiom: Modify()-then-assign (WorldSettingsDetails.cpp:71). Returns false + reason
 	// on a resolution failure WITHOUT touching the package. CONFIRMED member type is
 	// TSubclassOf<AGameModeBase> (WorldSettings.h:599).
-	static bool ApplyGameModeOverride(UWorld* World, const FString& ClassPath, FString& OutResolved, FString& OutError)
+	//
+	// Compare-before-dirty: if the resolved class already equals WS->DefaultGameMode,
+	// this is a no-op — no Modify(), no assignment, no MarkPackageDirty — and OutChanged
+	// is set false. Only an actual class difference mutates (and dirties) the package.
+	// Returns true on success (whether or not a change occurred); false only on a
+	// resolution/validation failure (in which case the package is never touched).
+	static bool ApplyGameModeOverride(UWorld* World, const FString& ClassPath, FString& OutResolved, bool& OutChanged, FString& OutError)
 	{
+		OutChanged = false;
 		AWorldSettings* WS = World ? World->GetWorldSettings() : nullptr;
 		if (!WS)
 		{
@@ -5981,10 +5988,19 @@ namespace MonolithEditorNavHarness
 			OutError = FString::Printf(TEXT("'%s' did not resolve to an AGameModeBase subclass"), *ClassPath);
 			return false;
 		}
+		OutResolved = GameModeClass->GetPathName();
+
+		// Already the configured GameMode override? Skip the mutate entirely so a
+		// re-apply of an identical class does not re-dirty the package.
+		if (WS->DefaultGameMode == GameModeClass)
+		{
+			return true;
+		}
+
 		WS->Modify();
 		WS->DefaultGameMode = GameModeClass;
 		WS->MarkPackageDirty();
-		OutResolved = GameModeClass->GetPathName();
+		OutChanged = true;
 		return true;
 	}
 
@@ -6271,14 +6287,17 @@ FMonolithActionResult FMonolithEditorActions::HandleCreateNavHarnessMap(const TS
 		if (Params->TryGetStringField(TEXT("game_mode_override"), GameModePath) && !GameModePath.IsEmpty())
 		{
 			FString Resolved, Error;
-			if (ApplyGameModeOverride(World, GameModePath, Resolved, Error))
+			bool bChanged = false;
+			if (ApplyGameModeOverride(World, GameModePath, Resolved, bChanged, Error))
 			{
 				Result->SetBoolField(TEXT("game_mode_override_set"), true);
+				Result->SetBoolField(TEXT("game_mode_override_changed"), bChanged);
 				Result->SetStringField(TEXT("game_mode_override"), Resolved);
 			}
 			else
 			{
 				Result->SetBoolField(TEXT("game_mode_override_set"), false);
+				Result->SetBoolField(TEXT("game_mode_override_changed"), false);
 				Result->SetStringField(TEXT("game_mode_override_error"), Error);
 			}
 		}
@@ -6443,14 +6462,17 @@ FMonolithActionResult FMonolithEditorActions::HandleAuthorMapSettings(const TSha
 		FString GameModePath;
 		Params->TryGetStringField(TEXT("game_mode_override"), GameModePath);
 		FString Resolved, Error;
-		if (!GameModePath.IsEmpty() && ApplyGameModeOverride(World, GameModePath, Resolved, Error))
+		bool bChanged = false;
+		if (!GameModePath.IsEmpty() && ApplyGameModeOverride(World, GameModePath, Resolved, bChanged, Error))
 		{
 			Result->SetBoolField(TEXT("game_mode_override_set"), true);
+			Result->SetBoolField(TEXT("game_mode_override_changed"), bChanged);
 			Result->SetStringField(TEXT("game_mode_override"), Resolved);
 		}
 		else
 		{
 			Result->SetBoolField(TEXT("game_mode_override_set"), false);
+			Result->SetBoolField(TEXT("game_mode_override_changed"), false);
 			Result->SetStringField(TEXT("game_mode_override_error"),
 				GameModePath.IsEmpty() ? TEXT("empty class path") : Error);
 		}

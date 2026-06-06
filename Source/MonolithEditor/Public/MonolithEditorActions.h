@@ -107,12 +107,12 @@ public:
 	// Stop the active Play-In-Editor session.
 	static FMonolithActionResult HandleStopPIE(const TSharedPtr<FJsonObject>& Params);
 
-	// --- Package state (F1: warband-harness plan 2026-06-04) ---
+	// --- Package state (F1: PIE/profiling harness plan 2026-06-04) ---
 	// Scoped dirty-package report + scoped saver with fail-on-unrequested-dirty.
 	static FMonolithActionResult HandleListDirtyPackages(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleSavePackages(const TSharedPtr<FJsonObject>& Params);
 
-	// --- Async session-based PIE smoke (F2/F3: warband-harness plan 2026-06-04) ---
+	// --- Async session-based PIE smoke (F2/F3: PIE/profiling harness plan 2026-06-04) ---
 	// run_pie_smoke starts PIE + registers a session and RETURNS IMMEDIATELY; the
 	// editor's real frame loop advances the session via the shared frame observer
 	// (FPieSmokeSessionManager). poll_pie_smoke reads progress / the final report;
@@ -129,7 +129,7 @@ public:
 	// PIE on a broken world (which would raise a game-thread-blocking modal).
 	static FMonolithActionResult HandleListErroredBlueprints(const TSharedPtr<FJsonObject>& Params);
 
-	// --- Nav harness map builder (F4: warband-harness plan 2026-06-04) ---
+	// --- Nav harness map builder (F4: PIE/profiling harness plan 2026-06-04) ---
 	// Build a test map from a JSON spec (floor, nav bounds, camera, target points,
 	// actor instances), rebuild + validate nav via runtime `ai` dispatch, save.
 	static FMonolithActionResult HandleCreateNavHarnessMap(const TSharedPtr<FJsonObject>& Params);

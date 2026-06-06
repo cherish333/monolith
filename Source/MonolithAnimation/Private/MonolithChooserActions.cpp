@@ -48,7 +48,7 @@ void FMonolithChooserActions::RegisterActions(FMonolithToolRegistry& Registry)
 		FMonolithActionHandler::CreateStatic(&HandleDuplicateChooserTree),
 		FParamSchemaBuilder()
 			.Required(TEXT("source_assets"), TEXT("array"), TEXT("Array of source UChooserTable asset paths to duplicate"))
-			.Required(TEXT("destination_folder"), TEXT("string"), TEXT("Destination content folder, e.g. /Game/Tests/Monolith/Warband"))
+			.Required(TEXT("destination_folder"), TEXT("string"), TEXT("Destination content folder, e.g. /Game/Tests/Monolith"))
 			.Optional(TEXT("remap_rules"), TEXT("object"), TEXT("Optional map of old-asset-path -> new-asset-path applied to RootChooser/ParentTable/NestedChoosers and result FInstancedStruct asset refs in each duplicate"))
 			.Build());
 

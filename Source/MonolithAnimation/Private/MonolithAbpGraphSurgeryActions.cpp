@@ -477,7 +477,7 @@ void FMonolithAbpGraphSurgeryActions::RegisterActions(FMonolithToolRegistry& Reg
 		FMonolithActionHandler::CreateStatic(&HandleDuplicateReparentAndSanitize),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("source_abp"), TEXT("Source Animation Blueprint asset path"))
-			.RequiredAssetPath(TEXT("destination_path"), TEXT("Destination ABP asset path for the duplicate (e.g. /Game/Tests/Monolith/Warband/ABP_Copy)"))
+			.RequiredAssetPath(TEXT("destination_path"), TEXT("Destination ABP asset path for the duplicate (e.g. /Game/Tests/Monolith/ABP_Copy)"))
 			.Required(TEXT("new_parent_class"), TEXT("string"), TEXT("New parent AnimInstance class — name or /Script/.../...Class path or BlueprintGeneratedClass path"))
 			.Optional(TEXT("dry_run"), TEXT("bool"), TEXT("Report only; when false the duplicate is created + reparented but auto-fix still requires opt-in (default: true)"), TEXT("true"))
 			.Build());
