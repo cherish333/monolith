@@ -6,6 +6,7 @@
 
 #if WITH_CHOOSER
 #include "MonolithAssetUtils.h"
+#include "MonolithChooserTreeCollector.h"
 
 // Chooser runtime headers. Chooser.Build.cs adds its Internal/ dir to
 // PublicIncludePaths, so the Internal table/result headers are reachable for any
@@ -34,10 +35,11 @@ void FMonolithChooserActions::RegisterActions(FMonolithToolRegistry& Registry)
 {
 	// --- inspect_chooser ---
 	Registry.RegisterAction(TEXT("chooser"), TEXT("inspect_chooser"),
-		TEXT("Read-only inspection of a UChooserTable: context-data parameters (class/struct requirements), result type + result class, row count, column count + types, referenced assets walked from result rows, and compile/validation status."),
+		TEXT("Read-only inspection of a UChooserTable: context-data parameters (class/struct requirements), result type + result class, row count, column count + types, referenced assets walked from result rows, and compile/validation status. Set recursive=true to additionally emit the full nested tree of row/result targets (asset / soft_asset / evaluate_chooser / nested_chooser kinds), output-object column cells, fallback, parent_table/root_chooser, and recursed child tables."),
 		FMonolithActionHandler::CreateStatic(&HandleInspectChooser),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("UChooserTable asset path"))
+			.Optional(TEXT("recursive"), TEXT("bool"), TEXT("When true, emit a recursive 'tree' of every row/result target (normalized asset paths) including nested FEvaluateChooser/FNestedChooser children, FallbackResult, and FOutputObjectColumn cells, so a root->child remap is provable from readback. Default false (back-compat)."))
 			.Build());
 
 	// --- duplicate_chooser_tree ---
@@ -284,6 +286,19 @@ FMonolithActionResult FMonolithChooserActions::HandleInspectChooser(const TShare
 	Root->SetNumberField(TEXT("row_count"), Table->CookedResults.Num());
 	Root->SetBoolField(TEXT("editor_only_data_available"), false);
 #endif
+
+	// Optional recursive tree: full nested walk via the shared read-only collector. The
+	// collector classifies each row/result location by kind (asset / soft_asset /
+	// evaluate_chooser / nested_chooser), resolves its target path, and recurses into embedded
+	// child tables (NestedObjects) — so a root->child chooser remap is provable from readback.
+	bool bRecursive = false;
+	Params->TryGetBoolField(TEXT("recursive"), bRecursive);
+	if (bRecursive)
+	{
+		// The visited-set cycle guard is a REQUIRED parameter of the collector's entry point.
+		TSet<UChooserTable*> VisitedTables;
+		Root->SetObjectField(TEXT("tree"), MonolithChooserTree::CollectTree(Table, VisitedTables));
+	}
 
 	// Compile to surface validation status (read-only side effect: regenerates cooked data).
 	Table->Compile(/*bForce=*/false);
