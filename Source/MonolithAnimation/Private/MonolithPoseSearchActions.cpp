@@ -3,6 +3,7 @@
 #include "MonolithParamSchema.h"
 
 #include "PoseSearch/PoseSearchDatabase.h"
+#include "PoseSearch/PoseSearchNormalizationSet.h"
 #include "PoseSearch/PoseSearchSchema.h"
 #include "PoseSearch/PoseSearchFeatureChannel.h"
 #include "PoseSearch/PoseSearchFeatureChannel_Position.h"
@@ -21,6 +22,15 @@
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "UObject/UnrealType.h"
 #include "Editor.h"
+
+// ---------------------------------------------------------------------------
+// File-local static handlers (Motion Matching Pack — no header decl)
+// ---------------------------------------------------------------------------
+
+// Task 1.3 — set_database_normalization_set (file-local, no header edit)
+static FMonolithActionResult HandleSetDatabaseNormalizationSet(const TSharedPtr<FJsonObject>& Params);
+// Task 1.4 — add_database_entry (file-local, no header edit)
+static FMonolithActionResult HandleAddDatabaseEntry(const TSharedPtr<FJsonObject>& Params);
 
 // ---------------------------------------------------------------------------
 // Registration
@@ -147,6 +157,51 @@ void FMonolithPoseSearchActions::RegisterActions(FMonolithToolRegistry& Registry
 			.Optional(TEXT("looping_cost_bias"), TEXT("number"), TEXT("Cost bias for looping animations"))
 			.Optional(TEXT("continuing_interaction_cost_bias"), TEXT("number"), TEXT("Cost bias for continuing interaction poses"))
 			.Build());
+
+	// Motion Matching Pack — Sprint 1
+	Registry.RegisterAction(TEXT("animation"), TEXT("create_normalization_set"),
+		TEXT("Create a UPoseSearchNormalizationSet asset"),
+		FMonolithActionHandler::CreateStatic(&HandleCreateNormalizationSet),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Asset path for the new normalization set"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("animation"), TEXT("add_database_to_normalization_set"),
+		TEXT("Add a PoseSearch database to a normalization set"),
+		FMonolithActionHandler::CreateStatic(&HandleAddDatabaseToNormalizationSet),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("set_path"), TEXT("PoseSearchNormalizationSet asset path"))
+			.RequiredAssetPath(TEXT("database_path"), TEXT("PoseSearchDatabase asset path to add"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("animation"), TEXT("set_database_normalization_set"),
+		TEXT("Assign a normalization set to a PoseSearch database (editor-only)"),
+		FMonolithActionHandler::CreateStatic(&HandleSetDatabaseNormalizationSet),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("database_path"), TEXT("PoseSearchDatabase asset path"))
+			.RequiredAssetPath(TEXT("set_path"), TEXT("PoseSearchNormalizationSet asset path"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("animation"), TEXT("add_database_entry"),
+		TEXT("Add any UAnimationAsset (sequence/blendspace/composite) to a PoseSearch database with mirror options"),
+		FMonolithActionHandler::CreateStatic(&HandleAddDatabaseEntry),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("database_path"), TEXT("PoseSearchDatabase asset path"))
+			.RequiredAssetPath(TEXT("anim_path"), TEXT("Animation asset to add (sequence, blendspace, or composite)"))
+			.Optional(TEXT("enabled"), TEXT("boolean"), TEXT("Enable for search (default true)"))
+			.Optional(TEXT("mirror_option"), TEXT("string"), TEXT("UnmirroredOnly, MirroredOnly, or UnmirroredAndMirrored"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("animation"), TEXT("set_database_entry_tags"),
+		TEXT("Set mirror/reselection/enabled flags on a PoseSearch database entry by index"),
+		FMonolithActionHandler::CreateStatic(&HandleSetDatabaseEntryTags),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("database_path"), TEXT("PoseSearchDatabase asset path"))
+			.Required(TEXT("entry_index"), TEXT("integer"), TEXT("Index of the database animation entry"))
+			.Optional(TEXT("mirror_option"), TEXT("string"), TEXT("UnmirroredOnly, MirroredOnly, or UnmirroredAndMirrored"))
+			.Optional(TEXT("disable_reselection"), TEXT("boolean"), TEXT("Prevent reselection of poses from same asset"))
+			.Optional(TEXT("enabled"), TEXT("boolean"), TEXT("Enable/disable for search"))
+			.Build());
 }
 
 // ---------------------------------------------------------------------------
@@ -237,6 +292,8 @@ FMonolithActionResult FMonolithPoseSearchActions::HandleGetPoseSearchDatabase(co
 	// Animation assets
 	const int32 NumAssets = Database->GetNumAnimationAssets();
 	Root->SetNumberField(TEXT("sequence_count"), NumAssets);
+	// §12b R1: explicit entry count alias for MM-pack read-backs
+	Root->SetNumberField(TEXT("count"), NumAssets);
 
 	TArray<TSharedPtr<FJsonValue>> SeqArray;
 	for (int32 i = 0; i < NumAssets; ++i)
@@ -255,6 +312,7 @@ FMonolithActionResult FMonolithPoseSearchActions::HandleGetPoseSearchDatabase(co
 
 #if WITH_EDITORONLY_DATA
 		SeqObj->SetBoolField(TEXT("enabled"), AnimAsset->IsEnabled());
+		SeqObj->SetBoolField(TEXT("disable_reselection"), AnimAsset->IsDisableReselection());
 		FFloatInterval Range = AnimAsset->GetSamplingRange();
 		SeqObj->SetNumberField(TEXT("sampling_range_start"), Range.Min);
 		SeqObj->SetNumberField(TEXT("sampling_range_end"), Range.Max);
@@ -376,7 +434,52 @@ FMonolithActionResult FMonolithPoseSearchActions::HandleGetDatabaseStats(const T
 
 	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetStringField(TEXT("asset_path"), AssetPath);
-	Root->SetNumberField(TEXT("sequence_count"), Database->GetNumAnimationAssets());
+	const int32 EntryCount = Database->GetNumAnimationAssets();
+	Root->SetNumberField(TEXT("sequence_count"), EntryCount);
+	// §12b R1: explicit entry count (alias of sequence_count for MM-pack read-backs)
+	Root->SetNumberField(TEXT("count"), EntryCount);
+
+	// §12b R1: normalization_set ref (path or null) — needed by task 1.3 read-back
+#if WITH_EDITORONLY_DATA
+	if (Database->NormalizationSet)
+	{
+		Root->SetStringField(TEXT("normalization_set"), Database->NormalizationSet->GetPathName());
+	}
+	else
+	{
+		Root->SetField(TEXT("normalization_set"), MakeShared<FJsonValueNull>());
+	}
+#else
+	Root->SetField(TEXT("normalization_set"), MakeShared<FJsonValueNull>());
+#endif
+
+	// §12b R1: per-entry flags — needed by tasks 1.2, 1.4, 1.5 read-backs
+	{
+		TArray<TSharedPtr<FJsonValue>> EntryArray;
+		for (int32 i = 0; i < EntryCount; ++i)
+		{
+			const FPoseSearchDatabaseAnimationAsset* Entry = Database->GetDatabaseAnimationAsset(i);
+			if (!Entry) continue;
+
+			TSharedPtr<FJsonObject> EntryObj = MakeShared<FJsonObject>();
+			EntryObj->SetNumberField(TEXT("index"), i);
+			if (UObject* Asset = Entry->GetAnimationAsset())
+			{
+				EntryObj->SetStringField(TEXT("animation"), Asset->GetPathName());
+				EntryObj->SetStringField(TEXT("asset_class"), Asset->GetClass()->GetName());
+			}
+#if WITH_EDITORONLY_DATA
+			EntryObj->SetBoolField(TEXT("enabled"), Entry->IsEnabled());
+			EntryObj->SetBoolField(TEXT("disable_reselection"), Entry->IsDisableReselection());
+			EntryObj->SetStringField(TEXT("mirror_option"),
+				Entry->GetMirrorOption() == EPoseSearchMirrorOption::UnmirroredOnly ? TEXT("UnmirroredOnly") :
+				Entry->GetMirrorOption() == EPoseSearchMirrorOption::MirroredOnly ? TEXT("MirroredOnly") :
+				TEXT("UnmirroredAndMirrored"));
+#endif
+			EntryArray.Add(MakeShared<FJsonValueObject>(EntryObj));
+		}
+		Root->SetArrayField(TEXT("entries"), EntryArray);
+	}
 
 	// Schema
 	if (Database->Schema)
@@ -386,11 +489,33 @@ FMonolithActionResult FMonolithPoseSearchActions::HandleGetDatabaseStats(const T
 		Root->SetNumberField(TEXT("schema_cardinality"), Database->Schema->SchemaCardinality);
 	}
 
-	// Search index stats
-	const UE::PoseSearch::FSearchIndex& SearchIndex = Database->GetSearchIndex();
-	const int32 NumPoses = SearchIndex.GetNumPoses();
-	Root->SetNumberField(TEXT("total_pose_count"), NumPoses);
-	Root->SetBoolField(TEXT("is_valid"), NumPoses > 0);
+	// Search index stats — GUARD: UPoseSearchDatabase::GetSearchIndex() check()-asserts
+	// (PoseSearchDatabase.cpp:1135) when the database has never been indexed. Mirror the
+	// engine's own gate (GetSkipSearchIfPossible, PoseSearchDatabase.cpp:1561): only touch
+	// the search index once an editor-time build has completed successfully.
+	{
+#if WITH_EDITOR
+		using namespace UE::PoseSearch;
+		const bool bIndexBuilt = Database->Schema &&
+			EAsyncBuildIndexResult::Success ==
+			FAsyncPoseSearchDatabasesManagement::RequestAsyncBuildIndex(
+				Database, ERequestAsyncBuildFlag::ContinueRequest | ERequestAsyncBuildFlag::WaitForCompletion);
+#else
+		const bool bIndexBuilt = false;
+#endif
+		Root->SetBoolField(TEXT("index_built"), bIndexBuilt);
+		if (bIndexBuilt)
+		{
+			const int32 NumPoses = Database->GetSearchIndex().GetNumPoses();
+			Root->SetNumberField(TEXT("total_pose_count"), NumPoses);
+			Root->SetBoolField(TEXT("is_valid"), NumPoses > 0);
+		}
+		else
+		{
+			Root->SetField(TEXT("total_pose_count"), MakeShared<FJsonValueNull>());
+			Root->SetBoolField(TEXT("is_valid"), false);
+		}
+	}
 
 	// Search mode
 	FString SearchModeStr;
@@ -1019,5 +1144,259 @@ FMonolithActionResult FMonolithPoseSearchActions::HandleSetDatabaseSearchMode(co
 	Root->SetNumberField(TEXT("looping_cost_bias"), Database->LoopingCostBias);
 	Root->SetNumberField(TEXT("continuing_interaction_cost_bias"), Database->ContinuingInteractionCostBias);
 
+	return FMonolithActionResult::Success(Root);
+}
+
+// ---------------------------------------------------------------------------
+// Motion Matching Pack — Task 1.1: create_normalization_set
+// (class-member handler; mirrors HandleCreatePoseSearchDatabase)
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithPoseSearchActions::HandleCreateNormalizationSet(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+
+	FString AssetName;
+	int32 LastSlash;
+	if (!AssetPath.FindLastChar('/', LastSlash) || LastSlash == AssetPath.Len() - 1)
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Invalid asset path: %s"), *AssetPath));
+	AssetName = AssetPath.Mid(LastSlash + 1);
+
+	if (FMonolithAssetUtils::LoadAssetByPath<UObject>(AssetPath))
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Asset already exists at '%s'"), *AssetPath));
+
+	UPackage* Pkg = CreatePackage(*AssetPath);
+	if (!Pkg) return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to create package at '%s'"), *AssetPath));
+
+	UPoseSearchNormalizationSet* Set = NewObject<UPoseSearchNormalizationSet>(Pkg, FName(*AssetName), RF_Public | RF_Standalone);
+	if (!Set) return FMonolithActionResult::Error(TEXT("Failed to create UPoseSearchNormalizationSet object"));
+
+	FAssetRegistryModule::AssetCreated(Set);
+	Pkg->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), Set->GetPathName());
+	Root->SetStringField(TEXT("asset_name"), AssetName);
+	return FMonolithActionResult::Success(Root);
+}
+
+// ---------------------------------------------------------------------------
+// Motion Matching Pack — Task 1.2: add_database_to_normalization_set
+// (class-member handler)
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithPoseSearchActions::HandleAddDatabaseToNormalizationSet(const TSharedPtr<FJsonObject>& Params)
+{
+	FString SetPath = Params->GetStringField(TEXT("set_path"));
+	FString DatabasePath = Params->GetStringField(TEXT("database_path"));
+
+	UPoseSearchNormalizationSet* Set = FMonolithAssetUtils::LoadAssetByPath<UPoseSearchNormalizationSet>(SetPath);
+	if (!Set)
+		return FMonolithActionResult::Error(FString::Printf(TEXT("PoseSearchNormalizationSet not found: %s"), *SetPath));
+
+	UPoseSearchDatabase* Database = FMonolithAssetUtils::LoadAssetByPath<UPoseSearchDatabase>(DatabasePath);
+	if (!Database)
+		return FMonolithActionResult::Error(FString::Printf(TEXT("PoseSearchDatabase not found: %s"), *DatabasePath));
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("Add Database To Normalization Set")));
+	Set->Modify();
+
+	// Databases is TArray<TObjectPtr<const UPoseSearchDatabase>>; non-const ptr converts implicitly.
+	Set->Databases.AddUnique(Database);
+
+	GEditor->EndTransaction();
+	Set->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("set_path"), SetPath);
+	Root->SetStringField(TEXT("database"), Database->GetPathName());
+	Root->SetNumberField(TEXT("count"), Set->Databases.Num());
+	return FMonolithActionResult::Success(Root);
+}
+
+// ---------------------------------------------------------------------------
+// Motion Matching Pack — Task 1.5: set_database_entry_tags
+// (class-member handler; mirrors HandleSetDatabaseSequenceProperties on the unified array)
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithPoseSearchActions::HandleSetDatabaseEntryTags(const TSharedPtr<FJsonObject>& Params)
+{
+	FString DatabasePath = Params->GetStringField(TEXT("database_path"));
+	int32 EntryIndex = static_cast<int32>(Params->GetNumberField(TEXT("entry_index")));
+
+	UPoseSearchDatabase* Database = FMonolithAssetUtils::LoadAssetByPath<UPoseSearchDatabase>(DatabasePath);
+	if (!Database)
+		return FMonolithActionResult::Error(FString::Printf(TEXT("PoseSearchDatabase not found: %s"), *DatabasePath));
+
+	const int32 NumAssets = Database->GetNumAnimationAssets();
+	if (EntryIndex < 0 || EntryIndex >= NumAssets)
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Invalid entry_index %d (database has %d entries)"), EntryIndex, NumAssets));
+
+	FPoseSearchDatabaseAnimationAsset* Entry = Database->GetMutableDatabaseAnimationAsset(EntryIndex);
+	if (!Entry)
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to get mutable entry at index %d"), EntryIndex));
+
+#if WITH_EDITORONLY_DATA
+	GEditor->BeginTransaction(FText::FromString(TEXT("Set PoseSearch Database Entry Tags")));
+	Database->Modify();
+
+	if (Params->HasField(TEXT("enabled")))
+	{
+		Entry->SetIsEnabled(Params->GetBoolField(TEXT("enabled")));
+	}
+
+	if (Params->HasField(TEXT("disable_reselection")))
+	{
+		Entry->SetDisableReselection(Params->GetBoolField(TEXT("disable_reselection")));
+	}
+
+	if (Params->HasField(TEXT("mirror_option")))
+	{
+		FString MirrorStr = Params->GetStringField(TEXT("mirror_option"));
+		if (MirrorStr.Equals(TEXT("UnmirroredOnly"), ESearchCase::IgnoreCase))
+			Entry->MirrorOption = EPoseSearchMirrorOption::UnmirroredOnly;
+		else if (MirrorStr.Equals(TEXT("MirroredOnly"), ESearchCase::IgnoreCase))
+			Entry->MirrorOption = EPoseSearchMirrorOption::MirroredOnly;
+		else if (MirrorStr.Equals(TEXT("UnmirroredAndMirrored"), ESearchCase::IgnoreCase))
+			Entry->MirrorOption = EPoseSearchMirrorOption::UnmirroredAndMirrored;
+		else
+		{
+			GEditor->EndTransaction();
+			return FMonolithActionResult::Error(FString::Printf(TEXT("Invalid mirror_option: '%s'. Use UnmirroredOnly, MirroredOnly, or UnmirroredAndMirrored"), *MirrorStr));
+		}
+	}
+
+	GEditor->EndTransaction();
+	Database->MarkPackageDirty();
+
+	// Read back current state
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("database_path"), DatabasePath);
+	Root->SetNumberField(TEXT("entry_index"), EntryIndex);
+	if (UObject* AnimAsset = Entry->GetAnimationAsset())
+	{
+		Root->SetStringField(TEXT("animation"), AnimAsset->GetPathName());
+	}
+	Root->SetBoolField(TEXT("enabled"), Entry->IsEnabled());
+	Root->SetBoolField(TEXT("disable_reselection"), Entry->IsDisableReselection());
+	FString MirrorStr;
+	switch (Entry->GetMirrorOption())
+	{
+	case EPoseSearchMirrorOption::UnmirroredOnly:        MirrorStr = TEXT("UnmirroredOnly"); break;
+	case EPoseSearchMirrorOption::MirroredOnly:          MirrorStr = TEXT("MirroredOnly"); break;
+	case EPoseSearchMirrorOption::UnmirroredAndMirrored: MirrorStr = TEXT("UnmirroredAndMirrored"); break;
+	default:                                             MirrorStr = TEXT("Unknown"); break;
+	}
+	Root->SetStringField(TEXT("mirror_option"), MirrorStr);
+	return FMonolithActionResult::Success(Root);
+#else
+	return FMonolithActionResult::Error(TEXT("set_database_entry_tags requires editor-only data (WITH_EDITORONLY_DATA)"));
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Motion Matching Pack — Task 1.3: set_database_normalization_set
+// (FILE-LOCAL static handler — no header edit)
+// ---------------------------------------------------------------------------
+
+static FMonolithActionResult HandleSetDatabaseNormalizationSet(const TSharedPtr<FJsonObject>& Params)
+{
+#if WITH_EDITORONLY_DATA
+	FString DatabasePath = Params->GetStringField(TEXT("database_path"));
+	FString SetPath = Params->GetStringField(TEXT("set_path"));
+
+	UPoseSearchDatabase* Database = FMonolithAssetUtils::LoadAssetByPath<UPoseSearchDatabase>(DatabasePath);
+	if (!Database)
+		return FMonolithActionResult::Error(FString::Printf(TEXT("PoseSearchDatabase not found: %s"), *DatabasePath));
+
+	UPoseSearchNormalizationSet* Set = FMonolithAssetUtils::LoadAssetByPath<UPoseSearchNormalizationSet>(SetPath);
+	if (!Set)
+		return FMonolithActionResult::Error(FString::Printf(TEXT("PoseSearchNormalizationSet not found: %s"), *SetPath));
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("Set Database Normalization Set")));
+	Database->Modify();
+
+	// NormalizationSet is a TObjectPtr<const UPoseSearchNormalizationSet> UPROPERTY with no setter;
+	// cast away const on the member to assign.
+	const_cast<TObjectPtr<const UPoseSearchNormalizationSet>&>(Database->NormalizationSet) = Set;
+
+	GEditor->EndTransaction();
+	Database->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("database_path"), DatabasePath);
+	Root->SetStringField(TEXT("normalization_set"), Set->GetPathName());
+	return FMonolithActionResult::Success(Root);
+#else
+	return FMonolithActionResult::Error(TEXT("set_database_normalization_set requires editor-only data (WITH_EDITORONLY_DATA)"));
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Motion Matching Pack — Task 1.4: add_database_entry
+// (FILE-LOCAL static handler — no header edit; mirrors HandleAddDatabaseSequence,
+//  uses the NON-DEPRECATED AddAnimationAsset(const FPoseSearchDatabaseAnimationAsset&) overload)
+// ---------------------------------------------------------------------------
+
+static FMonolithActionResult HandleAddDatabaseEntry(const TSharedPtr<FJsonObject>& Params)
+{
+	FString DatabasePath = Params->GetStringField(TEXT("database_path"));
+	FString AnimPath = Params->GetStringField(TEXT("anim_path"));
+
+	bool bEnabled = true;
+	if (Params->HasField(TEXT("enabled")))
+	{
+		bEnabled = Params->GetBoolField(TEXT("enabled"));
+	}
+
+	UPoseSearchDatabase* Database = FMonolithAssetUtils::LoadAssetByPath<UPoseSearchDatabase>(DatabasePath);
+	if (!Database)
+		return FMonolithActionResult::Error(FString::Printf(TEXT("PoseSearchDatabase not found: %s"), *DatabasePath));
+
+	UObject* AnimAsset = FMonolithAssetUtils::LoadAssetByPath<UObject>(AnimPath);
+	if (!AnimAsset)
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Animation asset not found: %s"), *AnimPath));
+
+	if (Database->Contains(AnimAsset))
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Animation already in database: %s"), *AnimPath));
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("Add PoseSearch Database Entry")));
+	Database->Modify();
+
+	FPoseSearchDatabaseAnimationAsset NewEntry;
+	NewEntry.AnimAsset = AnimAsset;
+#if WITH_EDITORONLY_DATA
+	NewEntry.bEnabled = bEnabled;
+
+	if (Params->HasField(TEXT("mirror_option")))
+	{
+		FString MirrorStr = Params->GetStringField(TEXT("mirror_option"));
+		if (MirrorStr.Equals(TEXT("UnmirroredOnly"), ESearchCase::IgnoreCase))
+			NewEntry.MirrorOption = EPoseSearchMirrorOption::UnmirroredOnly;
+		else if (MirrorStr.Equals(TEXT("MirroredOnly"), ESearchCase::IgnoreCase))
+			NewEntry.MirrorOption = EPoseSearchMirrorOption::MirroredOnly;
+		else if (MirrorStr.Equals(TEXT("UnmirroredAndMirrored"), ESearchCase::IgnoreCase))
+			NewEntry.MirrorOption = EPoseSearchMirrorOption::UnmirroredAndMirrored;
+		else
+		{
+			GEditor->EndTransaction();
+			return FMonolithActionResult::Error(FString::Printf(TEXT("Invalid mirror_option: '%s'. Use UnmirroredOnly, MirroredOnly, or UnmirroredAndMirrored"), *MirrorStr));
+		}
+	}
+#endif
+
+	const int32 IndexBefore = Database->GetNumAnimationAssets();
+	// NON-DEPRECATED plain-struct overload (PoseSearchDatabase.h:663) — NOT the FInstancedStruct overload.
+	Database->AddAnimationAsset(NewEntry);
+
+	GEditor->EndTransaction();
+	Database->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetNumberField(TEXT("index"), IndexBefore);
+	Root->SetStringField(TEXT("animation"), AnimAsset->GetPathName());
+	Root->SetStringField(TEXT("asset_class"), AnimAsset->GetClass()->GetName());
+	Root->SetBoolField(TEXT("enabled"), bEnabled);
+	Root->SetNumberField(TEXT("count"), Database->GetNumAnimationAssets());
 	return FMonolithActionResult::Success(Root);
 }
