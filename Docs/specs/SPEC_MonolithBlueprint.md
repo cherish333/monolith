@@ -60,7 +60,7 @@
 | `remove_component` | `asset_path`, `component_name` | Remove a component by name |
 | `rename_component` | `asset_path`, `old_name`, `new_name` | Rename a component |
 | `reparent_component` | `asset_path`, `component_name`, `new_parent` | Change a component's parent in the hierarchy |
-| `set_component_property` | `asset_path`, `component_name`, `property_name`, `value` | Set a property on a component via reflection |
+| `set_component_property` | `asset_path`, `component_name`, `property_name`, `value` | Set a property on a component via reflection. As of 2026-06-07, when the target is an inherited native component (CDO subobject, no SCS node) it uses the structural-modify + `CompileBlueprint` persistence handshake so the override survives reload; SCS-template writes keep the lighter `MarkBlueprintAsModified` path. |
 | `duplicate_component` | `asset_path`, `component_name`, `new_name` | Duplicate a component with all its settings |
 
 **Graph Management (10)**
@@ -117,12 +117,13 @@
 
 | Action | Params | Description |
 |--------|--------|-------------|
-| `set_anim_class` | `asset_path`, `anim_class` | Set the `AnimClass` (Anim Blueprint) on a character/pawn Blueprint's skeletal mesh component (SCS or inherited native), resolving the class from a path/name. |
+| `set_anim_class` | `asset_path`, `anim_class` | Set the `AnimClass` (Anim Blueprint) on a character/pawn Blueprint's skeletal mesh component (SCS or inherited native), resolving the class from a path/name. As of 2026-06-07 uses `BP->Modify()` + `MarkBlueprintAsStructurallyModified` + `CompileBlueprint` so the CDO override on an inherited native component persists across reload. |
 | `apply_movement_preset` | `asset_path`, `preset` | Apply a named `UCharacterMovementComponent` tuning preset (bulk CDO write of the movement-component defaults). |
 | `add_engine_component_typed` | `asset_path`, `component_class`, `component_name` | Add an engine-typed component to a Blueprint, resolving `component_class` from a path/name (the typed companion to `add_component`). |
 | `scaffold_locomotion_input` | `asset_path`, ... | Scaffold locomotion Enhanced Input wiring (input action / mapping references) on a character Blueprint. |
 | `validate_animbp_variable_contract` | `asset_path`, ... | Validate that a character Blueprint's Anim Blueprint exposes the variables the locomotion/motion-matching graph expects (the variable contract), reporting missing/mismatched entries. Read-only. |
-| `scaffold_motion_matching_character` | `asset_path`, ... | Composite: assemble a Motion-Matching-ready character Blueprint — anim class, movement preset, components, locomotion input, and the variable contract — in one call. |
+| `scaffold_motion_matching_character` | `asset_path`, ... | Composite: assemble a Motion-Matching-ready character Blueprint — anim class, movement preset, components, locomotion input, and the variable contract — in one call. The `mesh` option now writes the skeletal mesh via `SetSkeletalMeshAsset` with the structural-modify + compile persistence handshake. |
+| `get_inherited_component_override` | `bp_path`, `component`, `property_name` (opt) | READ-ONLY: report the effective value(s) of a component override on a child Blueprint, resolving the effective template (CDO subobject for inherited native, ICH for SCS-inherited), and classifying `source` (`cdo_native` / `ich` / `scs`). Default property set: AnimClass, SkeletalMesh, AnimationMode. |
 
 > **`EnhancedInput` dep (2026-06-07)** added to `MonolithBlueprint.Build.cs` for `scaffold_locomotion_input` (Enhanced Input action / mapping-context resolution).
 

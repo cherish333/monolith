@@ -38,4 +38,9 @@ public:
 
 	// 5.6 — COMPOSITE: create/reparent BP, set mesh, then call 5.1 + 5.2.
 	static FMonolithActionResult HandleScaffoldMotionMatchingCharacter(const TSharedPtr<FJsonObject>& Params);
+
+	// 5.7 — READ: report the effective value(s) of a component override on a child BP,
+	// resolving the effective template (CDO subobject for native, ICH for SCS-inherited),
+	// reading the requested property(ies) by reflection, and classifying the override source.
+	static FMonolithActionResult HandleGetInheritedComponentOverride(const TSharedPtr<FJsonObject>& Params);
 };

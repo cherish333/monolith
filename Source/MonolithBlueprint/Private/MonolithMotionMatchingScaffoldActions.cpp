@@ -9,9 +9,15 @@
 #include "MonolithParamSchema.h"
 #include "MonolithAssetUtils.h"
 #include "Engine/Blueprint.h"
+#include "Engine/BlueprintGeneratedClass.h"
+#include "Engine/InheritableComponentHandler.h"
+#include "Engine/SCS_Node.h"
+#include "Engine/SimpleConstructionScript.h"
 #include "Animation/AnimBlueprint.h"
 #include "Components/SkeletalMeshComponent.h"
+#include "Engine/SkeletalMesh.h"
 #include "Kismet2/BlueprintEditorUtils.h"
+#include "Kismet2/KismetEditorUtilities.h"
 #include "Editor.h"
 #include "EdGraph/EdGraph.h"
 #include "EdGraph/EdGraphNode.h"
@@ -99,6 +105,20 @@ void FMonolithMotionMatchingScaffoldActions::RegisterActions(FMonolithToolRegist
 			.RequiredAssetPath(TEXT("anim_bp_path"), TEXT("Animation Blueprint asset path"))
 			.OptionalAssetPath(TEXT("mesh"), TEXT("Skeletal mesh asset to assign to the mesh component (optional)"))
 			.Optional(TEXT("movement_preset"), TEXT("string"), TEXT("CMC preset (default 'orient_to_movement')"), TEXT("orient_to_movement"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("blueprint"), TEXT("get_inherited_component_override"),
+		TEXT("READ-ONLY: report the effective value(s) of a component override on a child Blueprint. "
+			 "Resolves the effective component template (CDO subobject for an inherited native component "
+			 "like a Character's mesh, or the Inheritable Component Handler override for an SCS-inherited "
+			 "component), reads the requested property (or a default set: AnimClass, SkeletalMesh, "
+			 "AnimationMode) by reflection, and reports 'source' (cdo_native / ich / scs). This is the "
+			 "verified read of what set_anim_class / set_mesh / set_component_property actually persisted."),
+		FMonolithActionHandler::CreateStatic(&HandleGetInheritedComponentOverride),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("bp_path"), TEXT("Child Blueprint asset path"))
+			.Required(TEXT("component"), TEXT("string"), TEXT("Component variable name or alias (e.g. 'Mesh' resolves to a Character's CharacterMesh0)"))
+			.Optional(TEXT("property_name"), TEXT("string"), TEXT("Single property to read; if omitted, a default set is reported (AnimClass, SkeletalMesh, AnimationMode)"))
 			.Build());
 }
 
@@ -300,6 +320,13 @@ FMonolithActionResult FMonolithMotionMatchingScaffoldActions::HandleSetAnimClass
 	// SetAnimClass setter where the template is a live instance; for a template subobject
 	// the direct field write + PostEditChange is the asset-time path mirrored by
 	// set_component_property's setter discipline.
+	//
+	// PERSISTENCE: the mesh component is an INHERITED NATIVE component (ACharacter's
+	// CharacterMesh0 has no SCS node, so no Inheritable Component Handler override exists).
+	// The write lands on the CDO subobject directly. MarkBlueprintAsModified alone does NOT
+	// re-serialise that CDO override — it silently reverts on the next reload/recompile.
+	// The CDO override only persists if the Blueprint is structurally modified AND recompiled.
+	BP->Modify();
 	SMC->Modify();
 	SMC->SetAnimInstanceClass(ABP->GeneratedClass);
 
@@ -310,7 +337,8 @@ FMonolithActionResult FMonolithMotionMatchingScaffoldActions::HandleSetAnimClass
 		SMC->PostEditChangeProperty(ChangeEvent);
 	}
 
-	FBlueprintEditorUtils::MarkBlueprintAsModified(BP);
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(BP);
+	FKismetEditorUtilities::CompileBlueprint(BP);
 	BP->MarkPackageDirty();
 
 	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
@@ -748,26 +776,45 @@ FMonolithActionResult FMonolithMotionMatchingScaffoldActions::HandleScaffoldMoti
 		}
 	}
 
-	// --- Optional: set the skeletal mesh — resolve the mesh component BY CLASS first so
-	//     we pass its REAL name (ACharacter's is "CharacterMesh0", not "Mesh") to the
-	//     shipped name-only set_component_property handler. ---
+	// --- Optional: set the skeletal mesh — resolve the mesh component BY CLASS, then write
+	//     the mesh asset DIRECTLY via SetSkeletalMeshAsset + the full persistence handshake.
+	//     The mesh component on a Character is an INHERITED NATIVE component (CharacterMesh0,
+	//     no SCS node), so the write lands on the CDO subobject. As with set_anim_class, that
+	//     override only persists if the Blueprint is structurally modified AND recompiled —
+	//     MarkBlueprintAsModified alone reverts it on reload. ---
 	if (!Mesh.IsEmpty())
 	{
 		UActorComponent* MeshComp = ResolveComponentOnBP(
 			BP, TEXT("Mesh"), USkeletalMeshComponent::StaticClass(),
 			{ TEXT("Mesh"), TEXT("SkeletalMesh") });
-		if (MeshComp)
+		USkeletalMeshComponent* MeshSMC = Cast<USkeletalMeshComponent>(MeshComp);
+		USkeletalMesh* MeshAsset = FMonolithAssetUtils::LoadAssetByPath<USkeletalMesh>(Mesh);
+		if (!MeshSMC)
 		{
-			TSharedRef<FJsonObject> MeshSub = MakeSub(BpPath);
-			MeshSub->SetStringField(TEXT("component_name"), MeshComp->GetName());
-			MeshSub->SetStringField(TEXT("property_name"), TEXT("SkeletalMesh"));
-			MeshSub->SetStringField(TEXT("value"), Mesh);
-			FMonolithActionResult MR = FMonolithBlueprintComponentActions::HandleSetComponentProperty(MeshSub);
-			NoteStep(TEXT("set_mesh"), MR.bSuccess, MR.bSuccess ? Mesh : MR.ErrorMessage);
+			NoteStep(TEXT("set_mesh"), false, TEXT("no skeletal mesh component found on BP"));
+		}
+		else if (!MeshAsset)
+		{
+			NoteStep(TEXT("set_mesh"), false, FString::Printf(TEXT("skeletal mesh asset not found: %s"), *Mesh));
 		}
 		else
 		{
-			NoteStep(TEXT("set_mesh"), false, TEXT("no skeletal mesh component found on BP"));
+			BP->Modify();
+			MeshSMC->Modify();
+			MeshSMC->SetSkeletalMeshAsset(MeshAsset);
+
+			// The persisted UPROPERTY is SkinnedAsset (SkeletalMeshAsset is Transient); notify
+			// the serialised property so the override is recorded against the CDO subobject.
+			if (FProperty* MeshProp = USkeletalMeshComponent::StaticClass()->FindPropertyByName(TEXT("SkinnedAsset")))
+			{
+				FPropertyChangedEvent ChangeEvent(MeshProp, EPropertyChangeType::ValueSet);
+				MeshSMC->PostEditChangeProperty(ChangeEvent);
+			}
+
+			FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(BP);
+			FKismetEditorUtilities::CompileBlueprint(BP);
+			BP->MarkPackageDirty();
+			NoteStep(TEXT("set_mesh"), true, Mesh);
 		}
 	}
 
@@ -817,5 +864,128 @@ FMonolithActionResult FMonolithMotionMatchingScaffoldActions::HandleScaffoldMoti
 	if (!Mesh.IsEmpty()) Root->SetStringField(TEXT("mesh"), Mesh);
 	Root->SetArrayField(TEXT("steps"), Steps);
 	Root->SetBoolField(TEXT("success"), true);
+	return FMonolithActionResult::Success(Root);
+}
+
+// ---------------------------------------------------------------------------
+// 5.7 — get_inherited_component_override (READ-ONLY)
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithMotionMatchingScaffoldActions::HandleGetInheritedComponentOverride(const TSharedPtr<FJsonObject>& Params)
+{
+	const FString BpPath = Params->GetStringField(TEXT("bp_path"));
+	const FString CompName = Params->GetStringField(TEXT("component"));
+	FString SingleProp;
+	Params->TryGetStringField(TEXT("property_name"), SingleProp);
+
+	if (BpPath.IsEmpty())   return FMonolithActionResult::Error(TEXT("Missing required parameter: bp_path"));
+	if (CompName.IsEmpty()) return FMonolithActionResult::Error(TEXT("Missing required parameter: component"));
+
+	UBlueprint* BP = FMonolithAssetUtils::LoadAssetByPath<UBlueprint>(BpPath);
+	if (!BP)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Blueprint not found: %s"), *BpPath));
+	}
+
+	// Resolve the EFFECTIVE component template. ResolveComponentOnBP returns the SCS
+	// template when the component is author-declared on this BP, otherwise the component
+	// on the CDO (which reflects native defaults + any ICH override + inherited values).
+	UActorComponent* Comp = ResolveComponentOnBP(
+		BP, CompName, UActorComponent::StaticClass(),
+		{ TEXT("Mesh"), TEXT("SkeletalMesh") });
+	if (!Comp)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Component '%s' not found on '%s'"), *CompName, *BpPath));
+	}
+
+	// Classify the override source.
+	//   scs        — declared as an SCS node on THIS Blueprint.
+	//   ich        — SCS-inherited from a parent BP with an Inheritable Component Handler override.
+	//   cdo_native — inherited native component (no SCS node anywhere); value read off the CDO.
+	FString SourceClass = TEXT("cdo_native");
+	{
+		bool bIsThisBpScs = false;
+		if (BP->SimpleConstructionScript)
+		{
+			for (USCS_Node* Node : BP->SimpleConstructionScript->GetAllNodes())
+			{
+				if (Node && (Node->GetVariableName() == Comp->GetFName() ||
+					(Node->ComponentTemplate && Node->ComponentTemplate->GetName().Equals(Comp->GetName(), ESearchCase::IgnoreCase))))
+				{
+					bIsThisBpScs = true;
+					break;
+				}
+			}
+		}
+
+		if (bIsThisBpScs)
+		{
+			SourceClass = TEXT("scs");
+		}
+		else if (UBlueprintGeneratedClass* BPGC = Cast<UBlueprintGeneratedClass>(BP->GeneratedClass))
+		{
+			// An SCS-inherited component (declared on a parent BP) carries its override on
+			// this BP's Inheritable Component Handler. If an ICH exists and holds an override
+			// template matching this component's name, classify as 'ich'; otherwise the value
+			// is the plain inherited/native default read off the CDO.
+			if (UInheritableComponentHandler* ICH = BPGC->GetInheritableComponentHandler(/*bCreateIfNecessary=*/false))
+			{
+				for (auto RecordIt = ICH->CreateRecordIterator(); RecordIt; ++RecordIt)
+				{
+					if (RecordIt->ComponentTemplate &&
+						RecordIt->ComponentTemplate->GetName().Equals(Comp->GetName(), ESearchCase::IgnoreCase))
+					{
+						SourceClass = TEXT("ich");
+						break;
+					}
+				}
+			}
+		}
+	}
+
+	// Build the property list to read.
+	TArray<FString> PropsToRead;
+	if (!SingleProp.IsEmpty())
+	{
+		PropsToRead.Add(SingleProp);
+	}
+	else
+	{
+		PropsToRead.Add(TEXT("AnimClass"));
+		PropsToRead.Add(TEXT("SkeletalMesh"));
+		PropsToRead.Add(TEXT("AnimationMode"));
+	}
+
+	TSharedPtr<FJsonObject> PropsObj = MakeShared<FJsonObject>();
+	for (const FString& PName : PropsToRead)
+	{
+		FProperty* Prop = Comp->GetClass()->FindPropertyByName(FName(*PName));
+		if (!Prop)
+		{
+			for (TFieldIterator<FProperty> It(Comp->GetClass()); It; ++It)
+			{
+				if (It->GetName().Equals(PName, ESearchCase::IgnoreCase)) { Prop = *It; break; }
+			}
+		}
+		if (!Prop)
+		{
+			// Property not present on this component class — report as not-applicable.
+			PropsObj->SetStringField(PName, TEXT("<property not found on component>"));
+			continue;
+		}
+		const void* ValuePtr = Prop->ContainerPtrToValuePtr<void>(Comp);
+		FString Exported;
+		Prop->ExportText_Direct(Exported, ValuePtr, ValuePtr, const_cast<UActorComponent*>(Comp), PPF_None);
+		PropsObj->SetStringField(Prop->GetName(), Exported);
+	}
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("bp_path"), BpPath);
+	Root->SetStringField(TEXT("component"), CompName);
+	Root->SetStringField(TEXT("resolved_component"), Comp->GetName());
+	Root->SetStringField(TEXT("component_class"), Comp->GetClass()->GetName());
+	Root->SetStringField(TEXT("source"), SourceClass);
+	Root->SetObjectField(TEXT("properties"), PropsObj);
 	return FMonolithActionResult::Success(Root);
 }

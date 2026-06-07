@@ -15,6 +15,7 @@
 #include "AnimGraphNode_LayeredBoneBlend.h"
 #include "AnimGraphNode_StateMachine.h"
 #include "AnimGraphNode_StateResult.h"
+#include "AnimGraphNode_Root.h"
 #include "AnimGraphNode_TwoBoneIK.h"
 #include "AnimGraphNode_ModifyBone.h"
 #include "AnimGraphNode_LocalToComponentSpace.h"
@@ -174,6 +175,16 @@ void FMonolithAbpWriteActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.RequiredAssetPath(TEXT("abp_path"), TEXT("Animation Blueprint asset path"))
 			.RequiredAssetPath(TEXT("database_path"), TEXT("UPoseSearchDatabase asset path assigned to the MM node's Database"))
 			.Optional(TEXT("chooser_path"), TEXT("string"), TEXT("Optional UChooserTable asset path for chooser-driven database selection (best-effort; Database is always set as fallback)"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("animation"), TEXT("get_anim_graph_output_connection"),
+		TEXT("READ-ONLY: report whether the AnimGraph's Output Pose (UAnimGraphNode_Root 'Result' input) "
+			 "is driven, and by which node/pin. Verifies the graph actually produces a final pose — the "
+			 "check that would have caught an unwired Motion Matching graph."),
+		FMonolithActionHandler::CreateStatic(&FMonolithAbpWriteActions::HandleGetAnimGraphOutputConnection),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("abp_path"), TEXT("Animation Blueprint asset path"))
+			.Optional(TEXT("graph_name"), TEXT("string"), TEXT("Graph to inspect (default the main AnimGraph)"), TEXT("AnimGraph"))
 			.Build());
 }
 
@@ -1832,6 +1843,49 @@ FMonolithActionResult FMonolithAbpWriteActions::HandleBuildMotionMatchingNode(co
 		HandleConfigureMotionMatchingNode(MMCfg);
 	}
 
+	// --- Wire History pose-out -> Output Pose (UAnimGraphNode_Root 'Result' input) ---
+	// Without this the graph has no final pose driving the output, so the AnimBP plays
+	// nothing. Resolve the main AnimGraph, find its Root node, and connect the History
+	// node's 'Pose' output to the Root's 'Result' input via the same connect internals.
+	bool bOutputPoseWired = false;
+	FString OutputWireNote;
+	{
+		FString RootGraphError;
+		UEdGraph* RootGraph = ResolveTargetGraph(ABP2, TEXT("AnimGraph"), TEXT(""), RootGraphError);
+		UAnimGraphNode_Root* RootNode = nullptr;
+		if (RootGraph)
+		{
+			TArray<UAnimGraphNode_Root*> Roots;
+			RootGraph->GetNodesOfClass<UAnimGraphNode_Root>(Roots);
+			if (Roots.Num() > 0)
+			{
+				RootNode = Roots[0];
+			}
+		}
+
+		if (!RootNode)
+		{
+			OutputWireNote = RootGraph
+				? TEXT("Output Pose (UAnimGraphNode_Root) not found in AnimGraph")
+				: RootGraphError;
+		}
+		else
+		{
+			TSharedPtr<FJsonObject> RootConn = MakeShared<FJsonObject>();
+			RootConn->SetStringField(TEXT("asset_path"), AbpPath);
+			RootConn->SetStringField(TEXT("source_node"), HistNodeName);
+			RootConn->SetStringField(TEXT("source_pin"), TEXT("Pose"));
+			RootConn->SetStringField(TEXT("target_node"), RootNode->GetName());
+			RootConn->SetStringField(TEXT("target_pin"), TEXT("Result"));
+			RootConn->SetBoolField(TEXT("compile"), false);
+			FMonolithActionResult RootConnResult = HandleConnectAnimGraphPins(RootConn);
+			bOutputPoseWired = RootConnResult.bSuccess;
+			OutputWireNote = bOutputPoseWired
+				? TEXT("connected")
+				: (RootConnResult.ErrorMessage.IsEmpty() ? TEXT("not connected") : RootConnResult.ErrorMessage);
+		}
+	}
+
 	MMAnim->ReconstructNode();
 	ABP2->MarkPackageDirty();
 	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(ABP2);
@@ -1844,7 +1898,65 @@ FMonolithActionResult FMonolithAbpWriteActions::HandleBuildMotionMatchingNode(co
 	Root->SetStringField(TEXT("database"), DatabasePath);
 	Root->SetBoolField(TEXT("wired"), bWired);
 	Root->SetStringField(TEXT("wire_note"), WireNote);
+	Root->SetBoolField(TEXT("output_pose_wired"), bOutputPoseWired);
+	Root->SetStringField(TEXT("output_pose_wire_note"), OutputWireNote);
 	if (bChooserNoted) Root->SetStringField(TEXT("chooser_path"), ChooserPath);
 	Root->SetBoolField(TEXT("compiled"), true);
+	return FMonolithActionResult::Success(Root);
+}
+
+// ---------------------------------------------------------------------------
+// Action: get_anim_graph_output_connection (READ-ONLY)
+// Find the UAnimGraphNode_Root and report whether its 'Result' input pose pin is
+// linked, and by which node/pin. Confirms the graph drives the final output pose.
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithAbpWriteActions::HandleGetAnimGraphOutputConnection(const TSharedPtr<FJsonObject>& Params)
+{
+	const FString AbpPath = Params->GetStringField(TEXT("abp_path"));
+	FString GraphName = Params->HasField(TEXT("graph_name")) ? Params->GetStringField(TEXT("graph_name")) : TEXT("AnimGraph");
+	if (GraphName.IsEmpty()) GraphName = TEXT("AnimGraph");
+
+	if (AbpPath.IsEmpty()) return FMonolithActionResult::Error(TEXT("Missing required parameter: abp_path"));
+
+	UAnimBlueprint* ABP = FMonolithAssetUtils::LoadAssetByPath<UAnimBlueprint>(AbpPath);
+	if (!ABP) return FMonolithActionResult::Error(FString::Printf(TEXT("AnimBlueprint not found: %s"), *AbpPath));
+
+	FString GraphError;
+	UEdGraph* Graph = ResolveTargetGraph(ABP, GraphName, TEXT(""), GraphError);
+	if (!Graph) return FMonolithActionResult::Error(GraphError);
+
+	TArray<UAnimGraphNode_Root*> Roots;
+	Graph->GetNodesOfClass<UAnimGraphNode_Root>(Roots);
+	if (Roots.Num() == 0)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("No Output Pose (UAnimGraphNode_Root) found in graph '%s'"), *GraphName));
+	}
+
+	UAnimGraphNode_Root* RootNode = Roots[0];
+	UEdGraphPin* ResultPin = RootNode->FindPin(FName(TEXT("Result")), EGPD_Input);
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("abp_path"), AbpPath);
+	Root->SetStringField(TEXT("graph_name"), GraphName);
+	Root->SetStringField(TEXT("root_node"), RootNode->GetName());
+
+	if (!ResultPin)
+	{
+		Root->SetBoolField(TEXT("output_connected"), false);
+		Root->SetStringField(TEXT("note"), TEXT("Output Pose node has no 'Result' input pin"));
+		return FMonolithActionResult::Success(Root);
+	}
+
+	const bool bConnected = ResultPin->LinkedTo.Num() > 0;
+	Root->SetBoolField(TEXT("output_connected"), bConnected);
+	if (bConnected)
+	{
+		UEdGraphPin* SrcPin = ResultPin->LinkedTo[0];
+		UEdGraphNode* SrcNode = SrcPin ? SrcPin->GetOwningNodeUnchecked() : nullptr;
+		Root->SetStringField(TEXT("source_node"), SrcNode ? SrcNode->GetName() : FString(TEXT("<unknown>")));
+		Root->SetStringField(TEXT("source_pin"), SrcPin ? SrcPin->PinName.ToString() : FString(TEXT("<unknown>")));
+	}
 	return FMonolithActionResult::Success(Root);
 }

@@ -183,7 +183,8 @@ Wraps `USkeleton::CompatibleSkeletons` — the canonical UE5 mechanism that lets
 | `validate_pose_search_database` | Validate a PoseSearch database (schema/entry/normalization consistency + build state). |
 | `configure_pose_history_node` | Configure a Pose-History anim-graph node (`UAnimGraphNode_PoseHistory`) in an ABP. |
 | `configure_motion_matching_node` | Configure a Motion-Matching anim-graph node (database, schema, settings) in an ABP. |
-| `build_motion_matching_node` | Composite: spawn + wire + configure a Motion-Matching node (with its Pose-History) in one call. |
+| `build_motion_matching_node` | Composite: spawn + wire + configure a Motion-Matching node (with its Pose-History) in one call. As of 2026-06-07 also wires the Pose-History pose-out to the AnimGraph Output Pose (`UAnimGraphNode_Root` 'Result' input) and reports `output_pose_wired`. |
+| `get_anim_graph_output_connection` | READ-ONLY: report whether the AnimGraph's Output Pose (`UAnimGraphNode_Root` 'Result' input) is driven, and by which `source_node`/`source_pin`. Optional `graph_name` (default the main AnimGraph). |
 
 **ABP Write (5) — v0.14.3 PR #34 by @MaxenceEpitech**
 | Action | Description |

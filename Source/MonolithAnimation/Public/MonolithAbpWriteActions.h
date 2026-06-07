@@ -25,4 +25,8 @@ private:
 	static FMonolithActionResult HandleConfigurePoseHistoryNode(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleConfigureMotionMatchingNode(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleBuildMotionMatchingNode(const TSharedPtr<FJsonObject>& Params);
+
+	// READ-ONLY — report whether the AnimGraph's Output Pose (UAnimGraphNode_Root 'Result'
+	// input) is driven, and by which node/pin. Verifies the graph actually produces a pose.
+	static FMonolithActionResult HandleGetAnimGraphOutputConnection(const TSharedPtr<FJsonObject>& Params);
 };
