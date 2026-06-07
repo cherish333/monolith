@@ -167,6 +167,16 @@ public:
 	static FMonolithActionResult HandleRemoveRetargetChain(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleSetRetargetChainBones(const TSharedPtr<FJsonObject>& Params);
 
+	// --- Retarget CREATE/RUN pack (4) ---
+	// Creates the IK Rig + IK Retargeter assets and runs a cross-skeleton batch
+	// retarget. Complements the existing IK Rig / retargeter MUTATION actions
+	// (get_ikrig_info, add_ik_solver, get_retargeter_info, set_retarget_chain_mapping,
+	// add/remove/set_retarget_chain*) which only operate on assets that already exist.
+	static FMonolithActionResult HandleCreateIKRig(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleCreateIKRetargeter(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleSetRetargeterRigs(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleBatchRetargetAnimations(const TSharedPtr<FJsonObject>& Params);
+
 	// --- Wave 11: Asset Creation + Setup (7 in this file) ---
 	static FMonolithActionResult HandleCreateBlendSpace(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleCreateBlendSpace1D(const TSharedPtr<FJsonObject>& Params);

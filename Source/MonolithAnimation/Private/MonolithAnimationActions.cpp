@@ -42,6 +42,8 @@
 #include "Retargeter/IKRetargeter.h"
 #include "Retargeter/IKRetargetChainMapping.h"
 #include "RetargetEditor/IKRetargeterController.h"
+#include "RetargetEditor/IKRetargetBatchOperation.h" // batch_retarget_animations — RunRetarget + FIKRetargetBatchOperationContext
+#include "EditorAnimUtils.h"                          // EditorAnimUtils::FNameDuplicationRule (output folder + rename rule)
 #include "ControlRigBlueprintLegacy.h"
 #include "Rigs/RigHierarchy.h"
 #include "Rigs/RigHierarchyElements.h"
@@ -1104,6 +1106,50 @@ void FMonolithAnimationActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Optional(TEXT("end_bone"), TEXT("string"), TEXT("New end bone name"))
 			.Optional(TEXT("goal_name"), TEXT("string"), TEXT("New goal name"))
 			.Optional(TEXT("new_name"), TEXT("string"), TEXT("Rename the chain"))
+			.Build());
+
+	// --- Retarget CREATE/RUN pack (gap only) ---
+	Registry.RegisterAction(TEXT("animation"), TEXT("create_ik_rig"),
+		TEXT("Create a new IK Rig asset that previews a given skeletal mesh. The mesh's skeleton is loaded into the IK Rig (use add_ik_solver / add_retarget_chain to populate it)."),
+		FMonolithActionHandler::CreateStatic(&HandleCreateIKRig),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Destination IK Rig asset path (e.g. /Game/Path/IK_MyRig)"))
+			.Required(TEXT("skeletal_mesh_path"), TEXT("string"), TEXT("Skeletal mesh the IK Rig previews; its skeleton is loaded into the rig"))
+			.Optional(TEXT("pelvis_bone"), TEXT("string"), TEXT("Retarget root bone (pelvis). Set after the mesh is assigned."))
+			.Build());
+	Registry.RegisterAction(TEXT("animation"), TEXT("create_ik_retargeter"),
+		TEXT("Create a new IK Retargeter asset. Optionally assign source/target IK Rigs here, or later via set_retargeter_rigs."),
+		FMonolithActionHandler::CreateStatic(&HandleCreateIKRetargeter),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Destination IK Retargeter asset path (e.g. /Game/Path/RTG_MyRetarget)"))
+			.Optional(TEXT("source_ik_rig_path"), TEXT("string"), TEXT("Source IK Rig asset path"))
+			.Optional(TEXT("target_ik_rig_path"), TEXT("string"), TEXT("Target IK Rig asset path"))
+			.Build());
+	Registry.RegisterAction(TEXT("animation"), TEXT("set_retargeter_rigs"),
+		TEXT("Set the source and target IK Rigs (and optional preview meshes) on an existing IK Retargeter."),
+		FMonolithActionHandler::CreateStatic(&HandleSetRetargeterRigs),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("IK Retargeter asset path"))
+			.Required(TEXT("source_ik_rig_path"), TEXT("string"), TEXT("Source IK Rig asset path"))
+			.Required(TEXT("target_ik_rig_path"), TEXT("string"), TEXT("Target IK Rig asset path"))
+			.Optional(TEXT("source_preview_mesh"), TEXT("string"), TEXT("Source preview skeletal mesh path"))
+			.Optional(TEXT("target_preview_mesh"), TEXT("string"), TEXT("Target preview skeletal mesh path"))
+			.Build());
+	Registry.RegisterAction(TEXT("animation"), TEXT("batch_retarget_animations"),
+		TEXT("Duplicate and retarget a list of animation assets cross-skeleton using an IK Retargeter. Outputs new clips bound to the target skeleton into output_folder."),
+		FMonolithActionHandler::CreateStatic(&HandleBatchRetargetAnimations),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("retargeter_path"), TEXT("IK Retargeter asset path"))
+			.Required(TEXT("source_anims"), TEXT("array"), TEXT("Array of source animation asset paths to retarget"))
+			.Required(TEXT("output_folder"), TEXT("string"), TEXT("Destination folder for retargeted clips (e.g. /Game/Path/Retargeted)"))
+			.Optional(TEXT("source_mesh"), TEXT("string"), TEXT("Source skeletal mesh (defaults to the retargeter's source preview mesh)"))
+			.Optional(TEXT("target_mesh"), TEXT("string"), TEXT("Target skeletal mesh (defaults to the retargeter's target preview mesh)"))
+			.Optional(TEXT("name_prefix"), TEXT("string"), TEXT("Prefix added to each output asset name"))
+			.Optional(TEXT("name_suffix"), TEXT("string"), TEXT("Suffix added to each output asset name"))
+			.Optional(TEXT("search"), TEXT("string"), TEXT("Substring to search for in source names (replaced with 'replace')"))
+			.Optional(TEXT("replace"), TEXT("string"), TEXT("Replacement for the 'search' substring"))
+			.Optional(TEXT("include_referenced"), TEXT("bool"), TEXT("Also retarget assets referenced by the inputs (default: false)"), TEXT("false"))
+			.Optional(TEXT("overwrite"), TEXT("bool"), TEXT("Overwrite existing output files instead of creating uniquely-named copies (default: false)"), TEXT("false"))
 			.Build());
 
 }
@@ -8983,6 +9029,333 @@ FMonolithActionResult FMonolithAnimationActions::HandleSetRetargetChainBones(con
 		ModArr.Add(MakeShared<FJsonValueString>(P));
 	}
 	Root->SetArrayField(TEXT("modified"), ModArr);
+	return FMonolithActionResult::Success(Root);
+}
+
+// ---------------------------------------------------------------------------
+// Retarget CREATE/RUN pack — create_ik_rig, create_ik_retargeter,
+// set_retargeter_rigs, batch_retarget_animations.
+//
+// These four fill the only gap left by the shipped IK Rig / retargeter MUTATION
+// actions: the ABILITY TO CREATE the assets and to run a cross-skeleton batch
+// retarget. The mutation actions (add_ik_solver / add_retarget_chain /
+// set_retarget_chain_mapping / ...) all require the asset to already exist.
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithAnimationActions::HandleCreateIKRig(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	FString MeshPath = Params->GetStringField(TEXT("skeletal_mesh_path"));
+
+	USkeletalMesh* Mesh = FMonolithAssetUtils::LoadAssetByPath<USkeletalMesh>(MeshPath);
+	if (!Mesh) return FMonolithActionResult::Error(FString::Printf(TEXT("Skeletal mesh not found: %s"), *MeshPath));
+
+	// Extract asset name from path
+	int32 LastSlash;
+	if (!AssetPath.FindLastChar('/', LastSlash) || LastSlash == AssetPath.Len() - 1)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Invalid asset path: %s"), *AssetPath));
+	}
+	const FString AssetName = AssetPath.Mid(LastSlash + 1);
+
+	if (FMonolithAssetUtils::LoadAssetByPath<UObject>(AssetPath))
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Asset already exists at '%s'"), *AssetPath));
+	}
+
+	UPackage* Pkg = CreatePackage(*AssetPath);
+	if (!Pkg) return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to create package at '%s'"), *AssetPath));
+
+	UIKRigDefinition* Rig = NewObject<UIKRigDefinition>(Pkg, FName(*AssetName), RF_Public | RF_Standalone | RF_Transactional);
+	if (!Rig) return FMonolithActionResult::Error(TEXT("Failed to create UIKRigDefinition object"));
+
+	UIKRigController* C = UIKRigController::GetController(Rig);
+	if (!C) return FMonolithActionResult::Error(TEXT("Failed to get IKRigController for new rig"));
+
+	// Loads the mesh's skeleton into the rig's IKRigSkeleton.
+	const bool bMeshSet = C->SetSkeletalMesh(Mesh);
+	if (!bMeshSet)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("SetSkeletalMesh failed — mesh '%s' incompatible with IK Rig"), *MeshPath));
+	}
+
+	// Optional retarget root (pelvis) — must be set after the skeleton is loaded.
+	bool bPelvisSet = false;
+	FString PelvisBone;
+	if (Params->TryGetStringField(TEXT("pelvis_bone"), PelvisBone) && !PelvisBone.IsEmpty())
+	{
+		bPelvisSet = C->SetRetargetRoot(FName(*PelvisBone));
+	}
+
+	FAssetRegistryModule::AssetCreated(Rig);
+	Pkg->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), Rig->GetPathName());
+	Root->SetStringField(TEXT("asset_name"), AssetName);
+	Root->SetStringField(TEXT("preview_mesh"), Mesh->GetPathName());
+	Root->SetNumberField(TEXT("bone_count"), C->GetIKRigSkeleton().BoneNames.Num());
+	if (!PelvisBone.IsEmpty())
+	{
+		Root->SetBoolField(TEXT("pelvis_set"), bPelvisSet);
+		Root->SetStringField(TEXT("pelvis_bone"), C->GetRetargetRoot().ToString());
+	}
+	return FMonolithActionResult::Success(Root);
+}
+
+FMonolithActionResult FMonolithAnimationActions::HandleCreateIKRetargeter(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+
+	int32 LastSlash;
+	if (!AssetPath.FindLastChar('/', LastSlash) || LastSlash == AssetPath.Len() - 1)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Invalid asset path: %s"), *AssetPath));
+	}
+	const FString AssetName = AssetPath.Mid(LastSlash + 1);
+
+	if (FMonolithAssetUtils::LoadAssetByPath<UObject>(AssetPath))
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Asset already exists at '%s'"), *AssetPath));
+	}
+
+	UPackage* Pkg = CreatePackage(*AssetPath);
+	if (!Pkg) return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to create package at '%s'"), *AssetPath));
+
+	UIKRetargeter* Retargeter = NewObject<UIKRetargeter>(Pkg, FName(*AssetName), RF_Public | RF_Standalone | RF_Transactional);
+	if (!Retargeter) return FMonolithActionResult::Error(TEXT("Failed to create UIKRetargeter object"));
+
+	UIKRetargeterController* C = UIKRetargeterController::GetController(Retargeter);
+	if (!C) return FMonolithActionResult::Error(TEXT("Failed to get UIKRetargeterController for new retargeter"));
+
+	// Optional source/target rigs assigned at creation.
+	FString SourceRigPath, TargetRigPath;
+	bool bSourceSet = false, bTargetSet = false;
+	if (Params->TryGetStringField(TEXT("source_ik_rig_path"), SourceRigPath) && !SourceRigPath.IsEmpty())
+	{
+		UIKRigDefinition* SourceRig = FMonolithAssetUtils::LoadAssetByPath<UIKRigDefinition>(SourceRigPath);
+		if (!SourceRig) return FMonolithActionResult::Error(FString::Printf(TEXT("Source IK Rig not found: %s"), *SourceRigPath));
+		C->SetIKRig(ERetargetSourceOrTarget::Source, SourceRig);
+		bSourceSet = true;
+	}
+	if (Params->TryGetStringField(TEXT("target_ik_rig_path"), TargetRigPath) && !TargetRigPath.IsEmpty())
+	{
+		UIKRigDefinition* TargetRig = FMonolithAssetUtils::LoadAssetByPath<UIKRigDefinition>(TargetRigPath);
+		if (!TargetRig) return FMonolithActionResult::Error(FString::Printf(TEXT("Target IK Rig not found: %s"), *TargetRigPath));
+		C->SetIKRig(ERetargetSourceOrTarget::Target, TargetRig);
+		bTargetSet = true;
+	}
+
+	FAssetRegistryModule::AssetCreated(Retargeter);
+	Pkg->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), Retargeter->GetPathName());
+	Root->SetStringField(TEXT("asset_name"), AssetName);
+	Root->SetBoolField(TEXT("source_rig_set"), bSourceSet);
+	Root->SetBoolField(TEXT("target_rig_set"), bTargetSet);
+	return FMonolithActionResult::Success(Root);
+}
+
+FMonolithActionResult FMonolithAnimationActions::HandleSetRetargeterRigs(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	FString SourceRigPath = Params->GetStringField(TEXT("source_ik_rig_path"));
+	FString TargetRigPath = Params->GetStringField(TEXT("target_ik_rig_path"));
+
+	UIKRetargeter* Retargeter = FMonolithAssetUtils::LoadAssetByPath<UIKRetargeter>(AssetPath);
+	if (!Retargeter) return FMonolithActionResult::Error(FString::Printf(TEXT("IKRetargeter not found: %s"), *AssetPath));
+
+	UIKRetargeterController* C = UIKRetargeterController::GetController(Retargeter);
+	if (!C) return FMonolithActionResult::Error(TEXT("Failed to get UIKRetargeterController"));
+
+	UIKRigDefinition* SourceRig = FMonolithAssetUtils::LoadAssetByPath<UIKRigDefinition>(SourceRigPath);
+	if (!SourceRig) return FMonolithActionResult::Error(FString::Printf(TEXT("Source IK Rig not found: %s"), *SourceRigPath));
+	UIKRigDefinition* TargetRig = FMonolithAssetUtils::LoadAssetByPath<UIKRigDefinition>(TargetRigPath);
+	if (!TargetRig) return FMonolithActionResult::Error(FString::Printf(TEXT("Target IK Rig not found: %s"), *TargetRigPath));
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("Set Retargeter Rigs")));
+	Retargeter->Modify();
+
+	C->SetIKRig(ERetargetSourceOrTarget::Source, SourceRig);
+	C->SetIKRig(ERetargetSourceOrTarget::Target, TargetRig);
+
+	// Optional preview meshes.
+	bool bSourceMeshSet = false, bTargetMeshSet = false;
+	FString SourceMeshPath, TargetMeshPath;
+	if (Params->TryGetStringField(TEXT("source_preview_mesh"), SourceMeshPath) && !SourceMeshPath.IsEmpty())
+	{
+		USkeletalMesh* SourceMesh = FMonolithAssetUtils::LoadAssetByPath<USkeletalMesh>(SourceMeshPath);
+		if (!SourceMesh)
+		{
+			GEditor->EndTransaction();
+			return FMonolithActionResult::Error(FString::Printf(TEXT("Source preview mesh not found: %s"), *SourceMeshPath));
+		}
+		C->SetPreviewMesh(ERetargetSourceOrTarget::Source, SourceMesh);
+		bSourceMeshSet = true;
+	}
+	if (Params->TryGetStringField(TEXT("target_preview_mesh"), TargetMeshPath) && !TargetMeshPath.IsEmpty())
+	{
+		USkeletalMesh* TargetMesh = FMonolithAssetUtils::LoadAssetByPath<USkeletalMesh>(TargetMeshPath);
+		if (!TargetMesh)
+		{
+			GEditor->EndTransaction();
+			return FMonolithActionResult::Error(FString::Printf(TEXT("Target preview mesh not found: %s"), *TargetMeshPath));
+		}
+		C->SetPreviewMesh(ERetargetSourceOrTarget::Target, TargetMesh);
+		bTargetMeshSet = true;
+	}
+
+	GEditor->EndTransaction();
+	Retargeter->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetStringField(TEXT("source_rig"), SourceRig->GetPathName());
+	Root->SetStringField(TEXT("target_rig"), TargetRig->GetPathName());
+	Root->SetBoolField(TEXT("source_preview_mesh_set"), bSourceMeshSet);
+	Root->SetBoolField(TEXT("target_preview_mesh_set"), bTargetMeshSet);
+	return FMonolithActionResult::Success(Root);
+}
+
+FMonolithActionResult FMonolithAnimationActions::HandleBatchRetargetAnimations(const TSharedPtr<FJsonObject>& Params)
+{
+	FString RetargeterPath = Params->GetStringField(TEXT("retargeter_path"));
+	FString OutputFolder = Params->GetStringField(TEXT("output_folder"));
+
+	UIKRetargeter* Retargeter = FMonolithAssetUtils::LoadAssetByPath<UIKRetargeter>(RetargeterPath);
+	if (!Retargeter) return FMonolithActionResult::Error(FString::Printf(TEXT("IKRetargeter not found: %s"), *RetargeterPath));
+
+	UIKRetargeterController* C = UIKRetargeterController::GetController(Retargeter);
+	if (!C) return FMonolithActionResult::Error(TEXT("Failed to get UIKRetargeterController"));
+
+	// Resolve source/target meshes — explicit param wins, else fall back to the
+	// retargeter's configured preview meshes.
+	USkeletalMesh* SourceMesh = nullptr;
+	USkeletalMesh* TargetMesh = nullptr;
+	FString SourceMeshPath, TargetMeshPath;
+	if (Params->TryGetStringField(TEXT("source_mesh"), SourceMeshPath) && !SourceMeshPath.IsEmpty())
+	{
+		SourceMesh = FMonolithAssetUtils::LoadAssetByPath<USkeletalMesh>(SourceMeshPath);
+		if (!SourceMesh) return FMonolithActionResult::Error(FString::Printf(TEXT("Source mesh not found: %s"), *SourceMeshPath));
+	}
+	else
+	{
+		SourceMesh = C->GetPreviewMesh(ERetargetSourceOrTarget::Source);
+	}
+	if (Params->TryGetStringField(TEXT("target_mesh"), TargetMeshPath) && !TargetMeshPath.IsEmpty())
+	{
+		TargetMesh = FMonolithAssetUtils::LoadAssetByPath<USkeletalMesh>(TargetMeshPath);
+		if (!TargetMesh) return FMonolithActionResult::Error(FString::Printf(TEXT("Target mesh not found: %s"), *TargetMeshPath));
+	}
+	else
+	{
+		TargetMesh = C->GetPreviewMesh(ERetargetSourceOrTarget::Target);
+	}
+
+	if (!SourceMesh) return FMonolithActionResult::Error(TEXT("No source mesh — pass 'source_mesh' or set the retargeter's source preview mesh"));
+	if (!TargetMesh) return FMonolithActionResult::Error(TEXT("No target mesh — pass 'target_mesh' or set the retargeter's target preview mesh"));
+	if (SourceMesh == TargetMesh) return FMonolithActionResult::Error(TEXT("Source and target meshes must differ"));
+
+	// Collect source animation assets.
+	const TArray<TSharedPtr<FJsonValue>>* AnimsArray = nullptr;
+	if (!Params->TryGetArrayField(TEXT("source_anims"), AnimsArray) || !AnimsArray || AnimsArray->Num() == 0)
+	{
+		return FMonolithActionResult::Error(TEXT("'source_anims' must be a non-empty array of animation asset paths"));
+	}
+
+	TArray<TWeakObjectPtr<UObject>> AssetsToRetarget;
+	TArray<FString> ResolvedSources;
+	TArray<FString> SkippedSources;
+	for (const TSharedPtr<FJsonValue>& Val : *AnimsArray)
+	{
+		FString AnimPath;
+		if (!Val.IsValid() || !Val->TryGetString(AnimPath) || AnimPath.IsEmpty()) continue;
+		UAnimationAsset* Anim = FMonolithAssetUtils::LoadAssetByPath<UAnimationAsset>(AnimPath);
+		if (!Anim)
+		{
+			SkippedSources.Add(AnimPath);
+			continue;
+		}
+		AssetsToRetarget.Add(Anim);
+		ResolvedSources.Add(Anim->GetPathName());
+	}
+
+	if (AssetsToRetarget.Num() == 0)
+	{
+		return FMonolithActionResult::Error(TEXT("No valid animation assets resolved from 'source_anims'"));
+	}
+
+	// Build the batch context. NameRule.FolderPath is the output folder.
+	FIKRetargetBatchOperationContext Context;
+	Context.AssetsToRetarget = AssetsToRetarget;
+	Context.SourceMesh = SourceMesh;
+	Context.TargetMesh = TargetMesh;
+	Context.IKRetargetAsset = Retargeter;
+	Context.bIncludeReferencedAssets = false;
+	Context.bOverwriteExistingFiles = false;
+
+	Params->TryGetStringField(TEXT("name_prefix"), Context.NameRule.Prefix);
+	Params->TryGetStringField(TEXT("name_suffix"), Context.NameRule.Suffix);
+	Params->TryGetStringField(TEXT("search"), Context.NameRule.ReplaceFrom);
+	Params->TryGetStringField(TEXT("replace"), Context.NameRule.ReplaceTo);
+	Context.NameRule.FolderPath = OutputFolder;
+
+	bool bIncludeRef = false;
+	if (Params->TryGetBoolField(TEXT("include_referenced"), bIncludeRef)) Context.bIncludeReferencedAssets = bIncludeRef;
+	bool bOverwrite = false;
+	if (Params->TryGetBoolField(TEXT("overwrite"), bOverwrite)) Context.bOverwriteExistingFiles = bOverwrite;
+
+	if (!Context.IsValid())
+	{
+		return FMonolithActionResult::Error(TEXT("Batch context invalid — check source/target meshes and retargeter"));
+	}
+
+	// Compute the expected output asset names BEFORE the run so we can resolve the
+	// created assets (UIKRetargetBatchOperation::GetNewAssets is private).
+	TArray<FString> ExpectedPaths;
+	const FString NormalizedFolder = OutputFolder.EndsWith(TEXT("/")) ? OutputFolder.LeftChop(1) : OutputFolder;
+	for (const TWeakObjectPtr<UObject>& WeakAsset : AssetsToRetarget)
+	{
+		if (UObject* Asset = WeakAsset.Get())
+		{
+			const FString NewName = Context.NameRule.Rename(Asset);
+			ExpectedPaths.Add(FString::Printf(TEXT("%s/%s.%s"), *NormalizedFolder, *NewName, *NewName));
+		}
+	}
+
+	// Run the synchronous batch retarget (uses FScopedSlowTask internally).
+	UIKRetargetBatchOperation* BatchOp = NewObject<UIKRetargetBatchOperation>(GetTransientPackage());
+	BatchOp->RunRetarget(Context);
+
+	// Verify created assets by loading the expected output paths.
+	TArray<FString> CreatedPaths;
+	for (const FString& Expected : ExpectedPaths)
+	{
+		// Expected is "/Game/Folder/Name.Name"; LoadAssetByPath accepts the long path.
+		const FString PackagePath = Expected.Contains(TEXT(".")) ? Expected.Left(Expected.Find(TEXT("."))) : Expected;
+		if (UObject* Created = FMonolithAssetUtils::LoadAssetByPath<UObject>(PackagePath))
+		{
+			CreatedPaths.Add(Created->GetPathName());
+		}
+	}
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("retargeter_path"), RetargeterPath);
+	Root->SetStringField(TEXT("output_folder"), OutputFolder);
+	Root->SetStringField(TEXT("source_mesh"), SourceMesh->GetPathName());
+	Root->SetStringField(TEXT("target_mesh"), TargetMesh->GetPathName());
+	Root->SetNumberField(TEXT("requested_count"), AssetsToRetarget.Num());
+	Root->SetNumberField(TEXT("created_count"), CreatedPaths.Num());
+
+	TArray<TSharedPtr<FJsonValue>> CreatedArr;
+	for (const FString& P : CreatedPaths) CreatedArr.Add(MakeShared<FJsonValueString>(P));
+	Root->SetArrayField(TEXT("created_assets"), CreatedArr);
+
+	TArray<TSharedPtr<FJsonValue>> SkippedArr;
+	for (const FString& P : SkippedSources) SkippedArr.Add(MakeShared<FJsonValueString>(P));
+	Root->SetArrayField(TEXT("skipped_sources"), SkippedArr);
+
 	return FMonolithActionResult::Success(Root);
 }
 
