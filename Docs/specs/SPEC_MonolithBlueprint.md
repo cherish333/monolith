@@ -16,6 +16,7 @@
 |-------|---------------|
 | `FMonolithBlueprintModule` | Registers ~115 blueprint actions (count approximate — query `monolith_discover("blueprint")` for the live figure) |
 | `FMonolithBlueprintActions` | Static handlers. Uses `FMonolithAssetUtils::LoadAssetByPath<UBlueprint>` |
+| `FMonolithBlueprintContractActions` | Variable-contract reconciliation: `compare_class_variable_contract` (diff engine) + `promote_variables_to_parent`. Pin-type-aware descriptor extraction shared by both. |
 | `MonolithBlueprintInternal` | Helpers: AddGraphArray, FindGraphByName, PinTypeToString, SerializePin/Node, TraceExecFlow, FindEntryNode |
 
 > **Unity-safe file-local helpers (#68).** Internal-linkage helpers (anonymous-namespace functions/types, file-`static`s) must carry file-unique names or live in per-file named namespaces — matching the MonolithUI model — so they don't collide when adaptive/full unity concatenates same-module `.cpp`s into one translation unit. (The previously-global `InterpModeToString` in `MonolithBlueprintNodeActions.cpp` is now `NodeInterpModeToString`.)
@@ -52,6 +53,15 @@
 | `set_variable_defaults` | `asset_path`, `variable_name`, `default_value` | Set a variable's default value |
 | `add_local_variable` | `asset_path`, `function_name`, `variable_name`, `variable_type` | Add a local variable inside a function graph |
 | `remove_local_variable` | `asset_path`, `function_name`, `variable_name` | Remove a local variable from a function graph |
+
+**Variable Contract Reconciliation (2) — `MonolithBlueprintContractActions.cpp`**
+
+Reconcile the member-variable surface of one class against another by name + type + container kind + enum/struct subtype. Aimed at Blueprint→C++ migration, where a variable set must be promoted onto a native parent contract without breaking the bindings the AnimGraph / chooser / PropertyAccess pins compare against.
+
+| Action | Params | Description |
+|--------|--------|-------------|
+| `compare_class_variable_contract` | `left`, `right`, `include_inherited?`, `variables?` | Pure read/report diff of two classes' variable contracts. Each side is a Blueprint asset path (`/Game/...` → `GeneratedClass`) or a native class name (resolved as-is, with U/A prefix added/stripped, or a full `/Script/...` path). Per-variable descriptor reports `base_type`, `container` (`scalar`/`Array`/`Set`/`Map`), `enum_subtype` (UEnum path), `struct_subtype` (UScriptStruct path), `object_class`, `map_value_type`, and presence on each side; the `mismatch` classification is one of `ok`, `missing-on-left`, `missing-on-right`, `type-mismatch`, `container-mismatch`, `enum-subtype-mismatch`, `struct-subtype-mismatch`. For a Blueprint side, descriptors are sourced from the **authoritative `FEdGraphPinType`** of `NewVariables` (overlaying the compiled-FProperty walk) — the KismetCompiler can lower a UserDefinedEnum pin to a plain `FIntProperty` on the generated class, and a BP variable that shadows a native parent property does not materialize as a direct generated-class property; the pin-type overlay catches both. Struct/enum identity is compared by `GetPathName()` (BP pins compare struct types by exact `UScriptStruct` pointer identity). Mutates nothing. |
+| `promote_variables_to_parent` | `asset_path`, `variables`, `mode?` (`verify` default / `remove_shadowed`) | Reconcile a Blueprint's named local variables against its **native parent class** contract (the parent is resolved by walking up the `ClassGeneratedBy` chain to the first native class). `verify`: per-variable `status` = `parent-satisfies` (parent already declares a name+type+container+enum/struct-compatible counterpart) / `parent-declares-but-mismatch` / `parent-missing`. Authors no C++ — it produces the authoritative delta that a hand-written/native header must satisfy, then re-verifies post-build. `remove_shadowed`: deletes the now-redundant BP-local duplicate (`FBlueprintEditorUtils::RemoveMemberVariable`) ONLY for variables that pass parity AND are genuinely BP-local member variables (present in `NewVariables`); never removes a variable the parent lacks or declares incompatibly. Reports `will_remove` / `remove_skipped_reason` per variable and a `summary{requested,parent_satisfies,not_satisfied,removed_shadowed}`. |
 
 **Component CRUD (6)**
 | Action | Params | Description |

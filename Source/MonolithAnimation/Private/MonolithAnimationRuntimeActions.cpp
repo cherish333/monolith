@@ -16,6 +16,7 @@
 #include "Dom/JsonValue.h"
 #include "UObject/UnrealType.h"
 #include "UObject/EnumProperty.h"
+#include "UObject/Class.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogMonolithAnimRuntime, Log, All);
 
@@ -155,6 +156,149 @@ namespace
 		Prop->ExportTextItem_Direct(Exported, ValuePtr, nullptr, Obj, PPF_None);
 		return MakeShared<FJsonValueString>(Exported);
 	}
+
+	// ── Lockstep parity comparison (compare_to_actor) ────────────────────
+	struct FParityTolerance
+	{
+		double Float     = 1e-3;
+		double Vector    = 1e-2; // per-component (cm)
+		double Rotator   = 1e-2; // per-component (deg)
+		double Transform = 1e-2; // per-component (translation cm / rotation deg)
+	};
+
+	// Classify a property into a tolerance class string used in the report.
+	FString ParityToleranceClass(const FProperty* Prop)
+	{
+		if (CastField<FBoolProperty>(Prop) || CastField<FNameProperty>(Prop) ||
+			CastField<FStrProperty>(Prop)  || CastField<FTextProperty>(Prop) ||
+			CastField<FObjectPropertyBase>(Prop))
+		{
+			return TEXT("exact");
+		}
+		if (CastField<FEnumProperty>(Prop)) return TEXT("exact");
+		if (CastField<FByteProperty>(Prop)) return TEXT("exact");
+		if (CastField<FIntProperty>(Prop) || CastField<FInt64Property>(Prop)) return TEXT("exact");
+		if (CastField<FFloatProperty>(Prop) || CastField<FDoubleProperty>(Prop)) return TEXT("float");
+		if (const FStructProperty* SP = CastField<FStructProperty>(Prop))
+		{
+			if (SP->Struct == TBaseStructure<FVector>::Get())    return TEXT("vector");
+			if (SP->Struct == TBaseStructure<FRotator>::Get())   return TEXT("rotator");
+			if (SP->Struct == TBaseStructure<FTransform>::Get()) return TEXT("transform");
+			return TEXT("struct-exact");
+		}
+		return TEXT("exact");
+	}
+
+	// Read a double from a numeric property value pointer (float or double).
+	double ParityReadNumeric(const FProperty* Prop, const void* Ptr)
+	{
+		if (const FFloatProperty* P = CastField<FFloatProperty>(Prop))   return (double)P->GetPropertyValue(Ptr);
+		if (const FDoubleProperty* P = CastField<FDoubleProperty>(Prop)) return P->GetPropertyValue(Ptr);
+		return 0.0;
+	}
+
+	// Compare one named property on two instances. Populates OutEntry with the
+	// per-variable verdict (delta + pass/fail). Returns the pass flag.
+	bool ParityCompareProperty(
+		UObject* A, UObject* B, const FString& VarName,
+		const FParityTolerance& Tol, const TSharedPtr<FJsonObject>& OutEntry)
+	{
+		OutEntry->SetStringField(TEXT("name"), VarName);
+
+		FProperty* PropA = A ? A->GetClass()->FindPropertyByName(FName(*VarName)) : nullptr;
+		FProperty* PropB = B ? B->GetClass()->FindPropertyByName(FName(*VarName)) : nullptr;
+		if (!PropA || !PropB)
+		{
+			OutEntry->SetStringField(TEXT("tolerance_class"), TEXT("missing"));
+			OutEntry->SetBoolField(TEXT("pass"), false);
+			OutEntry->SetStringField(TEXT("note"),
+				!PropA ? TEXT("property not found on actor") : TEXT("property not found on compare_to_actor"));
+			return false;
+		}
+
+		// Differing property layouts can't be component-compared — flag and fail.
+		if (PropA->GetClass() != PropB->GetClass())
+		{
+			OutEntry->SetStringField(TEXT("tolerance_class"), TEXT("type-mismatch"));
+			OutEntry->SetBoolField(TEXT("pass"), false);
+			OutEntry->SetStringField(TEXT("a_type"), PropA->GetCPPType(nullptr, 0u));
+			OutEntry->SetStringField(TEXT("b_type"), PropB->GetCPPType(nullptr, 0u));
+			return false;
+		}
+
+		const void* PtrA = PropA->ContainerPtrToValuePtr<void>(A);
+		const void* PtrB = PropB->ContainerPtrToValuePtr<void>(B);
+		const FString Klass = ParityToleranceClass(PropA);
+		OutEntry->SetStringField(TEXT("tolerance_class"), Klass);
+
+		if (Klass == TEXT("float"))
+		{
+			const double VA = ParityReadNumeric(PropA, PtrA);
+			const double VB = ParityReadNumeric(PropB, PtrB);
+			const double Delta = FMath::Abs(VA - VB);
+			const bool bPass = Delta <= Tol.Float;
+			OutEntry->SetNumberField(TEXT("a"), VA);
+			OutEntry->SetNumberField(TEXT("b"), VB);
+			OutEntry->SetNumberField(TEXT("delta"), Delta);
+			OutEntry->SetNumberField(TEXT("tolerance"), Tol.Float);
+			OutEntry->SetBoolField(TEXT("pass"), bPass);
+			return bPass;
+		}
+
+		if (Klass == TEXT("vector") || Klass == TEXT("rotator"))
+		{
+			const FStructProperty* SP = CastField<FStructProperty>(PropA);
+			double C0A, C1A, C2A, C0B, C1B, C2B;
+			if (Klass == TEXT("vector"))
+			{
+				const FVector& VA = *static_cast<const FVector*>(PtrA);
+				const FVector& VB = *static_cast<const FVector*>(PtrB);
+				C0A = VA.X; C1A = VA.Y; C2A = VA.Z; C0B = VB.X; C1B = VB.Y; C2B = VB.Z;
+			}
+			else
+			{
+				const FRotator& RA = *static_cast<const FRotator*>(PtrA);
+				const FRotator& RB = *static_cast<const FRotator*>(PtrB);
+				C0A = RA.Pitch; C1A = RA.Yaw; C2A = RA.Roll; C0B = RB.Pitch; C1B = RB.Yaw; C2B = RB.Roll;
+			}
+			const double Bound = (Klass == TEXT("vector")) ? Tol.Vector : Tol.Rotator;
+			const double MaxDelta = FMath::Max3(FMath::Abs(C0A - C0B), FMath::Abs(C1A - C1B), FMath::Abs(C2A - C2B));
+			const bool bPass = MaxDelta <= Bound;
+			(void)SP;
+			OutEntry->SetNumberField(TEXT("max_component_delta"), MaxDelta);
+			OutEntry->SetNumberField(TEXT("tolerance"), Bound);
+			OutEntry->SetBoolField(TEXT("pass"), bPass);
+			return bPass;
+		}
+
+		if (Klass == TEXT("transform"))
+		{
+			const FTransform& TA = *static_cast<const FTransform*>(PtrA);
+			const FTransform& TB = *static_cast<const FTransform*>(PtrB);
+			const FVector LocA = TA.GetLocation(), LocB = TB.GetLocation();
+			const FRotator RotA = TA.Rotator(), RotB = TB.Rotator();
+			const double LocDelta = FMath::Max3(FMath::Abs(LocA.X - LocB.X), FMath::Abs(LocA.Y - LocB.Y), FMath::Abs(LocA.Z - LocB.Z));
+			const double RotDelta = FMath::Max3(FMath::Abs(RotA.Pitch - RotB.Pitch), FMath::Abs(RotA.Yaw - RotB.Yaw), FMath::Abs(RotA.Roll - RotB.Roll));
+			const bool bScaleEqual = TA.GetScale3D().Equals(TB.GetScale3D(), 0.0);
+			const bool bPass = (LocDelta <= Tol.Transform) && (RotDelta <= Tol.Transform) && bScaleEqual;
+			OutEntry->SetNumberField(TEXT("translation_delta"), LocDelta);
+			OutEntry->SetNumberField(TEXT("rotation_delta"), RotDelta);
+			OutEntry->SetBoolField(TEXT("scale_exact"), bScaleEqual);
+			OutEntry->SetNumberField(TEXT("tolerance"), Tol.Transform);
+			OutEntry->SetBoolField(TEXT("pass"), bPass);
+			return bPass;
+		}
+
+		// exact / struct-exact — byte-identical comparison via FProperty::Identical.
+		const bool bPass = PropA->Identical(PtrA, PtrB, PPF_None);
+		FString ExpA, ExpB;
+		PropA->ExportTextItem_Direct(ExpA, PtrA, nullptr, A, PPF_None);
+		PropB->ExportTextItem_Direct(ExpB, PtrB, nullptr, B, PPF_None);
+		OutEntry->SetStringField(TEXT("a"), ExpA);
+		OutEntry->SetStringField(TEXT("b"), ExpB);
+		OutEntry->SetBoolField(TEXT("pass"), bPass);
+		return bPass;
+	}
 }
 
 // ── Registration ────────────────────────────────────────────────────
@@ -162,7 +306,8 @@ namespace
 void FMonolithAnimationRuntimeActions::RegisterActions(FMonolithToolRegistry& Registry)
 {
 	Registry.RegisterAction(TEXT("animation"), TEXT("sample_pie_anim_instance"),
-		TEXT("Sample a live PIE actor's animation state: active AnimInstance/AnimClass, animation mode, active state-machine states, active montage, requested anim-instance variables, and requested bone/socket transforms"),
+		TEXT("Sample a live PIE actor's animation state: active AnimInstance/AnimClass, animation mode, active state-machine states, active montage, requested anim-instance variables, and requested bone/socket transforms. "
+		     "When 'compare_to_actor' is set, samples a SECOND actor's AnimInstance in lockstep and emits per-variable deltas with per-type tolerance pass/fail classification + an overall roll-up."),
 		FMonolithActionHandler::CreateStatic(&HandleSamplePIEAnimInstance),
 		FParamSchemaBuilder()
 			.Required(TEXT("actor"), TEXT("string"), TEXT("Actor label or name in the PIE world"))
@@ -171,6 +316,9 @@ void FMonolithAnimationRuntimeActions::RegisterActions(FMonolithToolRegistry& Re
 			.Optional(TEXT("bones"), TEXT("array"), TEXT("Bone names (strings) to report world-space transforms for"))
 			.Optional(TEXT("sockets"), TEXT("array"), TEXT("Socket names (strings) to report world-space transforms for"))
 			.Optional(TEXT("state_machines"), TEXT("array"), TEXT("State machine names to report active state for. If omitted, all baked state machines are enumerated"))
+			.Optional(TEXT("compare_to_actor"), TEXT("string"), TEXT("Second actor label/name to sample in lockstep and compare the 'variables' set against (parity check)"))
+			.Optional(TEXT("compare_component_name"), TEXT("string"), TEXT("Skeletal mesh component name on the compare_to_actor (if it has multiple)"))
+			.Optional(TEXT("tolerance"), TEXT("object"), TEXT("Per-type tolerance overrides: {float, vector, rotator, transform}. Exact for bool/enum/int. Defaults: float 1e-3, vector/rotator 1e-2, transform 1e-2"))
 			.Build());
 
 	UE_LOG(LogMonolithAnimRuntime, Log, TEXT("MonolithAnimation Runtime: registered 1 action"));
@@ -366,6 +514,79 @@ FMonolithActionResult FMonolithAnimationRuntimeActions::HandleSamplePIEAnimInsta
 			SocketsArr.Add(MakeShared<FJsonValueObject>(SockObj));
 		}
 		Root->SetArrayField(TEXT("sockets"), SocketsArr);
+	}
+
+	// ── Lockstep parity comparison (compare_to_actor) ────────────────────
+	FString CompareActor;
+	if (Params->TryGetStringField(TEXT("compare_to_actor"), CompareActor) && !CompareActor.IsEmpty())
+	{
+		// Resolve the second actor's AnimInstance by reusing FindAnimInstanceInPIE
+		// with a synthetic params blob (actor + optional component name).
+		TSharedPtr<FJsonObject> CmpParams = MakeShared<FJsonObject>();
+		CmpParams->SetStringField(TEXT("actor"), CompareActor);
+		FString CmpComponent;
+		if (Params->TryGetStringField(TEXT("compare_component_name"), CmpComponent) && !CmpComponent.IsEmpty())
+		{
+			CmpParams->SetStringField(TEXT("component_name"), CmpComponent);
+		}
+
+		FAnimPIELookup CmpLookup = FindAnimInstanceInPIE(CmpParams);
+		if (!CmpLookup.bSuccess)
+		{
+			TSharedPtr<FJsonObject> Err = MakeShared<FJsonObject>();
+			Err->SetStringField(TEXT("error"), CmpLookup.Error.ErrorMessage);
+			Root->SetObjectField(TEXT("comparison"), Err);
+		}
+		else if (!CmpLookup.AnimInstance)
+		{
+			TSharedPtr<FJsonObject> Cmp = MakeShared<FJsonObject>();
+			Cmp->SetStringField(TEXT("error"), TEXT("compare_to_actor has no active AnimInstance"));
+			Root->SetObjectField(TEXT("comparison"), Cmp);
+		}
+		else
+		{
+			// Parse tolerance overrides.
+			FParityTolerance Tol;
+			const TSharedPtr<FJsonObject>* TolObj = nullptr;
+			if (Params->TryGetObjectField(TEXT("tolerance"), TolObj) && TolObj)
+			{
+				double V;
+				if ((*TolObj)->TryGetNumberField(TEXT("float"), V))     Tol.Float = V;
+				if ((*TolObj)->TryGetNumberField(TEXT("vector"), V))    Tol.Vector = V;
+				if ((*TolObj)->TryGetNumberField(TEXT("rotator"), V))   Tol.Rotator = V;
+				if ((*TolObj)->TryGetNumberField(TEXT("transform"), V)) Tol.Transform = V;
+			}
+
+			TSharedPtr<FJsonObject> Cmp = MakeShared<FJsonObject>();
+			Cmp->SetStringField(TEXT("compare_actor"), CmpLookup.Actor->GetActorLabel());
+			Cmp->SetStringField(TEXT("compare_anim_instance_class"), CmpLookup.AnimInstance->GetClass()->GetPathName());
+
+			TArray<TSharedPtr<FJsonValue>> CmpArr;
+			int32 PassCount = 0, FailCount = 0;
+			const TArray<TSharedPtr<FJsonValue>>* CmpVars = nullptr;
+			if (Params->TryGetArrayField(TEXT("variables"), CmpVars) && CmpVars)
+			{
+				for (const TSharedPtr<FJsonValue>& V : *CmpVars)
+				{
+					FString VarName;
+					if (!V.IsValid() || !V->TryGetString(VarName) || VarName.IsEmpty()) continue;
+					TSharedPtr<FJsonObject> Entry = MakeShared<FJsonObject>();
+					const bool bPass = ParityCompareProperty(AnimInstance, CmpLookup.AnimInstance, VarName, Tol, Entry);
+					if (bPass) ++PassCount; else ++FailCount;
+					CmpArr.Add(MakeShared<FJsonValueObject>(Entry));
+				}
+			}
+			Cmp->SetArrayField(TEXT("variables"), CmpArr);
+
+			TSharedPtr<FJsonObject> Roll = MakeShared<FJsonObject>();
+			Roll->SetNumberField(TEXT("compared"), PassCount + FailCount);
+			Roll->SetNumberField(TEXT("pass"), PassCount);
+			Roll->SetNumberField(TEXT("fail"), FailCount);
+			Roll->SetBoolField(TEXT("overall_pass"), FailCount == 0 && (PassCount + FailCount) > 0);
+			Cmp->SetObjectField(TEXT("summary"), Roll);
+
+			Root->SetObjectField(TEXT("comparison"), Cmp);
+		}
 	}
 
 	// Asset-player weight note: direct per-asset-player weight getters require a

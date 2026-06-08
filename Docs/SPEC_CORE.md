@@ -35,7 +35,7 @@ Monolith is a unified Unreal Engine editor plugin that consolidates 9 separate M
 ```
 Monolith.uplugin
   MonolithCore          — HTTP server (bind retry with port probe, Restart()), tool registry, discovery, settings, auto-updater
-  MonolithBlueprint     — Blueprint inspection, variable/component/graph CRUD, node operations, compile, spawn (89 actions)
+  MonolithBlueprint     — Blueprint inspection, variable/component/graph CRUD, node operations, compile, spawn, variable-contract reconciliation (91 actions)
   MonolithMaterial      — Material inspection + graph editing + CRUD + function suite + tiling quality + texture preview (63 actions)
   MonolithAnimation     — Animation sequences, montages, ABPs, curves, notifies, skeletons, PoseSearch, ABP/ControlRig write, layout (119 actions)
   MonolithNiagara       — Niagara particle systems, HLSL module/function creation, DI config, event handlers, sim stages, NPC, effect types, scalability, layout, temporal control, stateless-emitter factory, search & discovery (129 actions)

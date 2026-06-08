@@ -4,6 +4,16 @@ All notable changes to Monolith will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **Blueprint→C++ variable-contract reconciliation (`blueprint`).** Two new actions in `MonolithBlueprintContractActions.cpp` for promoting a Blueprint variable set onto a native parent contract during nativization, without breaking the bindings AnimGraph / chooser / PropertyAccess pins compare against.
+  - `compare_class_variable_contract` — pure read/report diff of two classes' variable contracts. Each side is a Blueprint asset path or a native class name. Per-variable descriptor reports base type, container kind (`scalar`/`Array`/`Set`/`Map`), enum subtype (UEnum path), struct subtype (UScriptStruct path), object class, and a `mismatch` classification (`ok`, `missing-on-left`, `missing-on-right`, `type-mismatch`, `container-mismatch`, `enum-subtype-mismatch`, `struct-subtype-mismatch`). For a Blueprint side it sources descriptors from the authoritative `FEdGraphPinType` of `NewVariables`, overlaying the compiled-FProperty walk — this catches enum-subtype mismatches that the KismetCompiler hides by lowering a UserDefinedEnum pin to a plain `FIntProperty`, and BP-local variables that shadow a native parent property (which never materialize as a direct generated-class property). Struct/enum identity is compared by path (BP pins compare struct types by exact `UScriptStruct` pointer identity). Mutates nothing.
+  - `promote_variables_to_parent` — reconcile a Blueprint's named local variables against its native parent class (resolved by walking the `ClassGeneratedBy` chain to the first native class). `verify` (default) reports which the parent already satisfies (name+type+container+enum/struct parity) vs which it does not yet declare compatibly; it authors no C++. `remove_shadowed` deletes the now-redundant BP-local duplicate only for variables that pass parity AND are genuinely BP-local member variables — never one the parent lacks or declares incompatibly.
+
+- **Lockstep AnimInstance parity comparison (`animation`).** `sample_pie_anim_instance` gained an optional, additive `compare_to_actor` (+ `compare_component_name`, `tolerance`) that samples a second PIE actor's `AnimInstance` in lockstep and emits a `comparison` block: per-variable delta + a per-type tolerance pass/fail (`exact` for bool/enum/int/name/string/object; `float` epsilon; `vector`/`rotator`/`transform` per-component) and an `overall_pass` roll-up. Per-type tolerances are overridable (`{float, vector, rotator, transform}`, defaults `1e-3`/`1e-2`/`1e-2`/`1e-2`). Backward-compatible — without `compare_to_actor` the single-instance payload is unchanged (no `comparison` key).
+
 ## [0.18.1] - 2026-06-07
 
 A motion-matching-focused release: a from-scratch Motion Matching authoring pack across the `animation`, `chooser`, and `blueprint` namespaces, plus a PIE / profiling harness, thread-safe AnimBP authoring primitives, and a batch of AI / editor / blueprint additions.
