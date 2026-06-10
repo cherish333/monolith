@@ -1,6 +1,7 @@
 #include "MonolithAnimationActions.h"
 #include "MonolithAssetUtils.h"
 #include "MonolithParamSchema.h"
+#include "MonolithPropertyAccessReader.h"
 
 #include "Animation/AnimMontage.h"
 #include "Animation/AnimSequence.h"
@@ -2257,7 +2258,15 @@ FMonolithActionResult FMonolithAnimationActions::HandleGetNodes(const TSharedPtr
 			if (!GraphFilter.IsEmpty() && Graph->GetName() != GraphFilter) continue;
 			for (UEdGraphNode* Node : Graph->Nodes)
 			{
-				if (!MonolithAnimGraphChooser::IsEvaluateChooserNode(Node)) continue;
+				if (!Node) continue;
+
+				// EvaluateChooser and PropertyAccess K2Nodes are NOT UAnimGraphNode_Base
+				// subclasses, so the primary loop skips them. Surface both here: the chooser
+				// node carries a reflectively-resolved chooser asset; the PropertyAccess node
+				// carries a reflectively-resolved property-access path (Gap 1).
+				const bool bIsChooser = MonolithAnimGraphChooser::IsEvaluateChooserNode(Node);
+				const bool bIsPropertyAccess = (Node->GetClass()->GetName() == TEXT("K2Node_PropertyAccess"));
+				if (!bIsChooser && !bIsPropertyAccess) continue;
 
 				FString ClassName = Node->GetClass()->GetName();
 				if (!NodeClassFilter.IsEmpty() && !ClassName.Contains(NodeClassFilter)) continue;
@@ -2269,8 +2278,16 @@ FMonolithActionResult FMonolithAnimationActions::HandleGetNodes(const TSharedPtr
 				NodeObj->SetStringField(TEXT("graph"), Graph->GetName());
 				NodeObj->SetStringField(TEXT("node_guid"), Node->NodeGuid.ToString());
 
-				// Reflectively resolve the private `Chooser` UPROPERTY (see file-header comment).
-				MonolithAnimGraphChooser::ResolveChooserAsset(Node, NodeObj);
+				if (bIsChooser)
+				{
+					// Reflectively resolve the private `Chooser` UPROPERTY (see file-header comment).
+					MonolithAnimGraphChooser::ResolveChooserAsset(Node, NodeObj);
+				}
+				if (bIsPropertyAccess)
+				{
+					// Reflectively resolve the private PropertyAccess path (shared helper, Gap 1).
+					MonolithPropertyAccessReader::SerializePropertyAccessBlock(Node, NodeObj);
+				}
 
 				TArray<TSharedPtr<FJsonValue>> PinsArr;
 				for (UEdGraphPin* Pin : Node->Pins)

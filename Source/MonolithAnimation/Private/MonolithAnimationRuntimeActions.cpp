@@ -1,5 +1,6 @@
 #include "MonolithAnimationRuntimeActions.h"
 #include "MonolithParamSchema.h"
+#include "MonolithStructFieldResolver.h"
 
 #include "Editor.h"
 #include "EngineUtils.h"
@@ -106,20 +107,19 @@ namespace
 		}
 	}
 
-	// Read a single live UPROPERTY value off an object into a JSON value.
-	// Handles the common scalar types directly; falls back to ExportText for
-	// structs/enums/anything else.
-	TSharedPtr<FJsonValue> ReadPropertyValue(UObject* Obj, const FString& VarName, FString& OutTypeName)
+	// Read an already-resolved property value into a JSON value. Handles the common
+	// scalar types directly; falls back to ExportText for structs/enums/anything else.
+	// ExportTextItem_Direct needs an "owner" object for object-reference export context;
+	// the leaf's container object is passed as OwnerForExport.
+	TSharedPtr<FJsonValue> ReadResolvedValue(const FProperty* Prop, const void* ValuePtr,
+		const UObject* OwnerForExport, FString& OutTypeName)
 	{
-		if (!Obj) return nullptr;
-		FProperty* Prop = Obj->GetClass()->FindPropertyByName(FName(*VarName));
-		if (!Prop)
+		if (!Prop || !ValuePtr)
 		{
 			OutTypeName = TEXT("<not found>");
 			return nullptr;
 		}
 		OutTypeName = Prop->GetCPPType(nullptr, 0u);
-		const void* ValuePtr = Prop->ContainerPtrToValuePtr<void>(Obj);
 
 		if (const FBoolProperty* BoolProp = CastField<FBoolProperty>(Prop))
 		{
@@ -147,14 +147,33 @@ namespace
 		}
 		if (const FObjectPropertyBase* ObjProp = CastField<FObjectPropertyBase>(Prop))
 		{
-			UObject* Val = ObjProp->GetObjectPropertyValue_InContainer(Obj);
+			UObject* Val = ObjProp->GetObjectPropertyValue(ValuePtr);
 			return MakeShared<FJsonValueString>(Val ? Val->GetPathName() : TEXT("None"));
 		}
 
 		// Generic fallback (enums, structs, vectors, etc.)
 		FString Exported;
-		Prop->ExportTextItem_Direct(Exported, ValuePtr, nullptr, Obj, PPF_None);
+		Prop->ExportTextItem_Direct(Exported, ValuePtr, nullptr, const_cast<UObject*>(OwnerForExport), PPF_None);
 		return MakeShared<FJsonValueString>(Exported);
+	}
+
+	// Read a single live UPROPERTY value off an object into a JSON value, resolving
+	// dotted member paths + UserDefinedStruct friendly names via the shared resolver.
+	// Plain (non-dotted) names keep the flat-lookup base case.
+	TSharedPtr<FJsonValue> ReadPropertyValue(UObject* Obj, const FString& VarName, FString& OutTypeName)
+	{
+		if (!Obj)
+		{
+			OutTypeName = TEXT("<not found>");
+			return nullptr;
+		}
+		const MonolithStructField::FResolved Resolved = MonolithStructField::Resolve(Obj, VarName);
+		if (!Resolved.Leaf)
+		{
+			OutTypeName = TEXT("<not found>");
+			return nullptr;
+		}
+		return ReadResolvedValue(Resolved.Leaf, Resolved.ValuePtr, Obj, OutTypeName);
 	}
 
 	// ── Lockstep parity comparison (compare_to_actor) ────────────────────
@@ -205,8 +224,12 @@ namespace
 	{
 		OutEntry->SetStringField(TEXT("name"), VarName);
 
-		FProperty* PropA = A ? A->GetClass()->FindPropertyByName(FName(*VarName)) : nullptr;
-		FProperty* PropB = B ? B->GetClass()->FindPropertyByName(FName(*VarName)) : nullptr;
+		// Resolve both sides through the shared dotted-path / UDS friendly-name resolver
+		// so parity comparison supports the same addressing as the variables read.
+		const MonolithStructField::FResolved ResA = MonolithStructField::Resolve(A, VarName);
+		const MonolithStructField::FResolved ResB = MonolithStructField::Resolve(B, VarName);
+		const FProperty* PropA = ResA.Leaf;
+		const FProperty* PropB = ResB.Leaf;
 		if (!PropA || !PropB)
 		{
 			OutEntry->SetStringField(TEXT("tolerance_class"), TEXT("missing"));
@@ -226,8 +249,8 @@ namespace
 			return false;
 		}
 
-		const void* PtrA = PropA->ContainerPtrToValuePtr<void>(A);
-		const void* PtrB = PropB->ContainerPtrToValuePtr<void>(B);
+		const void* PtrA = ResA.ValuePtr;
+		const void* PtrB = ResB.ValuePtr;
 		const FString Klass = ParityToleranceClass(PropA);
 		OutEntry->SetStringField(TEXT("tolerance_class"), Klass);
 
@@ -312,7 +335,7 @@ void FMonolithAnimationRuntimeActions::RegisterActions(FMonolithToolRegistry& Re
 		FParamSchemaBuilder()
 			.Required(TEXT("actor"), TEXT("string"), TEXT("Actor label or name in the PIE world"))
 			.Optional(TEXT("component_name"), TEXT("string"), TEXT("Skeletal mesh component name (if the actor has multiple)"))
-			.Optional(TEXT("variables"), TEXT("array"), TEXT("Anim-instance variable names to read live via reflection"))
+			.Optional(TEXT("variables"), TEXT("array"), TEXT("Anim-instance variable names to read live via reflection. Supports dotted member paths (e.g. 'Movement.Speed') that descend nested structs, matching UserDefinedStruct members by their friendly (authored) name. Struct-member traversal only; array/map indexing is not supported."))
 			.Optional(TEXT("bones"), TEXT("array"), TEXT("Bone names (strings) to report world-space transforms for"))
 			.Optional(TEXT("sockets"), TEXT("array"), TEXT("Socket names (strings) to report world-space transforms for"))
 			.Optional(TEXT("state_machines"), TEXT("array"), TEXT("State machine names to report active state for. If omitted, all baked state machines are enumerated"))

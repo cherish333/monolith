@@ -11,6 +11,7 @@
 #include "Actions/ProjectRefreshAssetsAction.h"
 #include "Actions/ProjectGetSavedAssetStateAction.h"
 #include "Actions/ProjectCleanupGeneratedAssetsAction.h"
+#include "Actions/ProjectExportAssetTextAction.h"
 
 #define LOCTEXT_NAMESPACE "FMonolithIndexModule"
 
@@ -69,6 +70,11 @@ void FMonolithIndexModule::StartupModule()
 		FProjectCleanupGeneratedAssetsAction::GetDescription(),
 		FMonolithActionHandler::CreateStatic(&FProjectCleanupGeneratedAssetsAction::Execute),
 		FProjectCleanupGeneratedAssetsAction::GetSchema());
+
+	Registry.RegisterAction(TEXT("project"), FProjectExportAssetTextAction::GetName(),
+		FProjectExportAssetTextAction::GetDescription(),
+		FMonolithActionHandler::CreateStatic(&FProjectExportAssetTextAction::Execute),
+		FProjectExportAssetTextAction::GetSchema());
 }
 
 void FMonolithIndexModule::ShutdownModule()

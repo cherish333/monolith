@@ -208,6 +208,12 @@ FMonolithActionResult FMonolithBlueprintActions::HandleListGraphs(const TSharedP
 	MonolithBlueprintInternal::AddGraphArray(GraphsArr, BP->FunctionGraphs, TEXT("function"));
 	MonolithBlueprintInternal::AddGraphArray(GraphsArr, BP->MacroGraphs, TEXT("macro"));
 	MonolithBlueprintInternal::AddGraphArray(GraphsArr, BP->DelegateSignatureGraphs, TEXT("delegate_signature"));
+	// Interface-implementation function graphs live on a separate array (Gap 7).
+	for (const FBPInterfaceDescription& Iface : BP->ImplementedInterfaces)
+	{
+		const FString IfaceName = Iface.Interface ? Iface.Interface->GetName() : FString();
+		MonolithBlueprintInternal::AddGraphArray(GraphsArr, Iface.Graphs, TEXT("interface"), IfaceName);
+	}
 	Root->SetArrayField(TEXT("graphs"), GraphsArr);
 
 	return FMonolithActionResult::Success(Root);
@@ -240,6 +246,22 @@ FMonolithActionResult FMonolithBlueprintActions::HandleGetGraphData(const TShare
 	else if (BP->FunctionGraphs.Contains(Graph)) GraphType = TEXT("function");
 	else if (BP->MacroGraphs.Contains(Graph)) GraphType = TEXT("macro");
 	else if (BP->DelegateSignatureGraphs.Contains(Graph)) GraphType = TEXT("delegate_signature");
+	else
+	{
+		// Interface-implementation function graphs live on a separate array (Gap 7).
+		for (const FBPInterfaceDescription& Iface : BP->ImplementedInterfaces)
+		{
+			if (Iface.Graphs.Contains(Graph))
+			{
+				GraphType = TEXT("interface");
+				if (Iface.Interface)
+				{
+					Root->SetStringField(TEXT("interface"), Iface.Interface->GetName());
+				}
+				break;
+			}
+		}
+	}
 	Root->SetStringField(TEXT("graph_type"), GraphType);
 
 	TArray<TSharedPtr<FJsonValue>> NodesArr;
