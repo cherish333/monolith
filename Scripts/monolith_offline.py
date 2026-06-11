@@ -1051,6 +1051,201 @@ class SourceActions:
                 lines.append(f"{name}: not deprecated")
         print("\n".join(lines))
 
+    # --- shared composition helpers (mirror FMonolithSourceActions) ---
+
+    def symbol_exists(self, symbol):
+        lookup = symbol
+        scope = symbol.rfind("::")
+        if scope >= 0:
+            lookup = symbol[:scope]
+        if self.db.execute("SELECT id FROM symbols WHERE name = ? LIMIT 1", (lookup,)).fetchone():
+            return True
+        fts_q = escape_fts(lookup)
+        if self.db.execute("SELECT s.id FROM symbols_fts f JOIN symbols s ON s.id = f.rowid "
+                           "WHERE symbols_fts MATCH ? LIMIT 1", (fts_q,)).fetchone():
+            return True
+        method = symbol if scope < 0 else symbol[scope + 2:]
+        needle = method + "("
+        sfts = escape_fts(symbol)
+        chunks = self.db.execute(
+            "SELECT file_id, line_number FROM source_fts WHERE source_fts MATCH ? "
+            "ORDER BY bm25(source_fts) LIMIT 25", (sfts,)).fetchall()
+        for ch in chunks:
+            try:
+                with open(self.get_file_path(ch["file_id"]), "r", encoding="utf-8", errors="replace") as f:
+                    fl = [ln.rstrip("\n").rstrip("\r") for ln in f.readlines()]
+            except FileNotFoundError:
+                continue
+            ws = max(0, ch["line_number"] - 1)
+            we = min(len(fl), ws + 10)
+            for i in range(ws, we):
+                di = fl[i].find(needle)
+                if di < 0:
+                    continue
+                if di > 0 and (fl[i][di - 1].isalnum() or fl[i][di - 1] == "_"):
+                    continue
+                return True
+        return False
+
+    def first_signature(self, symbol):
+        method = symbol
+        scope = symbol.rfind("::")
+        if scope >= 0:
+            method = symbol[scope + 2:]
+        for r in self.db.execute(
+                "SELECT signature, file_id, line_start FROM symbols WHERE name = ? AND kind = 'function'",
+                (method,)).fetchall():
+            sig = r["signature"] or ""
+            if not sig or "{" in sig or "\\" in sig:
+                continue
+            return sig.strip(), "column"
+        fts_q = escape_fts(symbol)
+        chunks = self.db.execute(
+            "SELECT file_id, line_number FROM source_fts WHERE source_fts MATCH ? "
+            "ORDER BY bm25(source_fts) LIMIT 50", (fts_q,)).fetchall()
+        needle = method + "("
+        for ch in chunks:
+            try:
+                with open(self.get_file_path(ch["file_id"]), "r", encoding="utf-8", errors="replace") as f:
+                    fl = [ln.rstrip("\n") for ln in f.readlines()]
+            except FileNotFoundError:
+                continue
+            ws = max(0, ch["line_number"] - 1)
+            we = min(len(fl), ws + 10)
+            for i in range(ws, we):
+                di = fl[i].find(needle)
+                if di < 0:
+                    continue
+                if di > 0 and (fl[i][di - 1].isalnum() or fl[i][di - 1] == "_"):
+                    continue
+                sig = self.compact_declaration(fl, i)
+                if not sig or needle not in sig:
+                    continue
+                return sig, "declaration_read"
+        return None, None
+
+    def verify_symbols(self, args):
+        symbols = args.symbols
+        cnt = self.db.execute("SELECT COUNT(*) as c FROM symbol_deprecations").fetchone()["c"]
+        dep_empty = cnt == 0
+
+        lines = []
+        for symbol in symbols:
+            if not self.symbol_exists(symbol):
+                lines.append(f"{symbol}: NOT FOUND")
+                continue
+            line = f"{symbol}: exists"
+
+            sym = self.resolve_symbol_row(symbol)
+            include = module_name = warning = ""
+            includable = True
+            if sym:
+                lookup = symbol
+                scope = symbol.rfind("::")
+                if scope >= 0:
+                    lookup = symbol[:scope]
+                allrows = self.db.execute(
+                    "SELECT s.file_id, f.path FROM symbols s JOIN files f ON f.id = s.file_id WHERE s.name = ?",
+                    (lookup,)).fetchall()
+                file_id = sym["file_id"]
+                file_path = self.get_file_path(file_id)
+                for r in allrows:
+                    if r["path"].endswith(".h"):
+                        file_id = r["file_id"]
+                        file_path = r["path"]
+                        break
+                mrows = self.db.execute(
+                    "SELECT m.name FROM files f JOIN modules m ON m.id = f.module_id WHERE f.id = ?",
+                    (file_id,)).fetchall()
+                module_name = mrows[0]["name"] if mrows else ""
+                include, includable, warning = self.derive_include_path(file_path, module_name)
+            if include:
+                line += f' | #include "{include}"' + ("" if includable else " (NOT includable)")
+
+            sig, _src = self.first_signature(symbol)
+            if sig:
+                line += f" | {sig}"
+
+            if not dep_empty:
+                method = symbol
+                scope = symbol.rfind("::")
+                if scope >= 0:
+                    method = symbol[scope + 2:]
+                drow = self.db.execute(
+                    "SELECT version FROM symbol_deprecations WHERE symbol_name = ? LIMIT 1", (method,)).fetchone()
+                if drow:
+                    line += " | DEPRECATED"
+            lines.append(line)
+        print("\n".join(lines))
+
+    def find_example_usage(self, args):
+        symbol = args.symbol
+        prefer = (getattr(args, "prefer", None) or "engine").lower()
+        prefer_project = prefer == "project"
+        limit = max(1, args.limit)
+        HARD_CAP, FTS_FETCH = 500, 400
+
+        method = symbol
+        scope = symbol.rfind("::")
+        if scope >= 0:
+            method = symbol[scope + 2:]
+        needle = method + "("
+
+        usages = []  # (file, line, context, rank, sort_path)
+        seen = set()
+        fts_q = escape_fts(symbol)
+        chunks = self.db.execute(
+            "SELECT file_id, line_number FROM source_fts WHERE source_fts MATCH ? "
+            "ORDER BY bm25(source_fts) LIMIT ?", (fts_q, FTS_FETCH)).fetchall()
+        for ch in chunks:
+            fp = self.get_file_path(ch["file_id"])
+            try:
+                with open(fp, "r", encoding="utf-8", errors="replace") as f:
+                    fl = [ln.rstrip("\n").rstrip("\r") for ln in f.readlines()]
+            except FileNotFoundError:
+                continue
+            ws = max(0, ch["line_number"] - 1)
+            we = min(len(fl), ws + 10)
+            for i in range(ws, we):
+                hi = fl[i].find(needle)
+                if hi < 0:
+                    continue
+                if hi > 0 and (fl[i][hi - 1].isalnum() or fl[i][hi - 1] == "_"):
+                    continue
+                key = f"{ch['file_id']}_{i + 1}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                cs, ce = max(0, i - 3), min(len(fl) - 1, i + 3)
+                ctx = "\n".join(f"{c+1:5d} | {fl[c]}" for c in range(cs, ce + 1))
+                norm = fp.replace("\\", "/")
+                is_engine = "Engine/Source/" in norm
+                is_runtime = "/Source/Runtime/" in norm
+                rank = 0 if (is_engine and is_runtime) else (1 if is_engine else 2)
+                usages.append((self.short_path(fp), i + 1, ctx, rank, fp))
+
+        def rank_key(u):
+            if not prefer_project:
+                return u[3]
+            return {2: 0, 0: 1}.get(u[3], 2)
+
+        usages.sort(key=lambda u: (rank_key(u), u[4], u[1]))
+
+        total = len(usages)
+        slice_end = min(min(limit, total), HARD_CAP)
+        if total == 0:
+            print(f"No call-site examples found for '{symbol}'.")
+            return
+        # PARITY: emit ONLY the rendered snippets (no total_estimate / next_cursor).
+        # Those are structured-JSON fields the live handler sets on its result
+        # object, not on content[].text. The text byte-compare runs against the
+        # live content[].text, which likewise omits both. Do NOT add them here.
+        parts = []
+        for i in range(slice_end):
+            f, ln, ctx, _r, _sp = usages[i]
+            parts.append(f"--- {f}:{ln} ---\n{ctx}")
+        print("\n\n".join(parts))
+
 
 # ============================================================
 # Project actions (UNCHANGED — do not touch)
@@ -2105,6 +2300,14 @@ def build_parser():
 
     p = src_sub.add_parser("check_deprecations")
     p.add_argument("symbols", nargs="+")
+
+    p = src_sub.add_parser("verify_symbols")
+    p.add_argument("symbols", nargs="+")
+
+    p = src_sub.add_parser("find_example_usage")
+    p.add_argument("symbol")
+    p.add_argument("--prefer", default="engine", choices=["engine", "project"])
+    p.add_argument("--limit", type=int, default=10)
 
     # --- project namespace ---
     prj = sub.add_parser("project", help="Query project index database")

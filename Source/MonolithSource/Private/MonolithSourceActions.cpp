@@ -155,6 +155,28 @@ void FMonolithSourceActions::RegisterAll()
 	Registry.SetActionAnnotations(TEXT("source"), TEXT("get_include_path"),  /*bReadOnly=*/true, /*bDestructive=*/false, /*bIdempotent=*/true, TEXT("Get include path"));
 	Registry.SetActionAnnotations(TEXT("source"), TEXT("get_signature"),     /*bReadOnly=*/true, /*bDestructive=*/false, /*bIdempotent=*/true, TEXT("Get signature"));
 	Registry.SetActionAnnotations(TEXT("source"), TEXT("check_deprecations"),/*bReadOnly=*/true, /*bDestructive=*/false, /*bIdempotent=*/true, TEXT("Check deprecations"));
+
+	// --- Phase 2: round-trip compression (items 4-5) ---
+
+	Registry.RegisterAction(TEXT("source"), TEXT("verify_symbols"),
+		TEXT("Batch pre-flight verdict for a list of symbols. Per symbol composes include path, declaration signature, deprecation status, and existence into one record. `exists` for a Class::Method is decided by the owning class row + a source-line declaration hit (engine class-body methods are not indexed as symbols), NOT by symbols-table presence; a missing symbol reports exists:false with no error."),
+		FMonolithActionHandler::CreateStatic(&FMonolithSourceActions::HandleVerifySymbols),
+		FParamSchemaBuilder()
+			.Required(TEXT("symbols"), TEXT("array"), TEXT("Array of symbol names or Class::Method strings to verify"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("source"), TEXT("find_example_usage"),
+		TEXT("Find real call-site examples of a symbol via full-text search over indexed source lines (pattern `SymbolName(`). Returns ranked snippets with ~3 lines of context. `prefer`: \"engine\" (default — engine Runtime first, then other engine, then project) or \"project\" (flips project ahead). Supports cursor pagination — pass `cursor` from a prior response's `next_cursor`."),
+		FMonolithActionHandler::CreateStatic(&FMonolithSourceActions::HandleFindExampleUsage),
+		FParamSchemaBuilder()
+			.Required(TEXT("symbol"), TEXT("string"), TEXT("Symbol name or Class::Method to find usage examples for"))
+			.Optional(TEXT("prefer"), TEXT("string"), TEXT("Ranking preference: engine (default) or project"), TEXT("engine"))
+			.Optional(TEXT("limit"), TEXT("integer"), TEXT("Max examples per page"), TEXT("10"))
+			.Optional(TEXT("cursor"), TEXT("string"), TEXT("Opaque pagination cursor from a prior next_cursor"))
+			.Build());
+
+	Registry.SetActionAnnotations(TEXT("source"), TEXT("verify_symbols"),     /*bReadOnly=*/true, /*bDestructive=*/false, /*bIdempotent=*/true, TEXT("Verify symbols"));
+	Registry.SetActionAnnotations(TEXT("source"), TEXT("find_example_usage"), /*bReadOnly=*/true, /*bDestructive=*/false, /*bIdempotent=*/true, TEXT("Find example usage"));
 }
 
 // ============================================================================
@@ -283,6 +305,149 @@ bool FMonolithSourceActions::ResolveOwningModule(FMonolithSourceDatabase* DB, co
 		OutBuildCsNote = FString::Printf(TEXT("Module '%s' — add to your Build.cs deps"), *OutModule);
 	}
 	return true;
+}
+
+// --- Phase 2 shared composition helpers (item 4 calls these, NOT the JSON handlers) ---
+
+bool FMonolithSourceActions::ResolveIncludeForSymbol(FMonolithSourceDatabase* DB, const FString& Symbol,
+	FString& OutInclude, bool& OutIncludable, FString& OutModule, FString& OutWarning)
+{
+	OutInclude.Empty();
+	OutIncludable = true;
+	OutModule.Empty();
+	OutWarning.Empty();
+	if (!DB) return false;
+
+	// For a Class::Method input resolve via the OWNING CLASS row.
+	FString LookupName = Symbol;
+	const int32 ScopeIdx = Symbol.Find(TEXT("::"), ESearchCase::CaseSensitive, ESearchDir::FromEnd);
+	if (ScopeIdx != INDEX_NONE)
+	{
+		LookupName = Symbol.Left(ScopeIdx);
+	}
+
+	TArray<FMonolithSourceSymbol> Symbols = DB->GetSymbolsByName(LookupName);
+	if (Symbols.Num() == 0) Symbols = DB->SearchSymbolsFTS(LookupName, 5);
+	if (Symbols.Num() == 0) return false;
+
+	// Prefer a header among same-name rows (decl + def).
+	const FMonolithSourceSymbol* Chosen = &Symbols[0];
+	for (const FMonolithSourceSymbol& S : Symbols)
+	{
+		if (DB->GetFilePath(S.FileId).EndsWith(TEXT(".h"))) { Chosen = &S; break; }
+	}
+
+	const FString FilePath = DB->GetFilePath(Chosen->FileId);
+	OutInclude = DeriveIncludePath(FilePath, OutIncludable, OutWarning);
+
+	FString BuildCsPath;
+	DB->GetFileModuleInfo(Chosen->FileId, OutModule, BuildCsPath);
+	return true;
+}
+
+bool FMonolithSourceActions::ResolveFirstSignature(FMonolithSourceDatabase* DB, const FString& Symbol,
+	FString& OutSignature, FString& OutSource)
+{
+	OutSignature.Empty();
+	OutSource.Empty();
+	if (!DB) return false;
+
+	// Method name = trailing identifier.
+	FString MethodName = Symbol;
+	const int32 ScopeIdx = Symbol.Find(TEXT("::"), ESearchCase::CaseSensitive, ESearchDir::FromEnd);
+	if (ScopeIdx != INDEX_NONE)
+	{
+		MethodName = Symbol.Mid(ScopeIdx + 2);
+	}
+
+	// Fast path: body-free signature column.
+	TArray<FMonolithSourceSymbol> Symbols = DB->GetSymbolsByName(MethodName, TEXT("function"));
+	for (const FMonolithSourceSymbol& S : Symbols)
+	{
+		if (S.Signature.IsEmpty()) continue;
+		if (S.Signature.Contains(TEXT("{")) || S.Signature.Contains(TEXT("\\"))) continue;
+		OutSignature = S.Signature.TrimStartAndEnd();
+		OutSource = TEXT("column");
+		return true;
+	}
+
+	// Primary: declaration-read over source_fts.
+	const FString NeedlePattern = MethodName + TEXT("(");
+	TArray<FMonolithSourceChunk> Chunks = DB->SearchSourceFTS(Symbol, TEXT("all"), 50);
+	for (const FMonolithSourceChunk& Chunk : Chunks)
+	{
+		const FString FilePath = DB->GetFilePath(Chunk.FileId);
+		TArray<FString> FileLines;
+		if (!FFileHelper::LoadFileToStringArray(FileLines, *FilePath)) continue;
+
+		const int32 WinStart = FMath::Max(0, Chunk.LineNumber - 1);
+		const int32 WinEnd = FMath::Min(FileLines.Num(), WinStart + 10);
+		for (int32 i = WinStart; i < WinEnd; ++i)
+		{
+			const FString& L = FileLines[i];
+			const int32 DeclIdx = L.Find(NeedlePattern, ESearchCase::CaseSensitive);
+			if (DeclIdx == INDEX_NONE) continue;
+			if (DeclIdx > 0)
+			{
+				const TCHAR Prev = L[DeclIdx - 1];
+				if (FChar::IsAlnum(Prev) || Prev == TEXT('_')) continue;
+			}
+			const FString Sig = CompactDeclaration(FileLines, i);
+			if (Sig.IsEmpty() || !Sig.Contains(NeedlePattern)) continue;
+			OutSignature = Sig;
+			OutSource = TEXT("declaration_read");
+			return true;
+		}
+	}
+	return false;
+}
+
+bool FMonolithSourceActions::SymbolExists(FMonolithSourceDatabase* DB, const FString& Symbol)
+{
+	if (!DB) return false;
+
+	// Class-row presence: for Class::Method, the OWNING class; for a plain symbol,
+	// the symbol itself. NEVER the method's own symbols-table row (Step-0: engine
+	// class-body methods have no row).
+	FString LookupName = Symbol;
+	const int32 ScopeIdx = Symbol.Find(TEXT("::"), ESearchCase::CaseSensitive, ESearchDir::FromEnd);
+	if (ScopeIdx != INDEX_NONE)
+	{
+		LookupName = Symbol.Left(ScopeIdx);
+	}
+	if (DB->GetSymbolsByName(LookupName).Num() > 0) return true;
+	if (DB->SearchSymbolsFTS(LookupName, 1).Num() > 0) return true;
+
+	// Source-line FTS declaration hit for `Name(` — covers free functions / methods
+	// the class-row lookup missed.
+	FString MethodName = Symbol;
+	if (ScopeIdx != INDEX_NONE)
+	{
+		MethodName = Symbol.Mid(ScopeIdx + 2);
+	}
+	const FString NeedlePattern = MethodName + TEXT("(");
+	TArray<FMonolithSourceChunk> Chunks = DB->SearchSourceFTS(Symbol, TEXT("all"), 25);
+	for (const FMonolithSourceChunk& Chunk : Chunks)
+	{
+		const FString FilePath = DB->GetFilePath(Chunk.FileId);
+		TArray<FString> FileLines;
+		if (!FFileHelper::LoadFileToStringArray(FileLines, *FilePath)) continue;
+		const int32 WinStart = FMath::Max(0, Chunk.LineNumber - 1);
+		const int32 WinEnd = FMath::Min(FileLines.Num(), WinStart + 10);
+		for (int32 i = WinStart; i < WinEnd; ++i)
+		{
+			const FString& L = FileLines[i];
+			const int32 DeclIdx = L.Find(NeedlePattern, ESearchCase::CaseSensitive);
+			if (DeclIdx == INDEX_NONE) continue;
+			if (DeclIdx > 0)
+			{
+				const TCHAR Prev = L[DeclIdx - 1];
+				if (FChar::IsAlnum(Prev) || Prev == TEXT('_')) continue;
+			}
+			return true;
+		}
+	}
+	return false;
 }
 
 FString FMonolithSourceActions::ReadFileLines(const FString& FilePath, int32 StartLine, int32 EndLine)
@@ -1779,6 +1944,338 @@ FMonolithActionResult FMonolithSourceActions::HandleCheckDeprecations(const TSha
 	auto ContentItem = MakeShared<FJsonObject>();
 	ContentItem->SetStringField(TEXT("type"), TEXT("text"));
 	ContentItem->SetStringField(TEXT("text"), FString::Join(TextLines, TEXT("\n")));
+	ContentArr.Add(MakeShared<FJsonValueObject>(ContentItem));
+	ResultObj->SetArrayField(TEXT("content"), ContentArr);
+	return FMonolithActionResult::Success(ResultObj);
+}
+
+// ============================================================================
+// Phase 2 — item 4: verify_symbols
+//
+// Composes items 1+2+3 via the shared C++ helpers (ResolveIncludeForSymbol /
+// ResolveFirstSignature + DB->GetDeprecation + SymbolExists) — NOT by re-parsing
+// the JSON handlers. `exists` for a Class::Method is class-row + source_fts
+// declaration hit, NEVER symbols-table presence (Step-0 finding). Missing symbol
+// -> exists:false, no error.
+// ============================================================================
+
+FMonolithActionResult FMonolithSourceActions::HandleVerifySymbols(const TSharedPtr<FJsonObject>& Params)
+{
+	FMonolithSourceDatabase* DB = GetDB();
+	if (!DB || !DB->IsOpen())
+	{
+		return FMonolithActionResult::Error(TEXT("Engine source DB not available. Run source.trigger_reindex first."));
+	}
+
+	TArray<FString> SymbolNames;
+	const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+	if (Params->TryGetArrayField(TEXT("symbols"), Arr) && Arr)
+	{
+		for (const TSharedPtr<FJsonValue>& V : *Arr)
+		{
+			FString S;
+			if (V.IsValid() && V->TryGetString(S) && !S.IsEmpty())
+			{
+				SymbolNames.Add(S);
+			}
+		}
+	}
+	if (SymbolNames.Num() == 0)
+	{
+		return FMonolithActionResult::Error(TEXT("'symbols' must be a non-empty array of symbol names."));
+	}
+
+	// Deprecation status is a single batch read (Decision 3 empty-index contract).
+	const bool bDeprecationIndexEmpty = (DB->GetDeprecationCount() == 0);
+	TMap<FString, FMonolithDeprecationRow> Deprecated;
+	if (!bDeprecationIndexEmpty)
+	{
+		// Key the batch lookup on the trailing identifier (symbol_deprecations stores
+		// the parsed method name; Class:: prefixes are not in that column — Step-0).
+		TArray<FString> LookupNames;
+		LookupNames.Reserve(SymbolNames.Num());
+		for (const FString& Name : SymbolNames)
+		{
+			FString MethodName = Name;
+			const int32 ScopeIdx = Name.Find(TEXT("::"), ESearchCase::CaseSensitive, ESearchDir::FromEnd);
+			if (ScopeIdx != INDEX_NONE) MethodName = Name.Mid(ScopeIdx + 2);
+			LookupNames.AddUnique(MethodName);
+		}
+		Deprecated = DB->GetDeprecationsBatch(LookupNames);
+	}
+
+	auto ResultObj = MakeShared<FJsonObject>();
+	TArray<TSharedPtr<FJsonValue>> Records;
+	TArray<FString> TextLines;
+
+	for (const FString& Symbol : SymbolNames)
+	{
+		auto Rec = MakeShared<FJsonObject>();
+		Rec->SetStringField(TEXT("symbol"), Symbol);
+
+		const bool bExists = SymbolExists(DB, Symbol);
+		Rec->SetBoolField(TEXT("exists"), bExists);
+
+		if (!bExists)
+		{
+			Records.Add(MakeShared<FJsonValueObject>(Rec));
+			TextLines.Add(FString::Printf(TEXT("%s: NOT FOUND"), *Symbol));
+			continue;
+		}
+
+		// Include path + module (item 1 composition).
+		FString Include, Module, Warning;
+		bool bIncludable = true;
+		if (ResolveIncludeForSymbol(DB, Symbol, Include, bIncludable, Module, Warning))
+		{
+			if (!Include.IsEmpty()) Rec->SetStringField(TEXT("include"), Include);
+			Rec->SetBoolField(TEXT("includable"), bIncludable);
+			if (!Module.IsEmpty()) Rec->SetStringField(TEXT("module"), Module);
+			if (!Warning.IsEmpty()) Rec->SetStringField(TEXT("warning"), Warning);
+		}
+
+		// Signature (item 2 composition).
+		FString Signature, SigSource;
+		if (ResolveFirstSignature(DB, Symbol, Signature, SigSource))
+		{
+			Rec->SetStringField(TEXT("signature"), Signature);
+			Rec->SetStringField(TEXT("signature_source"), SigSource);
+		}
+
+		// Deprecation (item 3 composition).
+		FString MethodName = Symbol;
+		const int32 ScopeIdx = Symbol.Find(TEXT("::"), ESearchCase::CaseSensitive, ESearchDir::FromEnd);
+		if (ScopeIdx != INDEX_NONE) MethodName = Symbol.Mid(ScopeIdx + 2);
+
+		if (bDeprecationIndexEmpty)
+		{
+			Rec->SetStringField(TEXT("deprecation_index"), TEXT("empty"));
+		}
+		else if (const FMonolithDeprecationRow* Dep = Deprecated.Find(MethodName))
+		{
+			Rec->SetBoolField(TEXT("deprecated"), true);
+			Rec->SetStringField(TEXT("deprecation_version"), Dep->Version);
+			Rec->SetStringField(TEXT("deprecation_message"), Dep->Message);
+			Rec->SetStringField(TEXT("deprecation_kind"), Dep->Kind);
+		}
+		else
+		{
+			Rec->SetBoolField(TEXT("deprecated"), false);
+		}
+
+		Records.Add(MakeShared<FJsonValueObject>(Rec));
+
+		FString Line = FString::Printf(TEXT("%s: exists"), *Symbol);
+		if (!Include.IsEmpty()) Line += FString::Printf(TEXT(" | #include \"%s\"%s"), *Include, bIncludable ? TEXT("") : TEXT(" (NOT includable)"));
+		if (!Signature.IsEmpty()) Line += FString::Printf(TEXT(" | %s"), *Signature);
+		if (!bDeprecationIndexEmpty && Deprecated.Contains(MethodName)) Line += TEXT(" | DEPRECATED");
+		TextLines.Add(Line);
+	}
+
+	ResultObj->SetArrayField(TEXT("results"), Records);
+
+	TArray<TSharedPtr<FJsonValue>> ContentArr;
+	auto ContentItem = MakeShared<FJsonObject>();
+	ContentItem->SetStringField(TEXT("type"), TEXT("text"));
+	ContentItem->SetStringField(TEXT("text"), FString::Join(TextLines, TEXT("\n")));
+	ContentArr.Add(MakeShared<FJsonValueObject>(ContentItem));
+	ResultObj->SetArrayField(TEXT("content"), ContentArr);
+	return FMonolithActionResult::Success(ResultObj);
+}
+
+// ============================================================================
+// Phase 2 — item 5: find_example_usage
+//
+// Substrate is source-line FTS over source_fts (NOT the references table, which
+// is to_symbol_id-keyed and empty for engine API — Step-0 finding). Query the
+// FTS for the symbol, keep hits whose line matches the call pattern `Name(`, read
+// +/-3 context lines via LoadFileToStringArray, rank per Decision 4, and
+// cursor-paginate via MonolithCursorCodec + the rerun-slice scheme (the same
+// moving-FTS-index rationale as search_source).
+// ============================================================================
+
+FMonolithActionResult FMonolithSourceActions::HandleFindExampleUsage(const TSharedPtr<FJsonObject>& Params)
+{
+	FMonolithSourceDatabase* DB = GetDB();
+	if (!DB || !DB->IsOpen())
+	{
+		return FMonolithActionResult::Error(TEXT("Engine source DB not available. Run source.trigger_reindex first."));
+	}
+
+	const FString Symbol = Params->GetStringField(TEXT("symbol"));
+	if (Symbol.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("'symbol' is required."));
+	}
+	FString Prefer = Params->HasField(TEXT("prefer")) ? Params->GetStringField(TEXT("prefer")) : TEXT("engine");
+	Prefer = Prefer.ToLower();
+	const bool bPreferProject = (Prefer == TEXT("project"));
+	const int32 RequestedLimit = Params->HasField(TEXT("limit")) ? static_cast<int32>(Params->GetNumberField(TEXT("limit"))) : 10;
+	const FString CursorIn = Params->HasField(TEXT("cursor")) ? Params->GetStringField(TEXT("cursor")) : TEXT("");
+
+	const int32 Limit = FMath::Max(1, RequestedLimit);
+	constexpr int32 HARD_CAP_ROWS = 500;
+	constexpr int32 FTS_FETCH = 400; // candidate FTS rows to scan before ranking
+
+	// Cursor query-hash: symbol + prefer. (Mode/Module/PathFilter/Kind unused here.)
+	const uint32 CurrentHash = MonolithCursorCodec::ComputeQueryHash(
+		Symbol, Prefer, TEXT("find_example_usage"), TEXT(""), TEXT(""), TEXT(""));
+
+	int32 PageIndex = 0;
+	if (!CursorIn.IsEmpty())
+	{
+		MonolithCursorCodec::FCursorState State;
+		if (!MonolithCursorCodec::Decode(CursorIn, State) || State.QueryHash != CurrentHash)
+		{
+			TSharedPtr<FJsonObject> ErrData = MakeShared<FJsonObject>();
+			ErrData->SetStringField(TEXT("error_code"), TEXT("INVALID_CURSOR"));
+			return FMonolithActionResult::Error(
+				TEXT("Cursor decode/query mismatch; restart pagination without `cursor`."),
+				FMonolithJsonUtils::ErrInvalidParams
+			).WithErrorData(ErrData);
+		}
+		PageIndex = State.SourcePage;
+	}
+
+	// Method name = trailing identifier; needle is `Name(`.
+	FString MethodName = Symbol;
+	const int32 ScopeIdx = Symbol.Find(TEXT("::"), ESearchCase::CaseSensitive, ESearchDir::FromEnd);
+	if (ScopeIdx != INDEX_NONE) MethodName = Symbol.Mid(ScopeIdx + 2);
+	const FString NeedlePattern = MethodName + TEXT("(");
+
+	struct FUsage
+	{
+		FString File;       // ShortPath form
+		int32 Line = 0;
+		FString Context;    // +/-3 lines joined
+		int32 RankClass = 3; // 0 = engine Runtime, 1 = other engine, 2 = project
+		FString SortPath;   // tie-break (native path)
+	};
+	TArray<FUsage> Usages;
+	TSet<FString> Seen;
+
+	TArray<FMonolithSourceChunk> Chunks = DB->SearchSourceFTS(Symbol, TEXT("all"), FTS_FETCH);
+	for (const FMonolithSourceChunk& Chunk : Chunks)
+	{
+		const FString FilePath = DB->GetFilePath(Chunk.FileId);
+		TArray<FString> FileLines;
+		if (!FFileHelper::LoadFileToStringArray(FileLines, *FilePath)) continue;
+
+		const int32 WinStart = FMath::Max(0, Chunk.LineNumber - 1);
+		const int32 WinEnd = FMath::Min(FileLines.Num(), WinStart + 10);
+		for (int32 i = WinStart; i < WinEnd; ++i)
+		{
+			const FString& L = FileLines[i];
+			const int32 HitIdx = L.Find(NeedlePattern, ESearchCase::CaseSensitive);
+			if (HitIdx == INDEX_NONE) continue;
+			if (HitIdx > 0)
+			{
+				const TCHAR Prev = L[HitIdx - 1];
+				if (FChar::IsAlnum(Prev) || Prev == TEXT('_')) continue;
+			}
+
+			const FString Key = FString::Printf(TEXT("%lld_%d"), Chunk.FileId, i + 1);
+			if (Seen.Contains(Key)) continue;
+			Seen.Add(Key);
+
+			// +/-3 context lines.
+			const int32 CtxStart = FMath::Max(0, i - 3);
+			const int32 CtxEnd = FMath::Min(FileLines.Num() - 1, i + 3);
+			TArray<FString> CtxLines;
+			for (int32 c = CtxStart; c <= CtxEnd; ++c)
+			{
+				CtxLines.Add(FString::Printf(TEXT("%5d | %s"), c + 1, *FileLines[c]));
+			}
+
+			// Rank classification (Decision 4). PARITY: classify on the raw
+			// DB-stored path (forward-slashed), via the SAME `Engine/Source/`
+			// (engine) + `/Source/Runtime/` (runtime) substrings the offline
+			// mirrors (monolith_query.cpp / monolith_offline.py) use, so the
+			// rank order — and therefore the byte output — is identical across
+			// all three tools. Do NOT use FPaths::EngineDir()/ConvertRelativePathToFull
+			// here: the offline tools have no such call, and an engine *plugin*
+			// path (Engine/Plugins/.../Source/) deliberately classifies as project
+			// in all three (it lacks the `Engine/Source/` segment).
+			FString NormPath = FilePath; NormPath.ReplaceInline(TEXT("\\"), TEXT("/"));
+			const bool bIsEngine = NormPath.Contains(TEXT("Engine/Source/"));
+			const bool bIsRuntime = NormPath.Contains(TEXT("/Source/Runtime/"));
+
+			FUsage U;
+			U.File = ShortPath(FilePath);
+			U.Line = i + 1;
+			U.Context = FString::Join(CtxLines, TEXT("\n"));
+			U.SortPath = FilePath;
+			if (bIsEngine && bIsRuntime)      U.RankClass = 0;
+			else if (bIsEngine)               U.RankClass = 1;
+			else                              U.RankClass = 2;
+			Usages.Add(MoveTemp(U));
+		}
+	}
+
+	// Decision 4 ordering. For prefer:"project", project (class 2) sorts ahead of
+	// engine; otherwise engine Runtime (0) then other engine (1) then project (2).
+	Usages.Sort([bPreferProject](const FUsage& A, const FUsage& B)
+	{
+		auto Key = [bPreferProject](const FUsage& X) -> int32
+		{
+			if (!bPreferProject) return X.RankClass;          // 0,1,2 as-is
+			// prefer project: project first, then engine Runtime, then other engine.
+			switch (X.RankClass) { case 2: return 0; case 0: return 1; default: return 2; }
+		};
+		const int32 Ka = Key(A), Kb = Key(B);
+		if (Ka != Kb) return Ka < Kb;
+		if (A.SortPath != B.SortPath) return A.SortPath < B.SortPath;
+		return A.Line < B.Line;
+	});
+
+	// Rerun-slice paging over the ranked list (deterministic order => safe slice).
+	const int32 Total = Usages.Num();
+	const int32 SliceStart = FMath::Min(PageIndex * Limit, HARD_CAP_ROWS);
+	const int32 SliceEnd = FMath::Min(FMath::Min(SliceStart + Limit, Total), HARD_CAP_ROWS);
+
+	auto ResultObj = MakeShared<FJsonObject>();
+	TArray<TSharedPtr<FJsonValue>> Examples;
+	TArray<FString> TextParts;
+	for (int32 i = SliceStart; i < SliceEnd; ++i)
+	{
+		const FUsage& U = Usages[i];
+		auto Obj = MakeShared<FJsonObject>();
+		Obj->SetStringField(TEXT("file"), U.File);
+		Obj->SetNumberField(TEXT("line"), U.Line);
+		Obj->SetStringField(TEXT("context"), U.Context);
+		Examples.Add(MakeShared<FJsonValueObject>(Obj));
+		TextParts.Add(FString::Printf(TEXT("--- %s:%d ---\n%s"), *U.File, U.Line, *U.Context));
+	}
+	ResultObj->SetArrayField(TEXT("examples"), Examples);
+	// Clamp to the cap: paging never returns past HARD_CAP_ROWS, so advertising
+	// the raw Total would over-promise rows the pager will never yield. This is a
+	// structured-JSON field only — it is NOT part of the content[].text envelope,
+	// so it does not enter the offline text byte-compare (same as next_cursor; the
+	// offline tools emit plain text without either field, and the live text omits
+	// both too — parity stays meaningful on the rendered snippets).
+	ResultObj->SetNumberField(TEXT("total_estimate"), FMath::Min(Total, HARD_CAP_ROWS));
+
+	// next_cursor unless terminal (short page or cap reached).
+	const int32 RowsThisPage = SliceEnd - SliceStart;
+	const int32 NextSliceStart = (PageIndex + 1) * Limit;
+	if (RowsThisPage >= Limit && NextSliceStart < Total && NextSliceStart < HARD_CAP_ROWS)
+	{
+		MonolithCursorCodec::FCursorState OutState;
+		OutState.QueryHash = CurrentHash;
+		OutState.SymbolPage = PageIndex + 1;
+		OutState.SourcePage = PageIndex + 1;
+		OutState.CachedTotalEstimate = Total;
+		ResultObj->SetStringField(TEXT("next_cursor"), MonolithCursorCodec::Encode(OutState));
+	}
+
+	FString ResultText = TextParts.Num() > 0
+		? FString::Join(TextParts, TEXT("\n\n"))
+		: FString::Printf(TEXT("No call-site examples found for '%s'."), *Symbol);
+
+	TArray<TSharedPtr<FJsonValue>> ContentArr;
+	auto ContentItem = MakeShared<FJsonObject>();
+	ContentItem->SetStringField(TEXT("type"), TEXT("text"));
+	ContentItem->SetStringField(TEXT("text"), ResultText);
 	ContentArr.Add(MakeShared<FJsonValueObject>(ContentItem));
 	ResultObj->SetArrayField(TEXT("content"), ContentArr);
 	return FMonolithActionResult::Success(ResultObj);

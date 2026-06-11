@@ -3,10 +3,11 @@
 verify_offline_parity.py -- HARD-GATE parity guard for the two offline Monolith RI tools.
 
 Byte/deep-diffs the C++ exe (Binaries/monolith_query.exe) against the Python
-reference (Scripts/monolith_offline.py) across 23 actions: 20 Reflection-
+reference (Scripts/monolith_offline.py) across 25 actions: 20 Reflection-
 Intelligence (RI) actions spanning 4 namespaces (cppreflect, network, decision,
-risk; JSON deep-diff) PLUS 3 source-ergonomics actions (get_include_path,
-get_signature, check_deprecations; plain-text STRICT byte-compare).
+risk; JSON deep-diff) PLUS 5 source-ergonomics actions (get_include_path,
+get_signature, check_deprecations, verify_symbols, find_example_usage;
+plain-text STRICT byte-compare).
 
 This is the acceptance test for the offline-parity sprint. Strict mode (default)
 requires every JSON action to deep-equal (INCLUDING the opaque base64
@@ -257,7 +258,7 @@ def discover_chain_inputs():
 
 def build_actions(chain):
     """
-    The 20 RI actions + 3 source actions with deterministic representative args.
+    The 20 RI actions + 5 source actions with deterministic representative args.
     Each entry: (label, namespace, action, [args]) -- JSON deep-diff (default), OR
     (label, namespace, action, [args], "text") -- raw-stdout STRICT byte-compare.
 
@@ -315,6 +316,18 @@ def build_actions(chain):
          ["UGameplayStatics::ApplyDamage"], "text"),
         ("source.check_deprecations", "source", "check_deprecations",
          ["PreparePathfinding", "AActor"], "text"),
+
+        # ---- source ergonomics Phase 2 (items 4-5) -- plain-text, STRICT byte-compare ----
+        # Fixed deterministic inputs:
+        #   verify_symbols      -> a stable class-body method (exists:true via class
+        #                          row + source_fts), a stable class, and a guaranteed-
+        #                          missing name (exists:false, no error).
+        #   find_example_usage  -> a stable engine API method with many call sites;
+        #                          --limit pins the page size so the slice is fixed.
+        ("source.verify_symbols", "source", "verify_symbols",
+         ["UGameplayStatics::ApplyDamage", "AActor", "UThisDoesNotExistAnywhereXYZ"], "text"),
+        ("source.find_example_usage", "source", "find_example_usage",
+         ["UGameplayStatics::ApplyDamage", "--limit", "5"], "text"),
     ]
     return actions
 

@@ -10,13 +10,13 @@
 
 **Dependencies:** Core, CoreUObject, Engine, MonolithCore, SQLiteCore, EditorSubsystem, UnrealEd, Json, JsonUtilities, Slate, SlateCore
 
-**Note:** Module structure was flattened — the vestigial outer stub has been removed. MonolithSource registers ~14+ actions. The engine source indexer is a native C++ implementation (`UMonolithSourceSubsystem` builds `EngineSource.db` in-process). The legacy Python tree-sitter indexer (`Scripts/source_indexer/`) is no longer used.
+**Note:** Module structure was flattened — the vestigial outer stub has been removed. MonolithSource registers ~16+ actions (plus `suggest_build_cs_deps`, registered onto `source` from MonolithReflectionIntel). The engine source indexer is a native C++ implementation (`UMonolithSourceSubsystem` builds `EngineSource.db` in-process). The legacy Python tree-sitter indexer (`Scripts/source_indexer/`) is no longer used.
 
 ### Classes
 
 | Class | Responsibility |
 |-------|---------------|
-| `FMonolithSourceModule` | Registers ~14+ source actions |
+| `FMonolithSourceModule` | Registers ~16+ source actions |
 | `UMonolithSourceSubsystem` | UEditorSubsystem. Owns engine source DB. Runs native C++ source indexer. Exposes `TriggerReindex()` (full engine re-index) and `TriggerProjectReindex()` (project C++ only, incremental). **F17 (2026-04-26):** Auto-binds `FCoreUObjectDelegates::ReloadCompleteDelegate` at `Initialize` to kick incremental project reindex on Live Coding / hot-reload completion (5s cooldown + `bIsIndexing` re-entrancy guard + bootstrap-DB-missing skip). Unbinds at `Deinitialize`. |
 | `FMonolithSourceDatabase` | Read-only SQLite wrapper. Thread-safe via FCriticalSection. FTS queries with prefix matching |
 | `FMonolithSourceActions` | ~14+ handlers. Helpers: IsForwardDeclaration (regex), ExtractMembers (smart class outline), DeriveIncludePath (Phase 1) |
@@ -32,7 +32,7 @@
 
 After F17, agents do not need to invoke any source-reindex action manually in the common dev loop — just run UBT or Live Coding and `source_query` reflects the new symbols within ~1 second.
 
-### Actions (~14+ — namespace: "source")
+### Actions (~16+ — namespace: "source")
 
 | Action | Params | Description |
 |--------|--------|-------------|
@@ -50,6 +50,9 @@ After F17, agents do not need to invoke any source-reindex action manually in th
 | `get_include_path` | `symbol` | Canonical `#include` form for a symbol, derived from its indexed file path (Phase 1). See contract below. |
 | `get_signature` | `symbol` | Exact overload signature(s) for a function/method. Declaration-read primary (Phase 1). See contract below. |
 | `check_deprecations` | `symbols[]` | Batch deprecation status for a symbol list, read from the `symbol_deprecations` index (Phase 1). See contract below. |
+| `verify_symbols` | `symbols[]` | Batch pre-flight verdict: per symbol composes existence + include + signature + deprecation into one record (Phase 2). See contract below. |
+| `find_example_usage` | `symbol`, `prefer`, `limit`, `cursor` | Ranked real call-site examples via source-line FTS (`SymbolName(`), ±3 context lines, cursor-paginated (Phase 2). See contract below. |
+| `suggest_build_cs_deps` | `file_path`, `symbols[]` | Required Build.cs modules + missing deps for a file/symbol-list (Phase 2). Registered onto `source` from `MonolithReflectionIntel` — see `SPEC_MonolithReflectionIntel.md` §4b-sibling. |
 
 **DB Location:** `Plugins/Monolith/Saved/EngineSource.db`
 
@@ -69,6 +72,17 @@ Three demand-proven lookups added so an agent can resolve an include, a signatur
   - Rationale: `symbols.signature` is populated only for inline-defined functions and captures the body + macro continuations; class-body method declarations (`UGameplayStatics::ApplyDamage`, `UWorld::SpawnActor`, …) are not indexed as symbols at all, so column-only resolution would miss the bulk of the engine API.
 
 **`check_deprecations`** — accepts `symbols[]`, batch-reads `symbol_deprecations`, returns per-symbol `{deprecated, version, message, kind}`. When the table has zero rows (schema v2 landed but no reindex yet) it returns `{ index_state: "empty", hint: "run source.trigger_reindex" }` and OMITS per-symbol verdicts — never a false "no symbol is deprecated" clean bill.
+
+### Phase 2 Action Contracts (Round-Trip Compression)
+
+Three actions that collapse multiple lookups into a single round-trip. `verify_symbols` + `find_example_usage` live in `MonolithSource` and are offline-served (`monolith_query.exe` / `monolith_offline.py`); `suggest_build_cs_deps` lives in `MonolithReflectionIntel` and is **NOT offline-served** (it needs the live cached query DB + on-disk Build.cs walk — same as `audit_module_dep_reality`).
+
+**`verify_symbols`** — accepts `symbols[]`; per symbol composes the Phase-1 logic via shared C++ helpers (NOT by re-parsing the JSON handlers) into one record: `exists`, `include` / `includable` / `module` / `warning`, `signature` / `signature_source`, and `deprecated` / `deprecation_version` / `deprecation_message` / `deprecation_kind`. **`exists` for a `Class::Method` is decided by the owning class row + a source-line declaration hit (`Name(`), NEVER `symbols`-table presence** — engine class-body methods have no symbols row (Step-0 finding), so a symbols-only check would false-negative the bulk of the engine API. A missing symbol reports `exists: false` with no error and no further fields. When the deprecation index is empty (Decision 3) the record carries `deprecation_index: "empty"` instead of a verdict.
+
+**`find_example_usage`** — substrate is source-line FTS over `source_fts` (NOT the `references` table, which is `to_symbol_id`-keyed and empty for engine API methods — Step-0). Runs an FTS query for the symbol, keeps hits whose line matches the call pattern `Name(`, reads ±3 context lines via `LoadFileToStringArray`, ranks per Decision 4, and cursor-paginates via `MonolithCursorCodec` + the rerun-slice scheme (the same moving-FTS-index rationale as `search_source`).
+  - Ranking (`prefer`, default `"engine"`): `"engine"` → (0) engine `Runtime` modules, (1) other engine modules, (2) project; `"project"` → project first, then engine `Runtime`, then other engine. Tie-break by file path, then line. Engine-vs-project is decided by whether the file path is under the engine dir; the `Runtime` sub-rank by a `/Source/Runtime/` path segment.
+
+**`suggest_build_cs_deps`** — forward direction of `audit_module_dep_reality` (see `SPEC_MonolithReflectionIntel.md` §4b-sibling). Resolves the declaring module **path-first** from `file_path`, reads its `<Module>.Build.cs` from disk (works on uncommitted/unindexed files), regex-extracts used UE types (and/or accepts `symbols[]`), resolves each type's owning module via the source index, diffs against the declared deps (Core/CoreUObject/Engine/Projects/RHI/RenderCore whitelist), and returns `required_modules[]` + `missing[]`.
 
 ### Deprecation Index (schema v2)
 

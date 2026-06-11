@@ -367,6 +367,8 @@ static Args parse_args(int argc, char* argv[]) {
                   << "  get_include_path <symbol>\n"
                   << "  get_signature <symbol> [--limit=N]\n"
                   << "  check_deprecations <symbol> [<symbol> ...]\n"
+                  << "  verify_symbols <symbol> [<symbol> ...]\n"
+                  << "  find_example_usage <symbol> [--prefer=engine|project] [--limit=N]\n"
                   << "\nProject actions:\n"
                   << "  search <query> [--limit=N]\n"
                   << "  find_by_type <asset_class> [--limit=N] [--offset=N]\n"
@@ -418,6 +420,8 @@ static Args parse_args(int argc, char* argv[]) {
         "min_confidence", "status", "max_age_days", "since_unix", "repo_tag",
         "macro_filter", "specifier_name", "interface_name", "decision_id",
         "file_path",
+        // source.find_example_usage
+        "prefer",
         // db overrides
         "db", "source_db", "project_db",
     };
@@ -1245,6 +1249,236 @@ public:
             std::cout << lines[i];
         }
         std::cout << std::endl;
+    }
+
+    // Shared composition: does Class::Method (or plain symbol) EXIST? Class-row +
+    // source_fts declaration hit, NEVER the method's own symbols row (Step-0).
+    bool symbol_exists(const std::string& symbol) {
+        std::string lookup = symbol;
+        size_t scope = symbol.rfind("::");
+        if (scope != std::string::npos) lookup = symbol.substr(0, scope);
+
+        if (!query(db, "SELECT id FROM symbols WHERE name = ? LIMIT 1", {lookup}).empty())
+            return true;
+        // FTS class-row fallback.
+        {
+            std::string fts_q = escape_fts(lookup);
+            if (!query(db, "SELECT s.id FROM symbols_fts f JOIN symbols s ON s.id = f.rowid "
+                           "WHERE symbols_fts MATCH ? LIMIT 1", {fts_q}).empty())
+                return true;
+        }
+        // Source-line declaration hit for `Name(`.
+        std::string method = symbol;
+        if (scope != std::string::npos) method = symbol.substr(scope + 2);
+        std::string needle = method + "(";
+        std::string fts_q = escape_fts(symbol);
+        auto chunks = query(db,
+            "SELECT file_id, line_number FROM source_fts WHERE source_fts MATCH ? "
+            "ORDER BY bm25(source_fts) LIMIT 25", {fts_q});
+        for (auto& ch : chunks) {
+            std::ifstream f(get_file_path(ch.get_int("file_id")));
+            if (!f.is_open()) continue;
+            std::vector<std::string> fl; std::string l;
+            while (std::getline(f, l)) { if (!l.empty() && l.back() == '\r') l.pop_back(); fl.push_back(l); }
+            int ws = std::max(0, ch.get_int("line_number") - 1);
+            int we = std::min((int)fl.size(), ws + 10);
+            for (int i = ws; i < we; ++i) {
+                size_t di = fl[i].find(needle);
+                if (di == std::string::npos) continue;
+                if (di > 0) { char p = fl[i][di - 1]; if (std::isalnum((unsigned char)p) || p == '_') continue; }
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // First declaration signature: body-free column fast path, else declaration_read.
+    bool first_signature(const std::string& symbol, std::string& out_sig, std::string& out_source) {
+        std::string method = symbol;
+        size_t scope = symbol.rfind("::");
+        if (scope != std::string::npos) method = symbol.substr(scope + 2);
+        auto fnrows = query(db,
+            "SELECT signature, file_id, line_start FROM symbols WHERE name = ? AND kind = 'function'",
+            {method});
+        for (auto& r : fnrows) {
+            std::string sig = r.get("signature");
+            if (sig.empty()) continue;
+            if (sig.find('{') != std::string::npos || sig.find('\\') != std::string::npos) continue;
+            size_t b = sig.find_first_not_of(" \t\r\n");
+            size_t e = sig.find_last_not_of(" \t\r\n");
+            out_sig = (b == std::string::npos) ? "" : sig.substr(b, e - b + 1);
+            out_source = "column";
+            return true;
+        }
+        std::string fts_q = escape_fts(symbol);
+        auto chunks = query(db,
+            "SELECT file_id, line_number FROM source_fts WHERE source_fts MATCH ? "
+            "ORDER BY bm25(source_fts) LIMIT 50", {fts_q});
+        std::string needle = method + "(";
+        for (auto& ch : chunks) {
+            std::ifstream f(get_file_path(ch.get_int("file_id")));
+            if (!f.is_open()) continue;
+            std::vector<std::string> fl; std::string l;
+            while (std::getline(f, l)) fl.push_back(l);
+            int ws = std::max(0, ch.get_int("line_number") - 1);
+            int we = std::min((int)fl.size(), ws + 10);
+            for (int i = ws; i < we; ++i) {
+                size_t di = fl[i].find(needle);
+                if (di == std::string::npos) continue;
+                if (di > 0) { char p = fl[i][di - 1]; if (std::isalnum((unsigned char)p) || p == '_') continue; }
+                std::string sig = compact_declaration(fl, i);
+                if (sig.empty() || sig.find(needle) == std::string::npos) continue;
+                out_sig = sig; out_source = "declaration_read";
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // --- verify_symbols (item 4) ---
+    void verify_symbols(const Args& args) {
+        if (args.positional.empty()) die("verify_symbols requires one or more symbol arguments");
+
+        auto cnt = query(db, "SELECT COUNT(*) as c FROM symbol_deprecations", {});
+        bool dep_empty = cnt.empty() || cnt[0].get_int("c") == 0;
+
+        std::vector<std::string> lines;
+        for (const auto& symbol : args.positional) {
+            bool exists = symbol_exists(symbol);
+            if (!exists) { lines.push_back(symbol + ": NOT FOUND"); continue; }
+
+            std::string line = symbol + ": exists";
+
+            // include
+            bool found = false;
+            Row sym = resolve_symbol_row(symbol, found);
+            std::string include, module_name, warning; bool includable = true;
+            if (found) {
+                std::string lookup = symbol;
+                size_t scope = symbol.rfind("::");
+                if (scope != std::string::npos) lookup = symbol.substr(0, scope);
+                auto allrows = query(db,
+                    "SELECT s.file_id, f.path FROM symbols s JOIN files f ON f.id = s.file_id WHERE s.name = ?",
+                    {lookup});
+                int file_id = sym.get_int("file_id");
+                std::string file_path = get_file_path(file_id);
+                for (auto& r : allrows) {
+                    std::string p = r.get("path");
+                    if (p.size() >= 2 && p.substr(p.size() - 2) == ".h") { file_id = r.get_int("file_id"); file_path = p; break; }
+                }
+                auto mrows = query(db,
+                    "SELECT m.name FROM files f JOIN modules m ON m.id = f.module_id WHERE f.id = ?",
+                    {std::to_string(file_id)});
+                module_name = mrows.empty() ? "" : mrows[0].get("name");
+                include = derive_include_path(file_path, includable, warning, module_name);
+            }
+            if (!include.empty())
+                line += " | #include \"" + include + "\"" + (includable ? "" : " (NOT includable)");
+
+            // signature
+            std::string sig, sig_src;
+            if (first_signature(symbol, sig, sig_src) && !sig.empty())
+                line += " | " + sig;
+
+            // deprecation
+            if (!dep_empty) {
+                std::string method = symbol;
+                size_t scope = symbol.rfind("::");
+                if (scope != std::string::npos) method = symbol.substr(scope + 2);
+                auto drows = query(db,
+                    "SELECT version FROM symbol_deprecations WHERE symbol_name = ? LIMIT 1", {method});
+                if (!drows.empty()) line += " | DEPRECATED";
+            }
+            lines.push_back(line);
+        }
+        for (size_t i = 0; i < lines.size(); ++i) { if (i > 0) std::cout << "\n"; std::cout << lines[i]; }
+        std::cout << std::endl;
+    }
+
+    // --- find_example_usage (item 5) ---
+    void find_example_usage(const Args& args) {
+        if (args.positional.empty()) die("find_example_usage requires a symbol argument");
+        std::string symbol = args.positional[0];
+        std::string prefer = args.opt("prefer", "engine");
+        std::transform(prefer.begin(), prefer.end(), prefer.begin(), ::tolower);
+        bool prefer_project = (prefer == "project");
+        int limit = std::max(1, args.opt_int("limit", 10));
+        const int HARD_CAP = 500, FTS_FETCH = 400;
+
+        std::string method = symbol;
+        size_t scope = symbol.rfind("::");
+        if (scope != std::string::npos) method = symbol.substr(scope + 2);
+        std::string needle = method + "(";
+
+        struct Usage { std::string file; int line; std::string context; int rank; std::string sort_path; };
+        std::vector<Usage> usages;
+        std::set<std::string> seen;
+
+        std::string fts_q = escape_fts(symbol);
+        auto chunks = query(db,
+            "SELECT file_id, line_number FROM source_fts WHERE source_fts MATCH ? "
+            "ORDER BY bm25(source_fts) LIMIT " + std::to_string(FTS_FETCH), {fts_q});
+        for (auto& ch : chunks) {
+            std::string fp = get_file_path(ch.get_int("file_id"));
+            std::ifstream f(fp);
+            if (!f.is_open()) continue;
+            std::vector<std::string> fl; std::string l;
+            while (std::getline(f, l)) { if (!l.empty() && l.back() == '\r') l.pop_back(); fl.push_back(l); }
+            int ws = std::max(0, ch.get_int("line_number") - 1);
+            int we = std::min((int)fl.size(), ws + 10);
+            for (int i = ws; i < we; ++i) {
+                size_t hi = fl[i].find(needle);
+                if (hi == std::string::npos) continue;
+                if (hi > 0) { char p = fl[i][hi - 1]; if (std::isalnum((unsigned char)p) || p == '_') continue; }
+                std::string key = std::to_string(ch.get_int("file_id")) + "_" + std::to_string(i + 1);
+                if (seen.count(key)) continue;
+                seen.insert(key);
+
+                int cs = std::max(0, i - 3), ce = std::min((int)fl.size() - 1, i + 3);
+                std::ostringstream ctx;
+                for (int c = cs; c <= ce; ++c) {
+                    char buf[16]; std::snprintf(buf, sizeof(buf), "%5d", c + 1);
+                    ctx << buf << " | " << fl[c];
+                    if (c < ce) ctx << "\n";
+                }
+                // engine-vs-project + Runtime classification. PARITY: identical
+                // rule across live / exe / py — classify on the forward-slashed raw
+                // stored path via the `Engine/Source/` (engine) + `/Source/Runtime/`
+                // (runtime) substrings. An engine plugin path (Engine/Plugins/.../
+                // Source/) lacks `Engine/Source/` and so ranks as project in all three.
+                std::string norm = fp;
+                for (auto& ch2 : norm) if (ch2 == '\\') ch2 = '/';
+                bool is_engine = norm.find("Engine/Source/") != std::string::npos;
+                bool is_runtime = norm.find("/Source/Runtime/") != std::string::npos;
+                int rank = is_engine ? (is_runtime ? 0 : 1) : 2;
+                usages.push_back({short_path(fp), i + 1, ctx.str(), rank, fp});
+            }
+        }
+
+        auto rank_key = [&](const Usage& x) -> int {
+            if (!prefer_project) return x.rank;
+            switch (x.rank) { case 2: return 0; case 0: return 1; default: return 2; }
+        };
+        std::stable_sort(usages.begin(), usages.end(), [&](const Usage& a, const Usage& b) {
+            int ka = rank_key(a), kb = rank_key(b);
+            if (ka != kb) return ka < kb;
+            if (a.sort_path != b.sort_path) return a.sort_path < b.sort_path;
+            return a.line < b.line;
+        });
+
+        int total = (int)usages.size();
+        int slice_end = std::min(std::min(limit, total), HARD_CAP);
+        if (total == 0) { std::cout << "No call-site examples found for '" << symbol << "'." << std::endl; return; }
+        // PARITY: emit ONLY the rendered snippets (no total_estimate / next_cursor).
+        // Those are structured-JSON fields the live handler sets on its result
+        // object, not on content[].text. The text byte-compare runs against the
+        // live content[].text, which likewise omits both. Do NOT add them here.
+        std::ostringstream out;
+        for (int i = 0; i < slice_end; ++i) {
+            if (i > 0) out << "\n\n";
+            out << "--- " << usages[i].file << ":" << usages[i].line << " ---\n" << usages[i].context;
+        }
+        std::cout << out.str() << std::endl;
     }
 };
 
@@ -3220,6 +3454,8 @@ int main(int argc, char* argv[]) {
             {"get_include_path",    [](SourceActions& s, const Args& a) { s.get_include_path(a); }},
             {"get_signature",       [](SourceActions& s, const Args& a) { s.get_signature(a); }},
             {"check_deprecations",  [](SourceActions& s, const Args& a) { s.check_deprecations(a); }},
+            {"verify_symbols",      [](SourceActions& s, const Args& a) { s.verify_symbols(a); }},
+            {"find_example_usage",  [](SourceActions& s, const Args& a) { s.find_example_usage(a); }},
         };
 
         auto it = actions.find(args.action);

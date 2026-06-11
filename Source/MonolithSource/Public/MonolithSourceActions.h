@@ -35,6 +35,37 @@ public:
 	 */
 	static FString CompactDeclaration(const TArray<FString>& Lines, int32 StartIdx);
 
+	// --- Phase 2 shared composition helpers (item 4 calls these, NOT the JSON
+	//     handlers; public for unit testing — see MonolithCppErgonomicsTest.cpp).
+
+	/**
+	 * Resolve a symbol's canonical include + owning module from the DB. Mirrors the
+	 * item-1 (get_include_path) resolution: resolves Class::Method via the owning
+	 * class row, prefers a header among same-name rows, derives the includable form.
+	 * Returns false when no class row + no FTS hit resolve it.
+	 */
+	static bool ResolveIncludeForSymbol(FMonolithSourceDatabase* DB, const FString& Symbol,
+		FString& OutInclude, bool& OutIncludable, FString& OutModule, FString& OutWarning);
+
+	/**
+	 * Resolve the first declaration signature for a symbol. Mirrors the item-2
+	 * (get_signature) resolution: body-free `signature` column fast path, else
+	 * declaration-read over source_fts. OutSource is "column" | "declaration_read".
+	 * Returns false when no signature is found (does NOT by itself imply
+	 * non-existence — an existing class with no resolvable method signature still
+	 * has a class row).
+	 */
+	static bool ResolveFirstSignature(FMonolithSourceDatabase* DB, const FString& Symbol,
+		FString& OutSignature, FString& OutSource);
+
+	/**
+	 * Decide whether a Class::Method (or plain symbol) EXISTS in the indexed source.
+	 * Per Step-0 finding: existence is class-row presence (for Class::Method, the
+	 * owning class) OR a source_fts declaration hit for `Name(` — NEVER symbols-table
+	 * presence of the method itself. Engine class-body methods have no symbols row.
+	 */
+	static bool SymbolExists(FMonolithSourceDatabase* DB, const FString& Symbol);
+
 private:
 	// Action handlers
 	static FMonolithActionResult HandleReadSource(const TSharedPtr<FJsonObject>& Params);
@@ -53,6 +84,10 @@ private:
 	static FMonolithActionResult HandleGetIncludePath(const TSharedPtr<FJsonObject>& Params);    // item 1
 	static FMonolithActionResult HandleGetSignature(const TSharedPtr<FJsonObject>& Params);      // item 2
 	static FMonolithActionResult HandleCheckDeprecations(const TSharedPtr<FJsonObject>& Params); // item 3
+
+	// Phase 2 — round-trip compression
+	static FMonolithActionResult HandleVerifySymbols(const TSharedPtr<FJsonObject>& Params);     // item 4
+	static FMonolithActionResult HandleFindExampleUsage(const TSharedPtr<FJsonObject>& Params);  // item 5
 
 	// Helpers
 	static FMonolithSourceDatabase* GetDB();
