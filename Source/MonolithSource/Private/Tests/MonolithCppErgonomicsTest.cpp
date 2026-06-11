@@ -165,21 +165,35 @@ bool FCppErgoDeprecationIndexExtractionTest::RunTest(const FString& /*Parameters
 	// StillFine must NOT be present.
 	TestFalse(TEXT("StillFine not deprecated"), DB.GetDeprecation(TEXT("StillFine")).IsSet());
 
-	// symbol_id NULL for both (class-body methods are not indexed as symbols).
+	// symbol_id NON-NULL (linked) for both.
+	//
+	// 2026-06-11 allman-class indexing fix: DeprecatedThings.h's UDeprecatedThings is
+	// declared allman-style (`{` on the line after `class`). Phase B of
+	// MonolithCppParser now indexes such plain classes and ExtractMembers extracts the
+	// class-body methods Foo/Baz as `function` symbol rows. The deprecation extractor
+	// resolves symbol_id by EXACT NAME (MonolithSourceIndexer SymbolNameToId.Find), so
+	// Foo/Baz now LINK to their member rows instead of storing NULL. This test
+	// previously encoded the OLD limitation (allman plain classes were invisible to
+	// Phase B, so class-body methods had no symbols row -> symbol_id NULL); both rows
+	// are now linked.
+	//
+	// Linkage caveat (not redesigned here): SymbolNameToId is keyed on the BARE name,
+	// so two same-named members across the corpus would collide to the last-inserted
+	// id. Foo/Baz are unique in this corpus, so the linkage is deterministic.
 	{
 		FSQLiteDatabase* Raw = DB.GetRawHandle();
 		if (Raw)
 		{
 			FSQLitePreparedStatement Stmt;
-			Stmt.Create(*Raw, TEXT("SELECT COUNT(*) FROM symbol_deprecations WHERE symbol_id IS NULL;"));
-			int32 NullCount = -1;
+			Stmt.Create(*Raw, TEXT("SELECT COUNT(*) FROM symbol_deprecations WHERE symbol_id IS NOT NULL;"));
+			int32 LinkedCount = -1;
 			if (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
 			{
 				int64 C = 0;
 				Stmt.GetColumnValueByIndex(0, C);
-				NullCount = static_cast<int32>(C);
+				LinkedCount = static_cast<int32>(C);
 			}
-			TestEqual(TEXT("both rows have symbol_id NULL"), NullCount, 2);
+			TestEqual(TEXT("both rows have a linked (non-NULL) symbol_id"), LinkedCount, 2);
 		}
 	}
 
@@ -957,6 +971,175 @@ bool FCppErgoGenerateClassStubNeverWritesTest::RunTest(const FString& /*Paramete
 	}
 
 	IFileManager::Get().DeleteDirectory(*SnapDir, /*bRequireExists=*/false, /*bTree=*/true);
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// AllmanClassIndexing — plain (non-reflected) classes/structs declared in Epic's
+// allman style (opening brace on the next line) get a symbols row + members, while
+// forward declarations and multi-line template parameters do NOT. Indexes the
+// staged corpus (AllmanCases.h among the fixtures) into a disposable DB and asserts
+// each Phase-B case from the plan §12.
+// ---------------------------------------------------------------------------
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCppErgoAllmanClassIndexingTest,
+	"Monolith.Source.CppErgonomics.AllmanClassIndexing",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCppErgoAllmanClassIndexingTest::RunTest(const FString& /*Parameters*/)
+{
+	using namespace MonolithCppErgoTestDetail;
+
+	const FString DbPath = MakeTempDbPath();
+	FString StagedDir;
+	FString Err;
+	if (!IndexFixtureCorpus(DbPath, StagedDir, Err))
+	{
+		AddError(Err);
+		IFileManager::Get().Delete(*DbPath, false, true);
+		return false;
+	}
+
+	FMonolithSourceDatabase DB;
+	if (!DB.Open(DbPath))
+	{
+		AddError(TEXT("Failed to reopen indexed DB"));
+		IFileManager::Get().Delete(*DbPath, false, true);
+		IFileManager::Get().DeleteDirectory(*StagedDir, /*bRequireExists=*/false, /*bTree=*/true);
+		return false;
+	}
+
+	// Helper: does a class/struct row exist for Name (definition rows have line_end > line_start)?
+	auto ClassRow = [&](const TCHAR* Name) -> TOptional<FMonolithSourceSymbol>
+	{
+		// Try both kinds — GetSymbolsByName with empty kind returns class OR struct.
+		TArray<FMonolithSourceSymbol> Rows = DB.GetSymbolsByName(FString(Name));
+		for (const FMonolithSourceSymbol& R : Rows)
+		{
+			if (R.Kind == TEXT("class") || R.Kind == TEXT("struct"))
+			{
+				return R;
+			}
+		}
+		return TOptional<FMonolithSourceSymbol>();
+	};
+
+	// 1) Plain allman class FAllmanPlain -> class row with a real line span, members extracted.
+	{
+		TOptional<FMonolithSourceSymbol> Row = ClassRow(TEXT("FAllmanPlain"));
+		TestTrue(TEXT("FAllmanPlain indexed"), Row.IsSet());
+		if (Row.IsSet())
+		{
+			TestEqual(TEXT("FAllmanPlain is a class"), Row.GetValue().Kind, FString(TEXT("class")));
+			TestTrue(TEXT("FAllmanPlain has a body span"), Row.GetValue().LineEnd > Row.GetValue().LineStart);
+		}
+
+		// Members: a variable Member and a function GetMember, both qualified to the class.
+		bool bFoundVar = false, bFoundFunc = false;
+		for (const FMonolithSourceSymbol& M : DB.GetSymbolsByName(TEXT("Member")))
+		{
+			if (M.Kind == TEXT("variable") && M.QualifiedName == TEXT("FAllmanPlain::Member")) { bFoundVar = true; }
+		}
+		for (const FMonolithSourceSymbol& M : DB.GetSymbolsByName(TEXT("GetMember")))
+		{
+			if (M.Kind == TEXT("function") && M.QualifiedName == TEXT("FAllmanPlain::GetMember")) { bFoundFunc = true; }
+		}
+		TestTrue(TEXT("FAllmanPlain::Member extracted"), bFoundVar);
+		TestTrue(TEXT("FAllmanPlain::GetMember extracted"), bFoundFunc);
+
+		// Reallocation use-after-free regression guard: FAllmanPlain declares 14 members,
+		// so Result.Symbols reallocates MID-extraction. Every member must extract with the
+		// correct FAllmanPlain ParentClass (carried via QualifiedName). If ParentClass were
+		// a dangling reference into the reallocated array, these would be missing or wrong.
+		// Reaching this point at all also proves indexing did not AV.
+		for (int32 N = 0; N <= 11; ++N)
+		{
+			const FString MemberName = FString::Printf(TEXT("Member%02d"), N);
+			const FString Qualified = FString::Printf(TEXT("FAllmanPlain::Member%02d"), N);
+			bool bFound = false;
+			for (const FMonolithSourceSymbol& M : DB.GetSymbolsByName(MemberName))
+			{
+				if (M.Kind == TEXT("variable") && M.QualifiedName == Qualified) { bFound = true; }
+			}
+			TestTrue(*FString::Printf(TEXT("%s extracted with correct ParentClass"), *Qualified), bFound);
+		}
+	}
+
+	// 2) Allman class with same-line inheritance -> row + recorded base class.
+	{
+		TOptional<FMonolithSourceSymbol> Row = ClassRow(TEXT("FAllmanDerived"));
+		TestTrue(TEXT("FAllmanDerived indexed"), Row.IsSet());
+		if (Row.IsSet())
+		{
+			TArray<FMonolithSourceInheritance> Parents = DB.GetParents(Row.GetValue().Id);
+			bool bHasBase = false;
+			for (const FMonolithSourceInheritance& P : Parents)
+			{
+				if (P.Name == TEXT("FAllmanPlain")) { bHasBase = true; }
+			}
+			TestTrue(TEXT("FAllmanDerived base FAllmanPlain recorded"), bHasBase);
+		}
+	}
+
+	// 3) Same-line-brace one-liner (today's 87-style) still indexes — no regression.
+	{
+		TOptional<FMonolithSourceSymbol> Row = ClassRow(TEXT("FOneLiner"));
+		TestTrue(TEXT("FOneLiner (same-line brace) indexed"), Row.IsSet());
+		if (Row.IsSet())
+		{
+			TestEqual(TEXT("FOneLiner is a struct"), Row.GetValue().Kind, FString(TEXT("struct")));
+		}
+	}
+
+	// 4) Forward declaration `class FAllmanFwd;` -> NO row (no brace found -> dropped).
+	{
+		TestFalse(TEXT("FAllmanFwd forward decl NOT indexed"), ClassRow(TEXT("FAllmanFwd")).IsSet());
+	}
+
+	// 5) Multi-line template parameter list: the `class T` line must NOT produce a row
+	//    (template-param guard), but the real FAllmanTpl declaration must index.
+	{
+		// No symbol named exactly "T" of class/struct kind.
+		bool bBogusT = false;
+		for (const FMonolithSourceSymbol& R : DB.GetSymbolsByName(TEXT("T")))
+		{
+			if (R.Kind == TEXT("class") || R.Kind == TEXT("struct")) { bBogusT = true; }
+		}
+		TestFalse(TEXT("template param T NOT indexed as a type"), bBogusT);
+		TestTrue(TEXT("FAllmanTpl indexed past the template params"), ClassRow(TEXT("FAllmanTpl")).IsSet());
+	}
+
+	// 6) Two adjacent one-line structs both index (cursor-advance guard — the brace
+	//    lookahead for FStructA must not consume FStructB).
+	{
+		TestTrue(TEXT("FStructA indexed"), ClassRow(TEXT("FStructA")).IsSet());
+		TestTrue(TEXT("FStructB indexed"), ClassRow(TEXT("FStructB")).IsSet());
+	}
+
+	// 7) UNTERMINATED allman body at EOF (no closing `}`). Regression guard for the
+	//    access violation: FindClosingBrace returns the line COUNT sentinel for an
+	//    unterminated body, which previously drove ExtractMembers' StartIdx past the
+	//    array. Reaching this point at all means indexing did NOT crash. This
+	//    implementation records the class row (best-effort) but extracts NO members.
+	{
+		TestTrue(TEXT("FAllmanUnterminated indexed (no crash, best-effort row)"),
+			ClassRow(TEXT("FAllmanUnterminated")).IsSet());
+
+		// No member should be extracted for the unterminated body.
+		bool bBogusMember = false;
+		for (const FMonolithSourceSymbol& M : DB.GetSymbolsByName(TEXT("NeverReached")))
+		{
+			if (M.QualifiedName == TEXT("FAllmanUnterminated::NeverReached")) { bBogusMember = true; }
+		}
+		TestFalse(TEXT("FAllmanUnterminated members NOT extracted"), bBogusMember);
+	}
+
+	// Teardown: close the DB FIRST, then delete the staged corpus. The reads above
+	// run against the DB only, but the staged-dir lifetime contract (FTS-backed reads
+	// re-open staged files) is honoured uniformly across this suite.
+	DB.Close();
+	IFileManager::Get().Delete(*DbPath, false, true);
+	IFileManager::Get().DeleteDirectory(*StagedDir, /*bRequireExists=*/false, /*bTree=*/true);
 	return true;
 }
 

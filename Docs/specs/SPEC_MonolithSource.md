@@ -121,4 +121,15 @@ Two actions for header pre-flight + class scaffolding. Both are read-only / idem
 
 **`build_cs_path` backfill:** the same Phase 1 indexer change backfills the `modules.build_cs_path` column (previously inserted empty). `DiscoverProjectModules` / `DiscoverEngineModules` derive each module's `<Module>.Build.cs` path from its `Source/<Module>/` dir. `get_include_path`'s `build_cs_note` reads this populated column. Existing DBs pick up the value on the same full `trigger_reindex` bootstrap.
 
+### Class/Struct Indexer Coverage (allman + K&R)
+
+`FMonolithCppParser::ExtractClassesAndStructs` extracts class/struct rows in two passes:
+
+- **Phase A** — UCLASS/USTRUCT/UINTERFACE-anchored reflected types. Already allman-tolerant (looks ahead ≤5 lines for the declaration, ≤2 more for the brace), so reflected coverage is unaffected by the change below.
+- **Phase B** — plain (non-reflected) classes/structs. Previously required the opening `{` **on the declaration line**, so the entire allman-style plain surface (Epic's coding standard — brace on the next line) was structurally excluded: `>99%` of exported non-reflected engine types (e.g. `FCollisionShape`, `FSceneView`, `FPrimitiveSceneProxy`) had no `symbols` row and no extracted members. Phase B is now allman-tolerant: the pattern's trailing token is a `{`-or-end-of-line alternation (so allman decls AND today's same-line/inline one-liners both match), and a ≤3-clean-line lookahead confirms the opening brace OPENS a following line. Behaviour:
+  - **Forward declarations stay excluded** — `class FFoo;` fails the regex, and any match with no opening brace found in the lookahead window is DROPPED (Phase B has no UE-macro anchor proving a definition follows, unlike Phase A).
+  - **Template-parameter guard** — a multi-line template parameter list can place `class T` alone on a line ahead of the real class's `{`; if the nearest preceding non-empty clean line ends with `<` or `,`, the match is treated as a template parameter and skipped (the SUBSEQUENT real declaration still indexes).
+
+**Bootstrap requirement:** the parser change is indexer-side, no schema change. Existing `EngineSource.db` files enrich with the previously-missing plain-class rows and their members on the next full `source.trigger_reindex` (the project-only F17/`trigger_project_reindex` pass enriches project symbols only). No offline-tool change — `monolith_query.exe` / `monolith_offline.py` read the same DB and return the richer results automatically after reindex.
+
 ---

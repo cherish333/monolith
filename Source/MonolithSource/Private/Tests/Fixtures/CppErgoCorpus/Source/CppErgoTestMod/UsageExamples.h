@@ -6,15 +6,14 @@
 // it exists:true via the owning class row + source_fts declaration hit, NOT via
 // symbols-table presence.
 //
-// NOTE: the opening brace MUST sit on the `class` declaration line (K&R). The
-// non-UE class parser (MonolithCppParser.cpp NonUEPattern) anchors `^...class
-// <Name> ... {` and requires a SAME-LINE `{`; an allman brace on the next line
-// is not indexed as a class symbol row, which would break the class-existence
-// assertions. The allman-class indexing gap is tracked as a deferred parser
-// follow-up in the plan's "Considered and deferred" section.
+// The class is declared in Epic's allman style (opening brace on the line after
+// the `class` declaration). Phase-B of MonolithCppParser's class extractor looks
+// ahead for the brace, so this indexes as a class row exactly like a same-line
+// brace would — this fixture is the live regression case for that fix.
 #pragma once
 
-class UCppErgoUsage {
+class UCppErgoUsage
+{
 public:
 	void Run();
 
