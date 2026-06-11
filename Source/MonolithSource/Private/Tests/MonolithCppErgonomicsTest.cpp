@@ -641,4 +641,323 @@ bool FCppErgoFindExampleUsagePaginationTest::RunTest(const FString& /*Parameters
 	return true;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 3 Test: LintHeaderRuleTable — each fixture header exercises one rule;
+// a clean header reports zero findings. Pure over LintHeaderLines (no DB).
+// ---------------------------------------------------------------------------
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCppErgoLintHeaderRuleTableTest,
+	"Monolith.Source.CppErgonomics.LintHeaderRuleTable",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCppErgoLintHeaderRuleTableTest::RunTest(const FString& /*Parameters*/)
+{
+	using namespace MonolithCppErgoTestDetail;
+
+	const FString ModDir = GetFixtureCorpusDir() / TEXT("Source") / TEXT("CppErgoTestMod");
+
+	// The committed lint fixtures carry a `.h.fixture` extension so UnrealHeaderTool
+	// never parses their reflection macros (UHT walks every `*.h` under the module
+	// tree and would hard-error on the deliberately-broken UCLASS layouts — and even
+	// register the clean one). But rule (c)/(d) key on the LINTED FILE's base name
+	// via FPaths::GetBaseFilename, which strips only the LAST extension: linting a
+	// `.h.fixture` would yield base "LintClean.h" (not "LintClean") and fire a bogus
+	// rule-c mismatch on the clean case. So STAGE each fixture to AutomationTransientDir
+	// under a real `Source/CppErgoTestMod/<name>.h` name (byte-verbatim copy) — the
+	// `.h` base name makes rule (c)/(d) correct, and the preserved Source/<Module>/
+	// tree keeps the path-first module derivation resolving CppErgoTestMod.
+	const FString StageRoot = FPaths::AutomationTransientDir()
+		/ FString::Printf(TEXT("cppergo-lint-%s"), *FGuid::NewGuid().ToString());
+	const FString StageModDir = StageRoot / TEXT("Source") / TEXT("CppErgoTestMod");
+	FPlatformFileManager::Get().GetPlatformFile().CreateDirectoryTree(*StageModDir);
+
+	// Stage a `.h.fixture` to a real `<RealName>.h` under the staged module dir; return
+	// the staged path. Byte-verbatim so linted CONTENT is identical to the committed file.
+	auto StageFixture = [&](const FString& FixtureName, const FString& RealHeaderName) -> FString
+	{
+		const FString Src = ModDir / FixtureName;
+		const FString Dst = StageModDir / RealHeaderName;
+		TArray<uint8> Bytes;
+		if (!FFileHelper::LoadFileToArray(Bytes, *Src) || !FFileHelper::SaveArrayToFile(Bytes, *Dst))
+		{
+			AddError(FString::Printf(TEXT("Could not stage lint fixture %s -> %s"), *Src, *Dst));
+			return FString();
+		}
+		return Dst;
+	};
+
+	// Helper: stage a `.h.fixture` to a real `.h` and lint it. RealHeaderName drives
+	// rule (c)/(d) base-name logic (e.g. "LintClean.h").
+	auto LintFixture = [&](const FString& FixtureName, const FString& RealHeaderName,
+		const TSet<FString>& Specs) -> TArray<FMonolithSourceActions::FLintFinding>
+	{
+		const FString Path = StageFixture(FixtureName, RealHeaderName);
+		if (Path.IsEmpty()) { return {}; }
+		TArray<FString> Lines;
+		if (!FFileHelper::LoadFileToStringArray(Lines, *Path))
+		{
+			AddError(FString::Printf(TEXT("Could not load staged lint fixture: %s"), *Path));
+			return {};
+		}
+		return FMonolithSourceActions::LintHeaderLines(Path, Lines, Specs);
+	};
+
+	auto HasRule = [](const TArray<FMonolithSourceActions::FLintFinding>& F, const TCHAR* RuleId) -> bool
+	{
+		for (const FMonolithSourceActions::FLintFinding& Fi : F) { if (Fi.RuleId == RuleId) return true; }
+		return false;
+	};
+
+	// Assert the finding set's rule_ids are EXACTLY `Expected` (order-independent) —
+	// catches spurious extra rules (e.g. the rule-c false positive) as well as
+	// missing ones.
+	auto TestExactRules = [&](const TCHAR* Label, const TArray<FMonolithSourceActions::FLintFinding>& F,
+		const TArray<FString>& Expected)
+	{
+		TSet<FString> Got;
+		for (const FMonolithSourceActions::FLintFinding& Fi : F) { Got.Add(Fi.RuleId); }
+		TSet<FString> Want;
+		for (const FString& R : Expected) { Want.Add(R); }
+		bool bMatch = (Got.Num() == Want.Num());
+		if (bMatch)
+		{
+			for (const FString& R : Got) { if (!Want.Contains(R)) { bMatch = false; break; } }
+		}
+		if (!bMatch)
+		{
+			AddError(FString::Printf(TEXT("%s: rule set mismatch. got=[%s] expected=[%s]"),
+				Label, *FString::Join(Got.Array(), TEXT(",")), *FString::Join(Want.Array(), TEXT(","))));
+		}
+		TestTrue(Label, bMatch);
+	};
+
+	const TSet<FString> NoSpecs;
+
+	// Clean header -> zero findings. (Staged as LintClean.h so rule-c base-name
+	// matching sees "LintClean" == "LintClean".)
+	{
+		TArray<FMonolithSourceActions::FLintFinding> F = LintFixture(TEXT("LintClean.h.fixture"), TEXT("LintClean.h"), NoSpecs);
+		TestEqual(TEXT("clean header zero findings"), F.Num(), 0);
+	}
+
+	// (a) missing GENERATED_BODY — EXACTLY {missing_generated_body}.
+	{
+		TArray<FMonolithSourceActions::FLintFinding> F = LintFixture(TEXT("LintMissingGeneratedBody.h.fixture"), TEXT("LintMissingGeneratedBody.h"), NoSpecs);
+		TestExactRules(TEXT("(a) LintMissingGeneratedBody exact rules"), F, { TEXT("missing_generated_body") });
+		// Each finding carries a message.
+		for (const FMonolithSourceActions::FLintFinding& Fi : F)
+		{
+			TestTrue(TEXT("(a) finding has message"), !Fi.Message.IsEmpty());
+		}
+	}
+
+	// (b) *.generated.h not last — EXACTLY {generated_h_not_last}. CRITICAL negated
+	// assertion: this fixture's last include is a NON-generated header, so the
+	// rule-c name-mismatch must NOT fire (regression guard for the false positive).
+	{
+		TArray<FMonolithSourceActions::FLintFinding> F = LintFixture(TEXT("LintGeneratedNotLast.h.fixture"), TEXT("LintGeneratedNotLast.h"), NoSpecs);
+		TestTrue(TEXT("(b) generated_h_not_last reported"), HasRule(F, TEXT("generated_h_not_last")));
+		TestFalse(TEXT("(b) NO spurious generated_h_name_mismatch"), HasRule(F, TEXT("generated_h_name_mismatch")));
+		TestExactRules(TEXT("(b) LintGeneratedNotLast exact rules"), F, { TEXT("generated_h_not_last") });
+		for (const FMonolithSourceActions::FLintFinding& Fi : F)
+		{
+			if (Fi.RuleId == TEXT("generated_h_not_last")) { TestTrue(TEXT("(b) has line"), Fi.Line > 0); }
+		}
+	}
+
+	// (c) generated.h name mismatch — EXACTLY {generated_h_name_mismatch}. Staged as
+	// LintNameMismatch.h; the include is "WrongName.generated.h" -> mismatch fires.
+	{
+		TArray<FMonolithSourceActions::FLintFinding> F = LintFixture(TEXT("LintNameMismatch.h.fixture"), TEXT("LintNameMismatch.h"), NoSpecs);
+		TestExactRules(TEXT("(c) LintNameMismatch exact rules"), F, { TEXT("generated_h_name_mismatch") });
+	}
+
+	// (d) missing <MODULE>_API — EXACTLY {missing_api_macro}.
+	{
+		TArray<FMonolithSourceActions::FLintFinding> F = LintFixture(TEXT("LintMissingApiMacro.h.fixture"), TEXT("LintMissingApiMacro.h"), NoSpecs);
+		TestExactRules(TEXT("(d) LintMissingApiMacro exact rules"), F, { TEXT("missing_api_macro") });
+	}
+
+	// (e) UPROPERTY in non-reflected type — EXACTLY {reflected_member_in_non_reflected_type}
+	// (deduped; the fixture has both a UPROPERTY and a UFUNCTION, same rule_id).
+	{
+		TArray<FMonolithSourceActions::FLintFinding> F = LintFixture(TEXT("LintOrphanUproperty.h.fixture"), TEXT("LintOrphanUproperty.h"), NoSpecs);
+		TestExactRules(TEXT("(e) LintOrphanUproperty exact rules"), F, { TEXT("reflected_member_in_non_reflected_type") });
+		// Both members fire (two findings, one rule_id).
+		int32 Count = 0;
+		for (const FMonolithSourceActions::FLintFinding& Fi : F)
+		{
+			if (Fi.RuleId == TEXT("reflected_member_in_non_reflected_type")) { ++Count; }
+		}
+		TestEqual(TEXT("(e) both UPROPERTY + UFUNCTION fire"), Count, 2);
+	}
+
+	// (f) invalid specifier — exercised against the CLEAN header's UCLASS() (no
+	// specifier) by passing a vocabulary that lacks an injected bad token. We
+	// instead lint an in-memory header carrying UCLASS(NotARealSpecifier).
+	{
+		TArray<FString> Lines;
+		Lines.Add(TEXT("#pragma once"));
+		Lines.Add(TEXT("#include \"CoreMinimal.h\""));
+		Lines.Add(TEXT("#include \"LintBadSpecifier.generated.h\""));
+		Lines.Add(TEXT("UCLASS(Blueprintable, NotARealSpecifier)"));
+		Lines.Add(TEXT("class CPPERGOTESTMOD_API ULintBadSpecifier : public UObject"));
+		Lines.Add(TEXT("{"));
+		Lines.Add(TEXT("\tGENERATED_BODY()"));
+		Lines.Add(TEXT("};"));
+
+		TSet<FString> Specs;
+		Specs.Add(TEXT("Blueprintable"));
+		Specs.Add(TEXT("BlueprintType"));
+		// "NotARealSpecifier" deliberately absent from the vocabulary.
+
+		const FString FakePath = ModDir / TEXT("LintBadSpecifier.h");
+		TArray<FMonolithSourceActions::FLintFinding> F =
+			FMonolithSourceActions::LintHeaderLines(FakePath, Lines, Specs);
+		TestTrue(TEXT("(f) invalid_specifier reported"), HasRule(F, TEXT("invalid_specifier")));
+
+		// Degrade gracefully: with an EMPTY vocabulary, the specifier rule is skipped.
+		TArray<FMonolithSourceActions::FLintFinding> F2 =
+			FMonolithSourceActions::LintHeaderLines(FakePath, Lines, TSet<FString>());
+		TestFalse(TEXT("(f) skipped when vocabulary empty"), HasRule(F2, TEXT("invalid_specifier")));
+	}
+
+	// Teardown: remove the staged-fixture tree (all reads above are done).
+	IFileManager::Get().DeleteDirectory(*StageRoot, /*bRequireExists=*/false, /*bTree=*/true);
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3 Test: GenerateClassStubText — the templated .h/.cpp pair carries the
+// API macro, parent include FIRST, *.generated.h LAST, GENERATED_BODY(), and the
+// correct constructor form. Pure over GenerateClassStubText (no DB).
+// ---------------------------------------------------------------------------
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCppErgoGenerateClassStubTextTest,
+	"Monolith.Source.CppErgonomics.GenerateClassStubText",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCppErgoGenerateClassStubTextTest::RunTest(const FString& /*Parameters*/)
+{
+	// Plain default constructor (parent does NOT require FObjectInitializer).
+	// UE "Add C++ Class" file-naming: class UMyComp -> file base "MyComp", so the
+	// includes are "MyComp.generated.h" / "MyComp.h" (U prefix stripped), while the
+	// C++ class identifier stays UMyComp.
+	{
+		FString H, C;
+		FMonolithSourceActions::GenerateClassStubText(
+			TEXT("UActorComponent"), TEXT("UMyComp"), TEXT("MyMod"),
+			TEXT("Components/ActorComponent.h"), /*bNeedsObjInit=*/false, H, C);
+
+		TestTrue(TEXT("h has API macro"), H.Contains(TEXT("MYMOD_API")));
+		TestTrue(TEXT("h has parent include"), H.Contains(TEXT("#include \"Components/ActorComponent.h\"")));
+		TestTrue(TEXT("h has GENERATED_BODY"), H.Contains(TEXT("GENERATED_BODY()")));
+		TestTrue(TEXT("h has parent base"), H.Contains(TEXT(": public UActorComponent")));
+		// The class IDENTIFIER keeps the U prefix.
+		TestTrue(TEXT("h declares UMyComp"), H.Contains(TEXT("class MYMOD_API UMyComp : public UActorComponent")));
+
+		// *.generated.h must be the LAST include line — and use the PREFIX-STRIPPED
+		// file base ("MyComp.generated.h", NOT "UMyComp.generated.h").
+		const int32 GenIdx = H.Find(TEXT("#include \"MyComp.generated.h\""));
+		const int32 ParentIdx = H.Find(TEXT("#include \"Components/ActorComponent.h\""));
+		TestTrue(TEXT("prefix-stripped generated.h present"), GenIdx != INDEX_NONE);
+		TestFalse(TEXT("NO U-prefixed generated.h"), H.Contains(TEXT("UMyComp.generated.h")));
+		TestTrue(TEXT("parent include before generated.h"), ParentIdx != INDEX_NONE && ParentIdx < GenIdx);
+		// No #include appears after the generated.h.
+		TestEqual(TEXT("generated.h is last include"),
+			H.Find(TEXT("#include"), ESearchCase::CaseSensitive, ESearchDir::FromEnd), GenIdx);
+
+		// .cpp: prefix-stripped include "MyComp.h" + plain default constructor on the
+		// full class identifier UMyComp (no FObjectInitializer).
+		TestTrue(TEXT("cpp has prefix-stripped include"), C.Contains(TEXT("#include \"MyComp.h\"")));
+		TestFalse(TEXT("cpp NO U-prefixed include"), C.Contains(TEXT("#include \"UMyComp.h\"")));
+		TestTrue(TEXT("cpp plain ctor on full identifier"), C.Contains(TEXT("UMyComp::UMyComp()")));
+		TestFalse(TEXT("cpp no FObjectInitializer"), C.Contains(TEXT("FObjectInitializer")));
+	}
+
+	// FObjectInitializer overload form. Class AMyChild -> file base "MyChild".
+	{
+		FString H, C;
+		FMonolithSourceActions::GenerateClassStubText(
+			TEXT("AMyParent"), TEXT("AMyChild"), TEXT("MyMod"),
+			TEXT("MyParent.h"), /*bNeedsObjInit=*/true, H, C);
+		TestTrue(TEXT("h ctor takes FObjectInitializer"),
+			H.Contains(TEXT("AMyChild(const FObjectInitializer& ObjectInitializer);")));
+		TestTrue(TEXT("cpp ctor takes FObjectInitializer"),
+			C.Contains(TEXT("AMyChild::AMyChild(const FObjectInitializer& ObjectInitializer)")));
+		TestTrue(TEXT("cpp inits Super"), C.Contains(TEXT(": Super(ObjectInitializer)")));
+		// A-prefix is stripped from the FILE names.
+		TestTrue(TEXT("h prefix-stripped generated.h"), H.Contains(TEXT("#include \"MyChild.generated.h\"")));
+		TestTrue(TEXT("cpp prefix-stripped include"), C.Contains(TEXT("#include \"MyChild.h\"")));
+	}
+
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3 Test: GenerateClassStubNeverWrites — v1 has NO write path (Decision 1).
+// Snapshot the transient dir before/after a stub-text generation; assert zero new
+// files. Also assert the registered schema exposes no write_to_disk param (the
+// param-schema is keyed off RegisterAll, but the handler routes through GetDB()
+// which the test cannot supply — so we assert the helper itself touches no disk).
+// ---------------------------------------------------------------------------
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCppErgoGenerateClassStubNeverWritesTest,
+	"Monolith.Source.CppErgonomics.GenerateClassStubNeverWrites",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCppErgoGenerateClassStubNeverWritesTest::RunTest(const FString& /*Parameters*/)
+{
+	using namespace MonolithCppErgoTestDetail;
+
+	const FString SnapDir = FPaths::AutomationTransientDir()
+		/ FString::Printf(TEXT("cppergo-stub-snap-%s"), *FGuid::NewGuid().ToString());
+	FPlatformFileManager::Get().GetPlatformFile().CreateDirectoryTree(*SnapDir);
+
+	auto CountFiles = [&]() -> int32
+	{
+		TArray<FString> Files;
+		IFileManager::Get().FindFilesRecursive(Files, *SnapDir, TEXT("*"), /*Files=*/true, /*Dirs=*/false, /*bClearFileNames=*/true);
+		return Files.Num();
+	};
+
+	const int32 Before = CountFiles();
+
+	// Generate text repeatedly — the helper must never touch disk.
+	for (int32 i = 0; i < 5; ++i)
+	{
+		FString H, C;
+		FMonolithSourceActions::GenerateClassStubText(
+			TEXT("AActor"), FString::Printf(TEXT("AMyActor%d"), i), TEXT("MyMod"),
+			TEXT("GameFramework/Actor.h"), /*bNeedsObjInit=*/false, H, C);
+		TestTrue(TEXT("text produced"), !H.IsEmpty() && !C.IsEmpty());
+	}
+
+	const int32 After = CountFiles();
+	TestEqual(TEXT("no files written by stub generation"), After, Before);
+
+	// Confirm the registered schema exposes no write_to_disk param.
+	{
+		FMonolithToolRegistry& Registry = FMonolithToolRegistry::Get();
+		if (Registry.HasAction(TEXT("source"), TEXT("generate_class_stub")))
+		{
+			const TArray<FMonolithActionInfo> Actions = Registry.GetActions(TEXT("source"));
+			for (const FMonolithActionInfo& Info : Actions)
+			{
+				if (Info.Action != TEXT("generate_class_stub")) { continue; }
+				if (!Info.ParamSchema.IsValid()) { break; }
+				// The param schema is flat: each param name is a top-level key.
+				TestFalse(TEXT("no write_to_disk param"), Info.ParamSchema->HasField(TEXT("write_to_disk")));
+				TestFalse(TEXT("no target_dir param"), Info.ParamSchema->HasField(TEXT("target_dir")));
+				// Confirm the three declared params ARE present (sanity).
+				TestTrue(TEXT("parent param present"), Info.ParamSchema->HasField(TEXT("parent")));
+				break;
+			}
+		}
+	}
+
+	IFileManager::Get().DeleteDirectory(*SnapDir, /*bRequireExists=*/false, /*bTree=*/true);
+	return true;
+}
+
 #endif // WITH_DEV_AUTOMATION_TESTS

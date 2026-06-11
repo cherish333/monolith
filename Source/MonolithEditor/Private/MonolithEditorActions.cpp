@@ -11,6 +11,13 @@
 #include "Misc/App.h"
 #include "Misc/AutomationTest.h"
 
+// Item 8: fix_hints — borrow the shared source DB (LNK2019 owner-module +
+// C4996 deprecation resolution). MonolithEditor already PrivateDependsOn
+// MonolithSource (MonolithEditor.Build.cs) — one-way Editor -> Source borrow.
+#include "MonolithSourceDatabase.h"
+#include "MonolithSourceSubsystem.h"
+#include "SQLiteDatabase.h"
+
 #if PLATFORM_WINDOWS
 #include "ILiveCodingModule.h"
 #endif
@@ -1088,7 +1095,176 @@ FMonolithActionResult FMonolithEditorActions::HandleGetBuildErrors(const TShared
 	for (const FString& C : ExcludeCategories) { ExclEcho.Add(MakeShared<FJsonValueString>(C)); }
 	Root->SetArrayField(TEXT("excluded_categories"), ExclEcho);
 
+	// Item 8 (ADDITIVE): deterministic error->fix-hint pattern table. Computed over
+	// the SAME error objects already in `errors[]` so the per-error `fix_hint` lands
+	// on the objects callers see. Existing fields are byte-identical — BuildFixHints
+	// only ADDS a `fix_hint` string to matched objects + returns a top-level array.
+	TArray<TSharedPtr<FJsonValue>> FixHints = BuildFixHints(ErrorsArr);
+	Root->SetArrayField(TEXT("fix_hints"), FixHints);
+
 	return FMonolithActionResult::Success(Root);
+}
+
+// ============================================================================
+// Item 8: BuildFixHints — deterministic error->fix-hint pattern table.
+//
+// ADDITIVE-ONLY contract: stamps a `fix_hint` string onto matched error objects
+// in-place and returns a top-level `fix_hints[]` array; never mutates any
+// pre-existing error field. Borrows the shared source DB the way the RI adapter
+// does (game-thread ensure + FScopeLock(GetLock()); statement finalized before
+// the lock releases; never a second handle on EngineSource.db).
+// ============================================================================
+
+TArray<TSharedPtr<FJsonValue>> FMonolithEditorActions::BuildFixHints(const TArray<TSharedPtr<FJsonValue>>& ErrorObjs)
+{
+	TArray<TSharedPtr<FJsonValue>> Hints;
+
+	// Resolve the borrowed source DB (may be null — degrade gracefully).
+	FMonolithSourceDatabase* SourceDb = nullptr;
+	if (IsInGameThread() && GEditor)
+	{
+		if (UMonolithSourceSubsystem* SS = GEditor->GetEditorSubsystem<UMonolithSourceSubsystem>())
+		{
+			SourceDb = SS->GetDatabase();
+		}
+	}
+
+	// LNK2019 on Z_Construct_* -> the missing module owns the referenced UClass.
+	// Resolve owner module via the source DB; statement is finalized before the
+	// lock releases (single borrow, no second handle).
+	auto ResolveOwnerModuleForZConstruct = [SourceDb](const FString& SymbolFragment, FString& OutModule) -> bool
+	{
+		OutModule.Empty();
+		if (!SourceDb || !SourceDb->GetRawHandle()) { return false; }
+		// Z_Construct_UClass_UFoo_NoRegister -> recover the "UFoo" type name.
+		FString TypeName;
+		{
+			FString S = SymbolFragment;
+			int32 Idx = S.Find(TEXT("Z_Construct_UClass_"), ESearchCase::CaseSensitive);
+			if (Idx != INDEX_NONE) { S = S.Mid(Idx + FCString::Strlen(TEXT("Z_Construct_UClass_"))); }
+			// Trim any trailing _NoRegister / decoration after the type name.
+			int32 Cut = INDEX_NONE;
+			if (S.FindChar(TEXT('_'), Cut)) { TypeName = S.Left(Cut); }
+			else { TypeName = S; }
+		}
+		if (TypeName.IsEmpty()) { return false; }
+
+		bool bResolved = false;
+		{
+			FScopeLock Lock(&SourceDb->GetLock());
+			FSQLiteDatabase* DB = SourceDb->GetRawHandle();
+			if (!DB) { return false; }
+			FSQLitePreparedStatement Stmt;
+			if (Stmt.Create(*DB, TEXT(
+				"SELECT m.name FROM symbols s "
+				"JOIN files f ON f.id = s.file_id "
+				"JOIN modules m ON m.id = f.module_id "
+				"WHERE s.name = ? GROUP BY m.name LIMIT 1;")))
+			{
+				Stmt.SetBindingValueByIndex(1, TypeName);
+				if (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+				{
+					Stmt.GetColumnValueByIndex(0, OutModule);
+					bResolved = !OutModule.IsEmpty();
+				}
+				// Finalize the statement BEFORE the lock releases (borrow-contract end).
+				Stmt.Destroy();
+			}
+		}
+		return bResolved;
+	};
+
+	for (int32 Idx = 0; Idx < ErrorObjs.Num(); ++Idx)
+	{
+		const TSharedPtr<FJsonObject>* ErrObjPtr = nullptr;
+		if (!ErrorObjs[Idx].IsValid() || !ErrorObjs[Idx]->TryGetObject(ErrObjPtr) || !ErrObjPtr) { continue; }
+		const TSharedPtr<FJsonObject>& ErrObj = *ErrObjPtr;
+
+		FString Message;
+		ErrObj->TryGetStringField(TEXT("message"), Message);
+		if (Message.IsEmpty()) { continue; }
+
+		FString Pattern;
+		FString Hint;
+
+		// --- LNK2019 on Z_Construct_* (missing module dep). ---
+		if (Message.Contains(TEXT("LNK2019")) && Message.Contains(TEXT("Z_Construct_")))
+		{
+			Pattern = TEXT("LNK2019_Z_Construct");
+			FString OwnerModule;
+			if (ResolveOwnerModuleForZConstruct(Message, OwnerModule))
+			{
+				Hint = FString::Printf(
+					TEXT("Unresolved UClass constructor — the referenced type is owned by module '%s'. Add \"%s\" to your Build.cs PrivateDependencyModuleNames (or PublicDependencyModuleNames)."),
+					*OwnerModule, *OwnerModule);
+			}
+			else
+			{
+				Hint = TEXT("Unresolved UClass constructor (Z_Construct_*) — the referenced type's owning module is missing from your Build.cs dependency list. Add the module that declares that UCLASS.");
+			}
+		}
+		// --- DeveloperSettings-module LNK2019 (common gotcha). ---
+		else if (Message.Contains(TEXT("LNK2019")) &&
+				 (Message.Contains(TEXT("UDeveloperSettings")) || Message.Contains(TEXT("DeveloperSettings"))))
+		{
+			Pattern = TEXT("LNK2019_DeveloperSettings");
+			Hint = TEXT("UDeveloperSettings lives in the 'DeveloperSettings' module (NOT 'Engine'). Add \"DeveloperSettings\" to your Build.cs dependency list.");
+		}
+		// --- C4996 deprecation. ---
+		else if (Message.Contains(TEXT("C4996")))
+		{
+			Pattern = TEXT("C4996_deprecation");
+			// Try to recover the deprecated identifier and attach the indexed message.
+			FString DeprMsg;
+			if (SourceDb && SourceDb->IsOpen())
+			{
+				// Parse a quoted identifier or "'Name': ..." form from the warning.
+				FString Ident;
+				int32 Q1 = Message.Find(TEXT("'"), ESearchCase::CaseSensitive);
+				if (Q1 != INDEX_NONE)
+				{
+					FString Rest = Message.Mid(Q1 + 1);
+					int32 Q2 = Rest.Find(TEXT("'"), ESearchCase::CaseSensitive);
+					if (Q2 != INDEX_NONE) { Ident = Rest.Left(Q2); }
+				}
+				// Take a trailing :: scope as the method name.
+				if (!Ident.IsEmpty())
+				{
+					int32 ScopeIdx = Ident.Find(TEXT("::"), ESearchCase::CaseSensitive, ESearchDir::FromEnd);
+					const FString LookupName = (ScopeIdx != INDEX_NONE) ? Ident.Mid(ScopeIdx + 2) : Ident;
+					TArray<FString> Names; Names.Add(LookupName);
+					TMap<FString, FMonolithDeprecationRow> Dep = SourceDb->GetDeprecationsBatch(Names);
+					if (const FMonolithDeprecationRow* Row = Dep.Find(LookupName))
+					{
+						DeprMsg = FString::Printf(TEXT("'%s' is UE_DEPRECATED (%s): %s"), *LookupName, *Row->Version, *Row->Message);
+					}
+				}
+			}
+			Hint = DeprMsg.IsEmpty()
+				? TEXT("Deprecated API used (C4996). Query source.check_deprecations with the symbol name for the replacement, or read the deprecation message in the warning text.")
+				: DeprMsg;
+		}
+		// --- 'generated.h must be the last include'. ---
+		else if (Message.Contains(TEXT("generated.h")) && Message.Contains(TEXT("last")))
+		{
+			Pattern = TEXT("generated_h_not_last");
+			Hint = TEXT("The '*.generated.h' include must be the LAST #include in the header. Move it below every other include.");
+		}
+
+		if (!Hint.IsEmpty())
+		{
+			// ADDITIVE: stamp the per-error hint on the object (new field only).
+			ErrObj->SetStringField(TEXT("fix_hint"), Hint);
+
+			TSharedPtr<FJsonObject> HintObj = MakeShared<FJsonObject>();
+			HintObj->SetNumberField(TEXT("error_index"), Idx);
+			HintObj->SetStringField(TEXT("pattern"), Pattern);
+			HintObj->SetStringField(TEXT("hint"), Hint);
+			Hints.Add(MakeShared<FJsonValueObject>(HintObj));
+		}
+	}
+
+	return Hints;
 }
 
 FMonolithActionResult FMonolithEditorActions::HandleGetBuildStatus(const TSharedPtr<FJsonObject>& Params)

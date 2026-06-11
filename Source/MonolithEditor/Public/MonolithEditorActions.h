@@ -50,6 +50,17 @@ public:
 
 	static FMonolithActionResult HandleTriggerBuild(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleGetBuildErrors(const TSharedPtr<FJsonObject>& Params);
+
+	/**
+	 * Deterministic error->fix-hint pattern table (item 8). Given the already-built
+	 * error-object array, returns an ADDITIVE array of {error_index, pattern, hint}
+	 * objects (one per matched error) AND stamps a `fix_hint` string onto the matched
+	 * error objects in-place. Existing error fields are never mutated otherwise.
+	 * Reads the borrowed source DB (FScopeLock on its lock) for LNK2019 owner-module
+	 * resolution + the C4996 deprecation message; degrades to a generic hint when the
+	 * DB is unavailable. Public for unit testing (FixHintsAdditive).
+	 */
+	static TArray<TSharedPtr<FJsonValue>> BuildFixHints(const TArray<TSharedPtr<FJsonValue>>& ErrorObjs);
 	static FMonolithActionResult HandleGetBuildStatus(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleGetBuildSummary(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleSearchBuildOutput(const TSharedPtr<FJsonObject>& Params);

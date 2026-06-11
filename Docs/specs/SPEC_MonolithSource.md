@@ -32,7 +32,7 @@
 
 After F17, agents do not need to invoke any source-reindex action manually in the common dev loop — just run UBT or Live Coding and `source_query` reflects the new symbols within ~1 second.
 
-### Actions (~16+ — namespace: "source")
+### Actions (~18+ — namespace: "source")
 
 | Action | Params | Description |
 |--------|--------|-------------|
@@ -53,6 +53,8 @@ After F17, agents do not need to invoke any source-reindex action manually in th
 | `verify_symbols` | `symbols[]` | Batch pre-flight verdict: per symbol composes existence + include + signature + deprecation into one record (Phase 2). See contract below. |
 | `find_example_usage` | `symbol`, `prefer`, `limit`, `cursor` | Ranked real call-site examples via source-line FTS (`SymbolName(`), ±3 context lines, cursor-paginated (Phase 2). See contract below. |
 | `suggest_build_cs_deps` | `file_path`, `symbols[]` | Required Build.cs modules + missing deps for a file/symbol-list (Phase 2). Registered onto `source` from `MonolithReflectionIntel` — see `SPEC_MonolithReflectionIntel.md` §4b-sibling. |
+| `lint_header` | `file_path` | Regex-level UHT-gotcha lint of a single header (Phase 3). Works on UNINDEXED files. Structured findings `{rule_id, line, message, severity}`; clean header → zero findings. See contract below. |
+| `generate_class_stub` | `parent`, `class_name`, `module` | UCLASS-derived `.h`/`.cpp` stub pair returned as TEXT — never writes to disk (Phase 3, Decision 1). See contract below. |
 
 **DB Location:** `Plugins/Monolith/Saved/EngineSource.db`
 
@@ -83,6 +85,24 @@ Three actions that collapse multiple lookups into a single round-trip. `verify_s
   - Ranking (`prefer`, default `"engine"`): `"engine"` → (0) engine `Runtime` modules, (1) other engine modules, (2) project; `"project"` → project first, then engine `Runtime`, then other engine. Tie-break by file path, then line. Engine-vs-project is decided by whether the file path is under the engine dir; the `Runtime` sub-rank by a `/Source/Runtime/` path segment.
 
 **`suggest_build_cs_deps`** — forward direction of `audit_module_dep_reality` (see `SPEC_MonolithReflectionIntel.md` §4b-sibling). Resolves the declaring module **path-first** from `file_path`, reads its `<Module>.Build.cs` from disk (works on uncommitted/unindexed files), regex-extracts used UE types (and/or accepts `symbols[]`), resolves each type's owning module via the source index, diffs against the declared deps (Core/CoreUObject/Engine/Projects/RHI/RenderCore whitelist), and returns `required_modules[]` + `missing[]`.
+
+### Phase 3 Action Contracts (Pre-Flight Lint + Stub Gen)
+
+Two actions for header pre-flight + class scaffolding. Both are read-only / idempotent and offline-served by `monolith_query.exe` / `monolith_offline.py` (item 9 text mode is a pure DB read — Decision 5).
+
+**`lint_header`** — `file_path` (required). Reads a single header via `FFileHelper::LoadFileToStringArray` and applies a deterministic regex rule table. **MUST work on UNINDEXED files** — the primary case is a header the agent just wrote, not yet in `EngineSource.db`. The `<MODULE>_API` macro check derives the module name PRIMARILY from the file path (`Source/<Module>/...` / `Plugins/<X>/Source/<Module>/...`); no DB read is required. Returns structured findings `{rule_id, line, message, severity}` (sorted by line then rule_id) + a `finding_count`; a clean header returns zero findings. `FRegexMatcher`/`FRegexPattern` are constructed as locals only (ICU init contract). Rules:
+
+| `rule_id` | Severity | Fires when |
+|-----------|----------|-----------|
+| `missing_generated_body` | error | A reflected type (UCLASS/USTRUCT) declares no `GENERATED_BODY()`. |
+| `generated_h_not_last` | error | The `*.generated.h` include is not the LAST `#include`. |
+| `missing_generated_h_include` | error | A reflected type uses `GENERATED_BODY()` but has no `*.generated.h` include. |
+| `generated_h_name_mismatch` | error | The `*.generated.h` base name ≠ the header file base name. |
+| `missing_api_macro` | warning | A UCLASS-declared type lacks the expected `<MODULE>_API` export macro. |
+| `reflected_member_in_non_reflected_type` | error | `UPROPERTY`/`UFUNCTION` in a file with no UCLASS/USTRUCT. |
+| `invalid_specifier` | warning | A specifier token not in the cppreflect `list_class_specifiers` vocabulary. **Cross-check only — degrades gracefully (rule skipped) when RI is unavailable**, e.g. in the offline tools, which always skip it. |
+
+**`generate_class_stub`** — `parent`, `class_name`, `module` (all required). Resolves the parent's header + owning module via the source DB and returns a `.h`/`.cpp` pair as TEXT (fields: `header`, `cpp`, `parent_include`, `api_macro`, `uses_object_initializer`). **TEXT-RETURN-ONLY — NEVER writes to disk** (Decision 1): no `write_to_disk` param, no `target_dir` param, no `written_path` in the response. v1 supports **UCLASS-derived parents ONLY** (no USTRUCT/UENUM/UINTERFACE — rejected cleanly). The `.h` emits `<MODULE>_API`, the parent header include FIRST, `"<Class>.generated.h"` LAST, and `GENERATED_BODY()`. The `.cpp` emits a plain default constructor unless the parent's indexed constructor signature requires `FObjectInitializer&` (detected by an FObjectInitializer-only ctor with no plain alternative).
 
 ### Deprecation Index (schema v2)
 

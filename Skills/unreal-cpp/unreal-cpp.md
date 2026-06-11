@@ -5,7 +5,7 @@ description: Use when writing or debugging Unreal Engine C++ code via Monolith M
 
 # Unreal C++ Development Workflows
 
-**~17+ source actions** via `source_query()`, **6 config actions** via `config_query()`.
+**~18+ source actions** via `source_query()`, **6 config actions** via `config_query()`.
 
 ```
 monolith_discover({ namespace: "source" })
@@ -31,6 +31,8 @@ monolith_discover({ namespace: "config" })
 | `verify_symbols` | `symbols` | Batch pre-flight: existence + include + signature + deprecation per symbol in one call |
 | `find_example_usage` | `symbol` | Ranked real call-site examples (±3 context lines), `prefer` engine/project, cursor-paged |
 | `suggest_build_cs_deps` | `file_path` | Required Build.cs modules + missing deps for a file (works on uncommitted files) |
+| `lint_header` | `file_path` | Regex UHT-gotcha lint of a header (works on UNINDEXED files); findings `{rule_id, line, message, severity}` |
+| `generate_class_stub` | `parent`, `class_name`, `module` | UCLASS-derived `.h`/`.cpp` stub pair as TEXT (never writes; generated.h last, `<MODULE>_API`) |
 | `trigger_reindex` | -- | Full engine source re-index |
 | `trigger_project_reindex` | -- | Incremental project-only re-index |
 

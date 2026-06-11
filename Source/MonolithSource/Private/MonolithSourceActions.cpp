@@ -177,6 +177,27 @@ void FMonolithSourceActions::RegisterAll()
 
 	Registry.SetActionAnnotations(TEXT("source"), TEXT("verify_symbols"),     /*bReadOnly=*/true, /*bDestructive=*/false, /*bIdempotent=*/true, TEXT("Verify symbols"));
 	Registry.SetActionAnnotations(TEXT("source"), TEXT("find_example_usage"), /*bReadOnly=*/true, /*bDestructive=*/false, /*bIdempotent=*/true, TEXT("Find example usage"));
+
+	// --- Phase 3: pre-flight lint + stub gen (items 7, 9) ---
+
+	Registry.RegisterAction(TEXT("source"), TEXT("lint_header"),
+		TEXT("Regex-level UHT-gotcha lint of a single header file. Works on UNINDEXED files (a header you just wrote). Deterministic rule table: GENERATED_BODY presence/position, *.generated.h last-include, UCLASS/class-name match, missing <MODULE>_API, UPROPERTY/UFUNCTION in a non-reflected type, invalid specifier token. Returns structured findings {rule_id, line, message, severity}; a clean header returns zero findings."),
+		FMonolithActionHandler::CreateStatic(&FMonolithSourceActions::HandleLintHeader),
+		FParamSchemaBuilder()
+			.RequiredDiskPath(TEXT("file_path"), TEXT("Header file path to lint"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("source"), TEXT("generate_class_stub"),
+		TEXT("Generate a UCLASS-derived .h/.cpp stub pair as TEXT (never writes to disk). Resolves the parent header + owning module via the source DB, emits <MODULE>_API, parent header include FIRST, \"<Class>.generated.h\" LAST, GENERATED_BODY(), and a plain default constructor (the FObjectInitializer& overload only when the parent requires it). UCLASS-derived parents only; other parents are rejected cleanly."),
+		FMonolithActionHandler::CreateStatic(&FMonolithSourceActions::HandleGenerateClassStub),
+		FParamSchemaBuilder()
+			.Required(TEXT("parent"), TEXT("string"), TEXT("Parent class name (must be UCLASS-derived, e.g. AActor, UActorComponent)"))
+			.Required(TEXT("class_name"), TEXT("string"), TEXT("New class name (with U/A prefix, e.g. UMyComp, AMyActor)"))
+			.Required(TEXT("module"), TEXT("string"), TEXT("Owning module name (used to derive the <MODULE>_API export macro)"))
+			.Build());
+
+	Registry.SetActionAnnotations(TEXT("source"), TEXT("lint_header"),          /*bReadOnly=*/true, /*bDestructive=*/false, /*bIdempotent=*/true, TEXT("Lint header"));
+	Registry.SetActionAnnotations(TEXT("source"), TEXT("generate_class_stub"),  /*bReadOnly=*/true, /*bDestructive=*/false, /*bIdempotent=*/true, TEXT("Generate class stub"));
 }
 
 // ============================================================================
@@ -2278,5 +2299,563 @@ FMonolithActionResult FMonolithSourceActions::HandleFindExampleUsage(const TShar
 	ContentItem->SetStringField(TEXT("text"), ResultText);
 	ContentArr.Add(MakeShared<FJsonValueObject>(ContentItem));
 	ResultObj->SetArrayField(TEXT("content"), ContentArr);
+	return FMonolithActionResult::Success(ResultObj);
+}
+
+// ============================================================================
+// Phase 3 — item 7: lint_header
+//
+// A self-contained regex lint over a SINGLE header file. MUST work on UNINDEXED
+// files (the primary case is a header the agent just wrote, not yet in the DB),
+// so the rule table reads only the file lines + the file path. The expected
+// <MODULE>_API token is derived PRIMARILY from the path; an optional valid-
+// specifier vocabulary cross-check degrades gracefully when empty. FRegexMatcher
+// is constructed as a LOCAL only (ICU init contract — Regex.h:41).
+// ============================================================================
+
+namespace MonolithLintDetail
+{
+	// Derive the owning module name from a .../Source/<Module>/ segment (covers
+	// both Source/<Module>/ and Plugins/<X>/Source/<Module>/). Returns empty when
+	// no recognised layout is present.
+	static FString DeriveModuleFromPath(const FString& FilePath)
+	{
+		FString Path = FilePath;
+		Path.ReplaceInline(TEXT("\\"), TEXT("/"));
+		const int32 SrcIdx = Path.Find(TEXT("/Source/"), ESearchCase::IgnoreCase, ESearchDir::FromEnd);
+		if (SrcIdx == INDEX_NONE) return FString();
+		const FString AfterSrc = Path.Mid(SrcIdx + 8); // skip "/Source/"
+		int32 Slash = INDEX_NONE;
+		if (AfterSrc.FindChar(TEXT('/'), Slash))
+		{
+			return AfterSrc.Left(Slash);
+		}
+		return FString();
+	}
+
+	// Strip // line comments from a code line so the rule scans don't fire on
+	// commented-out macros. Multi-line block comments are handled by the caller.
+	static FString StripComment(const FString& Line)
+	{
+		const int32 LineComment = Line.Find(TEXT("//"), ESearchCase::CaseSensitive);
+		return (LineComment != INDEX_NONE) ? Line.Left(LineComment) : Line;
+	}
+
+	// Strip block comments from a single source line, threading the multi-line
+	// state through bInOutBlock. Avoids the FString::Find start-position overload
+	// by chopping the leading already-scanned portion off a working copy each pass.
+	static FString StripBlockComments(const FString& Line, bool& bInOutBlock)
+	{
+		FString Result;
+		FString Work = Line;
+		while (true)
+		{
+			if (bInOutBlock)
+			{
+				const int32 End = Work.Find(TEXT("*/"), ESearchCase::CaseSensitive);
+				if (End == INDEX_NONE) { return Result; }  // whole remainder is inside a block
+				Work = Work.Mid(End + 2);
+				bInOutBlock = false;
+			}
+			const int32 Open = Work.Find(TEXT("/*"), ESearchCase::CaseSensitive);
+			if (Open == INDEX_NONE) { Result += Work; return Result; }
+			Result += Work.Left(Open);
+			Work = Work.Mid(Open + 2);
+			bInOutBlock = true;
+		}
+	}
+}
+
+TArray<FMonolithSourceActions::FLintFinding> FMonolithSourceActions::LintHeaderLines(
+	const FString& FilePath, const TArray<FString>& Lines, const TSet<FString>& ValidSpecifiers)
+{
+	using namespace MonolithLintDetail;
+
+	TArray<FLintFinding> Findings;
+
+	const FString ModuleName = DeriveModuleFromPath(FilePath);
+	const FString ExpectedApiMacro = ModuleName.IsEmpty() ? FString() : (ModuleName.ToUpper() + TEXT("_API"));
+
+	bool bInBlockComment = false;
+	bool bHasGeneratedBody = false;
+	int32 GeneratedBodyLine = 0;
+
+	int32 LastIncludeLine = 0;
+	FString LastIncludePath;
+	int32 GeneratedHIncludeLine = 0;
+	FString GeneratedHIncludePath;   // the ACTUAL *.generated.h include (NOT the last include — fixes rule-c false positive)
+
+	struct FReflectedType { int32 MacroLine = 0; FString MacroKind; FString DeclaredName; int32 DeclLine = 0; bool bHasApiMacro = false; };
+	TArray<FReflectedType> ReflectedTypes;
+	bool bAnyReflectedMacro = false;
+
+	bool bPendingReflected = false;
+	FString PendingKind;
+	int32 PendingMacroLine = 0;
+
+	// Regex (LOCALS only — ICU init contract).
+	const FRegexPattern IncludePattern(TEXT("^\\s*#\\s*include\\s+[\"<]([^\">]+)[\">]"));
+	const FRegexPattern ClassDeclPattern(TEXT("^\\s*(?:class|struct)\\s+(?:[A-Z][A-Z0-9_]*_API\\s+)?([A-Za-z_][A-Za-z0-9_]*)"));
+	const FRegexPattern ApiInDeclPattern(TEXT("\\b([A-Z][A-Z0-9_]*_API)\\b"));
+	const FRegexPattern UClassSpecifierPattern(TEXT("^\\s*U(?:CLASS|STRUCT|ENUM|INTERFACE|PROPERTY|FUNCTION)\\s*\\(([^)]*)\\)"));
+
+	for (int32 i = 0; i < Lines.Num(); ++i)
+	{
+		const FString Scan = StripBlockComments(Lines[i], bInBlockComment);
+		const FString Line = StripComment(Scan);
+		const FString Trimmed = Line.TrimStartAndEnd();
+		if (Trimmed.IsEmpty()) { continue; }
+
+		// #include tracking.
+		{
+			FRegexMatcher Mt(IncludePattern, Line);
+			if (Mt.FindNext())
+			{
+				const FString Inc = Mt.GetCaptureGroup(1);
+				LastIncludeLine = i + 1;
+				LastIncludePath = Inc;
+				if (Inc.EndsWith(TEXT(".generated.h")))
+				{
+					GeneratedHIncludeLine = i + 1;
+					GeneratedHIncludePath = Inc;
+				}
+				continue;
+			}
+		}
+
+		if (Trimmed.Contains(TEXT("GENERATED_BODY")) || Trimmed.Contains(TEXT("GENERATED_UCLASS_BODY")))
+		{
+			bHasGeneratedBody = true;
+			if (GeneratedBodyLine == 0) { GeneratedBodyLine = i + 1; }
+		}
+
+		if (Trimmed.StartsWith(TEXT("UCLASS")) || Trimmed.StartsWith(TEXT("USTRUCT")) ||
+			Trimmed.StartsWith(TEXT("UENUM")) || Trimmed.StartsWith(TEXT("UINTERFACE")))
+		{
+			bAnyReflectedMacro = true;
+			if (Trimmed.StartsWith(TEXT("UCLASS")))
+			{
+				bPendingReflected = true;
+				PendingKind = TEXT("UCLASS");
+				PendingMacroLine = i + 1;
+			}
+		}
+
+		if (bPendingReflected)
+		{
+			FRegexMatcher Mt(ClassDeclPattern, Line);
+			if (Mt.FindNext())
+			{
+				FReflectedType RT;
+				RT.MacroLine = PendingMacroLine;
+				RT.MacroKind = PendingKind;
+				RT.DeclaredName = Mt.GetCaptureGroup(1);
+				RT.DeclLine = i + 1;
+				FRegexMatcher ApiMt(ApiInDeclPattern, Line);
+				RT.bHasApiMacro = ApiMt.FindNext();
+				ReflectedTypes.Add(RT);
+				bPendingReflected = false;
+			}
+		}
+
+		// Invalid-specifier cross-check (rule f) — only when a vocabulary is supplied.
+		if (ValidSpecifiers.Num() > 0)
+		{
+			FRegexMatcher SpecMt(UClassSpecifierPattern, Line);
+			if (SpecMt.FindNext())
+			{
+				const FString SpecBlob = SpecMt.GetCaptureGroup(1);
+				TArray<FString> Tokens;
+				SpecBlob.ParseIntoArray(Tokens, TEXT(","), /*InCullEmpty=*/true);
+				for (FString Tok : Tokens)
+				{
+					Tok = Tok.TrimStartAndEnd();
+					int32 Cut = INDEX_NONE;
+					if (Tok.FindChar(TEXT('='), Cut)) Tok = Tok.Left(Cut).TrimStartAndEnd();
+					if (Tok.FindChar(TEXT('('), Cut)) Tok = Tok.Left(Cut).TrimStartAndEnd();
+					if (Tok.IsEmpty()) continue;
+					bool bIdent = true;
+					for (const TCHAR C : Tok) { if (!FChar::IsAlnum(C) && C != TEXT('_')) { bIdent = false; break; } }
+					if (!bIdent) continue;
+					if (!ValidSpecifiers.Contains(Tok))
+					{
+						FLintFinding F;
+						F.RuleId = TEXT("invalid_specifier");
+						F.Line = i + 1;
+						F.Message = FString::Printf(TEXT("Unknown specifier token '%s' (not in the cppreflect class-specifier vocabulary)."), *Tok);
+						F.Severity = TEXT("warning");
+						Findings.Add(F);
+					}
+				}
+			}
+		}
+	}
+
+	// --- Rule (a): GENERATED_BODY presence (only meaningful for a reflected type). ---
+	if (bAnyReflectedMacro && !bHasGeneratedBody)
+	{
+		FLintFinding F;
+		F.RuleId = TEXT("missing_generated_body");
+		F.Line = ReflectedTypes.Num() > 0 ? ReflectedTypes[0].DeclLine : 0;
+		F.Message = TEXT("Reflected type (UCLASS/USTRUCT) is missing a GENERATED_BODY() macro.");
+		F.Severity = TEXT("error");
+		Findings.Add(F);
+	}
+
+	// --- Rule (b): *.generated.h must be the LAST include. ---
+	if (GeneratedHIncludeLine != 0 && LastIncludeLine != 0 && GeneratedHIncludeLine != LastIncludeLine)
+	{
+		FLintFinding F;
+		F.RuleId = TEXT("generated_h_not_last");
+		F.Line = GeneratedHIncludeLine;
+		F.Message = FString::Printf(
+			TEXT("'*.generated.h' must be the LAST #include (an include at line %d follows it: \"%s\")."),
+			LastIncludeLine, *LastIncludePath);
+		F.Severity = TEXT("error");
+		Findings.Add(F);
+	}
+	else if (bAnyReflectedMacro && bHasGeneratedBody && GeneratedHIncludeLine == 0)
+	{
+		FLintFinding F;
+		F.RuleId = TEXT("missing_generated_h_include");
+		F.Line = GeneratedBodyLine;
+		F.Message = TEXT("Reflected type uses GENERATED_BODY() but no '*.generated.h' include is present (must be last).");
+		F.Severity = TEXT("error");
+		Findings.Add(F);
+	}
+
+	// --- Rule (d): missing <MODULE>_API on each UCLASS-declared type. ---
+	const FString HeaderBaseName = FPaths::GetBaseFilename(FilePath);
+	for (const FReflectedType& RT : ReflectedTypes)
+	{
+		if (!ExpectedApiMacro.IsEmpty() && !RT.bHasApiMacro)
+		{
+			FLintFinding F;
+			F.RuleId = TEXT("missing_api_macro");
+			F.Line = RT.DeclLine;
+			F.Message = FString::Printf(
+				TEXT("UCLASS-declared type '%s' is missing the '%s' export macro (class %s ...)."),
+				*RT.DeclaredName, *ExpectedApiMacro, *RT.DeclaredName);
+			F.Severity = TEXT("warning");
+			Findings.Add(F);
+		}
+	}
+
+	// --- Rule (c): *.generated.h base-name vs header file base-name mismatch. ---
+	// Use the ACTUAL generated.h include path (GeneratedHIncludePath), NOT the last
+	// include — when generated.h is not last (rule-b case) the last include is some
+	// other header and would fire a bogus mismatch. Gate on the captured include
+	// actually ending in `.generated.h`.
+	if (GeneratedHIncludeLine != 0 && !HeaderBaseName.IsEmpty() &&
+		GeneratedHIncludePath.EndsWith(TEXT(".generated.h")))
+	{
+		FString GenBase = FPaths::GetCleanFilename(GeneratedHIncludePath);
+		GenBase.LeftChopInline(FCString::Strlen(TEXT(".generated.h")));
+		if (!GenBase.IsEmpty() && GenBase != HeaderBaseName)
+		{
+			FLintFinding F;
+			F.RuleId = TEXT("generated_h_name_mismatch");
+			F.Line = GeneratedHIncludeLine;
+			F.Message = FString::Printf(
+				TEXT("'%s.generated.h' does not match the header file name '%s.h' — the GENERATED_BODY pairing requires \"%s.generated.h\"."),
+				*GenBase, *HeaderBaseName, *HeaderBaseName);
+			F.Severity = TEXT("error");
+			Findings.Add(F);
+		}
+	}
+
+	// --- Rule (e): UPROPERTY/UFUNCTION in a file with NO reflected type. ---
+	if (!bAnyReflectedMacro)
+	{
+		bInBlockComment = false;
+		for (int32 i = 0; i < Lines.Num(); ++i)
+		{
+			const FString Scan = StripBlockComments(Lines[i], bInBlockComment);
+			const FString Trimmed = StripComment(Scan).TrimStartAndEnd();
+			if (Trimmed.StartsWith(TEXT("UPROPERTY")) || Trimmed.StartsWith(TEXT("UFUNCTION")))
+			{
+				FLintFinding F;
+				F.RuleId = TEXT("reflected_member_in_non_reflected_type");
+				F.Line = i + 1;
+				F.Message = TEXT("UPROPERTY/UFUNCTION found but the file declares no reflected type (UCLASS/USTRUCT) — the macro will not be processed by UHT.");
+				F.Severity = TEXT("error");
+				Findings.Add(F);
+			}
+		}
+	}
+
+	// Stable, deterministic order (tests + offline parity).
+	Findings.Sort([](const FLintFinding& A, const FLintFinding& B)
+	{
+		if (A.Line != B.Line) return A.Line < B.Line;
+		return A.RuleId < B.RuleId;
+	});
+	return Findings;
+}
+
+FMonolithActionResult FMonolithSourceActions::HandleLintHeader(const TSharedPtr<FJsonObject>& Params)
+{
+	const FString FilePath = Params->GetStringField(TEXT("file_path"));
+	if (FilePath.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("'file_path' is required."));
+	}
+
+	TArray<FString> Lines;
+	if (!FFileHelper::LoadFileToStringArray(Lines, *FilePath))
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Could not read header file: %s"), *FilePath));
+	}
+
+	// Optional valid-specifier vocabulary cross-check (rule f). Resolve from the RI
+	// cppreflect list_class_specifiers action when registered; degrade gracefully
+	// (empty set => the specifier rule is skipped) when RI is unavailable.
+	TSet<FString> ValidSpecifiers;
+	{
+		FMonolithToolRegistry& Registry = FMonolithToolRegistry::Get();
+		if (Registry.HasAction(TEXT("source"), TEXT("list_class_specifiers")))
+		{
+			TSharedPtr<FJsonObject> SpecParams = MakeShared<FJsonObject>();
+			FMonolithActionResult SpecRes = Registry.ExecuteAction(TEXT("source"), TEXT("list_class_specifiers"), SpecParams);
+			if (SpecRes.bSuccess && SpecRes.Result.IsValid())
+			{
+				const TArray<TSharedPtr<FJsonValue>>* SpecArr = nullptr;
+				if (SpecRes.Result->TryGetArrayField(TEXT("specifiers"), SpecArr) && SpecArr)
+				{
+					for (const TSharedPtr<FJsonValue>& V : *SpecArr)
+					{
+						if (!V.IsValid()) continue;
+						FString S;
+						if (V->TryGetString(S)) { if (!S.IsEmpty()) ValidSpecifiers.Add(S); continue; }
+						const TSharedPtr<FJsonObject>* Obj = nullptr;
+						if (V->TryGetObject(Obj) && Obj && Obj->IsValid())
+						{
+							FString Name;
+							if ((*Obj)->TryGetStringField(TEXT("name"), Name) || (*Obj)->TryGetStringField(TEXT("specifier"), Name))
+							{
+								if (!Name.IsEmpty()) ValidSpecifiers.Add(Name);
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	const TArray<FLintFinding> Findings = LintHeaderLines(FilePath, Lines, ValidSpecifiers);
+
+	auto ResultObj = MakeShared<FJsonObject>();
+	TArray<TSharedPtr<FJsonValue>> FindingArr;
+	TArray<FString> TextLines;
+	for (const FLintFinding& F : Findings)
+	{
+		auto Obj = MakeShared<FJsonObject>();
+		Obj->SetStringField(TEXT("rule_id"), F.RuleId);
+		Obj->SetNumberField(TEXT("line"), F.Line);
+		Obj->SetStringField(TEXT("message"), F.Message);
+		Obj->SetStringField(TEXT("severity"), F.Severity);
+		FindingArr.Add(MakeShared<FJsonValueObject>(Obj));
+		TextLines.Add(FString::Printf(TEXT("[%s] L%d (%s): %s"), *F.Severity, F.Line, *F.RuleId, *F.Message));
+	}
+	ResultObj->SetArrayField(TEXT("findings"), FindingArr);
+	ResultObj->SetNumberField(TEXT("finding_count"), Findings.Num());
+
+	const FString Text = Findings.Num() == 0
+		? TEXT("Clean -- no lint findings.")
+		: FString::Join(TextLines, TEXT("\n"));
+
+	TArray<TSharedPtr<FJsonValue>> LintContentArr;
+	auto LintContentItem = MakeShared<FJsonObject>();
+	LintContentItem->SetStringField(TEXT("type"), TEXT("text"));
+	LintContentItem->SetStringField(TEXT("text"), Text);
+	LintContentArr.Add(MakeShared<FJsonValueObject>(LintContentItem));
+	ResultObj->SetArrayField(TEXT("content"), LintContentArr);
+	return FMonolithActionResult::Success(ResultObj);
+}
+
+// ============================================================================
+// Phase 3 — item 9: generate_class_stub
+//
+// TEXT-RETURN-ONLY (Decision 1): templates a UCLASS-derived .h/.cpp pair and
+// NEVER writes to disk. Resolves the parent header + owning module via the DB.
+// Plain default constructor unless the parent's indexed constructor signature
+// requires FObjectInitializer&. UCLASS-derived parents ONLY (v1).
+// ============================================================================
+
+void FMonolithSourceActions::GenerateClassStubText(
+	const FString& ParentClass, const FString& ClassName, const FString& Module,
+	const FString& ParentHeaderInclude, bool bParentNeedsObjectInitializer,
+	FString& OutHeaderText, FString& OutCppText)
+{
+	const FString ApiMacro = Module.ToUpper() + TEXT("_API");
+	// UE "Add C++ Class" file-naming convention: the U/A UCLASS-derived prefix is
+	// dropped from the FILE names (class UMyComp -> MyComp.h / MyComp.cpp /
+	// MyComp.generated.h). class_name is already validated UCLASS-derived, so only a
+	// leading U/A followed by an uppercase letter is stripped; otherwise the raw name
+	// is used. The C++ class identifier (ClassName) is unchanged — only file names strip.
+	const FString FileBase = (ClassName.Len() >= 2 &&
+		(ClassName[0] == TEXT('U') || ClassName[0] == TEXT('A')) && FChar::IsUpper(ClassName[1]))
+		? ClassName.RightChop(1)
+		: ClassName;
+	const FString GeneratedInclude = FileBase + TEXT(".generated.h");
+
+	// --- Header ---
+	{
+		TArray<FString> H;
+		H.Add(TEXT("#pragma once"));
+		H.Add(TEXT(""));
+		H.Add(TEXT("#include \"CoreMinimal.h\""));
+		if (!ParentHeaderInclude.IsEmpty())
+		{
+			H.Add(FString::Printf(TEXT("#include \"%s\""), *ParentHeaderInclude));
+		}
+		H.Add(FString::Printf(TEXT("#include \"%s\""), *GeneratedInclude)); // ALWAYS last (prefix-stripped file base)
+		H.Add(TEXT(""));
+		H.Add(TEXT("UCLASS()"));
+		H.Add(FString::Printf(TEXT("class %s %s : public %s"), *ApiMacro, *ClassName, *ParentClass));
+		H.Add(TEXT("{"));
+		H.Add(TEXT("\tGENERATED_BODY()"));
+		H.Add(TEXT(""));
+		H.Add(TEXT("public:"));
+		if (bParentNeedsObjectInitializer)
+		{
+			H.Add(FString::Printf(TEXT("\t%s(const FObjectInitializer& ObjectInitializer);"), *ClassName));
+		}
+		else
+		{
+			H.Add(FString::Printf(TEXT("\t%s();"), *ClassName));
+		}
+		H.Add(TEXT("};"));
+		H.Add(TEXT(""));
+		OutHeaderText = FString::Join(H, TEXT("\n"));
+	}
+
+	// --- Cpp ---
+	{
+		TArray<FString> C;
+		C.Add(FString::Printf(TEXT("#include \"%s.h\""), *FileBase)); // prefix-stripped file base
+		C.Add(TEXT(""));
+		if (bParentNeedsObjectInitializer)
+		{
+			C.Add(FString::Printf(TEXT("%s::%s(const FObjectInitializer& ObjectInitializer)"), *ClassName, *ClassName));
+			C.Add(TEXT("\t: Super(ObjectInitializer)"));
+			C.Add(TEXT("{"));
+			C.Add(TEXT("}"));
+		}
+		else
+		{
+			C.Add(FString::Printf(TEXT("%s::%s()"), *ClassName, *ClassName));
+			C.Add(TEXT("{"));
+			C.Add(TEXT("}"));
+		}
+		C.Add(TEXT(""));
+		OutCppText = FString::Join(C, TEXT("\n"));
+	}
+}
+
+FMonolithActionResult FMonolithSourceActions::HandleGenerateClassStub(const TSharedPtr<FJsonObject>& Params)
+{
+	FMonolithSourceDatabase* DB = GetDB();
+	if (!DB || !DB->IsOpen())
+	{
+		return FMonolithActionResult::Error(TEXT("Engine source DB not available. Run source.trigger_reindex first."));
+	}
+
+	const FString ParentClass = Params->GetStringField(TEXT("parent"));
+	const FString ClassName = Params->GetStringField(TEXT("class_name"));
+	const FString Module = Params->GetStringField(TEXT("module"));
+	if (ParentClass.IsEmpty() || ClassName.IsEmpty() || Module.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("'parent', 'class_name', and 'module' are all required."));
+	}
+
+	// Resolve the parent's class row. UCLASS-derived parents ONLY (v1).
+	TArray<FMonolithSourceSymbol> ParentRows = DB->GetSymbolsByName(ParentClass);
+	if (ParentRows.Num() == 0) ParentRows = DB->SearchSymbolsFTS(ParentClass, 5);
+	if (ParentRows.Num() == 0)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Parent class '%s' not found in the source index. Run source.trigger_reindex if it is a project type."), *ParentClass));
+	}
+
+	const FMonolithSourceSymbol* ParentSym = nullptr;
+	for (const FMonolithSourceSymbol& S : ParentRows)
+	{
+		if (S.Kind == TEXT("class") || S.Kind == TEXT("struct")) { ParentSym = &S; break; }
+	}
+	if (!ParentSym) { ParentSym = &ParentRows[0]; }
+
+	// UCLASS-derived gate: U/A prefix is the engine convention; also accept the
+	// indexed is_ue_macro flag.
+	const bool bLooksUClass = ParentSym->bIsUEMacro
+		|| ParentClass.StartsWith(TEXT("U")) || ParentClass.StartsWith(TEXT("A"));
+	if (!bLooksUClass)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Parent '%s' is not a UCLASS-derived type. generate_class_stub v1 supports UCLASS-derived parents only (no USTRUCT/UENUM/UINTERFACE)."), *ParentClass));
+	}
+
+	// Resolve the parent header include via the owning header (prefer a .h row).
+	const FMonolithSourceSymbol* HeaderSym = ParentSym;
+	for (const FMonolithSourceSymbol& S : ParentRows)
+	{
+		if (DB->GetFilePath(S.FileId).EndsWith(TEXT(".h"))) { HeaderSym = &S; break; }
+	}
+	const FString ParentFilePath = DB->GetFilePath(HeaderSym->FileId);
+	bool bIncludable = true;
+	FString IncWarning;
+	const FString ParentInclude = DeriveIncludePath(ParentFilePath, bIncludable, IncWarning);
+
+	// Constructor convention: plain default unless the parent's indexed ctor signature
+	// requires FObjectInitializer& (and has no plain alternative).
+	bool bParentNeedsObjectInitializer = false;
+	{
+		TArray<FMonolithSourceSymbol> CtorRows = DB->GetSymbolsByName(ParentClass, TEXT("function"));
+		bool bSawAnyCtor = false;
+		bool bSawPlainCtor = false;
+		bool bSawObjInitCtor = false;
+		for (const FMonolithSourceSymbol& S : CtorRows)
+		{
+			if (S.Signature.IsEmpty()) continue;
+			if (!S.Signature.Contains(ParentClass + TEXT("("))) continue;
+			bSawAnyCtor = true;
+			if (S.Signature.Contains(TEXT("FObjectInitializer"))) bSawObjInitCtor = true;
+			else bSawPlainCtor = true;
+		}
+		bParentNeedsObjectInitializer = bSawAnyCtor && bSawObjInitCtor && !bSawPlainCtor;
+	}
+
+	FString HeaderText, CppText;
+	GenerateClassStubText(ParentClass, ClassName, Module, ParentInclude, bParentNeedsObjectInitializer, HeaderText, CppText);
+
+	// File-naming convention (mirrors GenerateClassStubText): the U/A UCLASS-derived
+	// prefix is dropped from the FILE names. Report the intended file names so callers
+	// know what to save the text as, and use them in the content banner.
+	const FString FileBase = (ClassName.Len() >= 2 &&
+		(ClassName[0] == TEXT('U') || ClassName[0] == TEXT('A')) && FChar::IsUpper(ClassName[1]))
+		? ClassName.RightChop(1)
+		: ClassName;
+	const FString HeaderFile = FileBase + TEXT(".h");
+	const FString CppFile = FileBase + TEXT(".cpp");
+
+	auto ResultObj = MakeShared<FJsonObject>();
+	ResultObj->SetStringField(TEXT("header"), HeaderText);
+	ResultObj->SetStringField(TEXT("cpp"), CppText);
+	ResultObj->SetStringField(TEXT("header_file"), HeaderFile);
+	ResultObj->SetStringField(TEXT("cpp_file"), CppFile);
+	ResultObj->SetStringField(TEXT("parent_include"), ParentInclude);
+	ResultObj->SetStringField(TEXT("api_macro"), Module.ToUpper() + TEXT("_API"));
+	ResultObj->SetBoolField(TEXT("uses_object_initializer"), bParentNeedsObjectInitializer);
+
+	const FString Text = FString::Printf(
+		TEXT("// === %s ===\n%s\n// === %s ===\n%s"),
+		*HeaderFile, *HeaderText, *CppFile, *CppText);
+
+	TArray<TSharedPtr<FJsonValue>> StubContentArr;
+	auto StubContentItem = MakeShared<FJsonObject>();
+	StubContentItem->SetStringField(TEXT("type"), TEXT("text"));
+	StubContentItem->SetStringField(TEXT("text"), Text);
+	StubContentArr.Add(MakeShared<FJsonValueObject>(StubContentItem));
+	ResultObj->SetArrayField(TEXT("content"), StubContentArr);
 	return FMonolithActionResult::Success(ResultObj);
 }

@@ -66,6 +66,38 @@ public:
 	 */
 	static bool SymbolExists(FMonolithSourceDatabase* DB, const FString& Symbol);
 
+	// --- Phase 3 pure helpers (items 7, 9; public for unit testing) ---
+
+	/** One lint finding (item 7). */
+	struct FLintFinding
+	{
+		FString RuleId;
+		int32 Line = 0;       // 1-based; 0 when file-level (no specific line)
+		FString Message;
+		FString Severity;     // "error" | "warning"
+	};
+
+	/**
+	 * Run the deterministic header-lint rule table over an already-loaded set of
+	 * lines (item 7). MUST work on UNINDEXED files — no DB read. The expected
+	 * <MODULE>_API token is derived PRIMARILY from the file path (Source/<Module>/
+	 * or Plugins/<X>/Source/<Module>/). ValidSpecifiers, when non-empty, enables
+	 * the invalid-specifier cross-check (degrade gracefully: empty = rule skipped).
+	 * Locals-only FRegexMatcher. A clean header yields an empty array.
+	 */
+	static TArray<FLintFinding> LintHeaderLines(const FString& FilePath, const TArray<FString>& Lines,
+		const TSet<FString>& ValidSpecifiers);
+
+	/**
+	 * Template a UCLASS-derived .h/.cpp pair (item 9, TEXT-RETURN-ONLY — never writes).
+	 * ParentHeaderInclude is the parent's canonical include (e.g. "Components/ActorComponent.h");
+	 * empty when unresolved (caller should reject). bParentNeedsObjectInitializer emits the
+	 * FObjectInitializer& constructor overload instead of the plain default form.
+	 */
+	static void GenerateClassStubText(const FString& ParentClass, const FString& ClassName, const FString& Module,
+		const FString& ParentHeaderInclude, bool bParentNeedsObjectInitializer,
+		FString& OutHeaderText, FString& OutCppText);
+
 private:
 	// Action handlers
 	static FMonolithActionResult HandleReadSource(const TSharedPtr<FJsonObject>& Params);
@@ -88,6 +120,10 @@ private:
 	// Phase 2 — round-trip compression
 	static FMonolithActionResult HandleVerifySymbols(const TSharedPtr<FJsonObject>& Params);     // item 4
 	static FMonolithActionResult HandleFindExampleUsage(const TSharedPtr<FJsonObject>& Params);  // item 5
+
+	// Phase 3 — pre-flight lint + stub gen
+	static FMonolithActionResult HandleLintHeader(const TSharedPtr<FJsonObject>& Params);        // item 7
+	static FMonolithActionResult HandleGenerateClassStub(const TSharedPtr<FJsonObject>& Params); // item 9
 
 	// Helpers
 	static FMonolithSourceDatabase* GetDB();

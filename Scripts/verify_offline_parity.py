@@ -3,11 +3,11 @@
 verify_offline_parity.py -- HARD-GATE parity guard for the two offline Monolith RI tools.
 
 Byte/deep-diffs the C++ exe (Binaries/monolith_query.exe) against the Python
-reference (Scripts/monolith_offline.py) across 25 actions: 20 Reflection-
+reference (Scripts/monolith_offline.py) across 27 actions: 20 Reflection-
 Intelligence (RI) actions spanning 4 namespaces (cppreflect, network, decision,
-risk; JSON deep-diff) PLUS 5 source-ergonomics actions (get_include_path,
-get_signature, check_deprecations, verify_symbols, find_example_usage;
-plain-text STRICT byte-compare).
+risk; JSON deep-diff) PLUS 7 source-ergonomics actions (get_include_path,
+get_signature, check_deprecations, verify_symbols, find_example_usage,
+lint_header, generate_class_stub; plain-text STRICT byte-compare).
 
 This is the acceptance test for the offline-parity sprint. Strict mode (default)
 requires every JSON action to deep-equal (INCLUDING the opaque base64
@@ -328,6 +328,29 @@ def build_actions(chain):
          ["UGameplayStatics::ApplyDamage", "AActor", "UThisDoesNotExistAnywhereXYZ"], "text"),
         ("source.find_example_usage", "source", "find_example_usage",
          ["UGameplayStatics::ApplyDamage", "--limit", "5"], "text"),
+
+        # ---- source ergonomics Phase 3 (items 7, 9) -- plain-text, STRICT byte-compare ----
+        # Fixed deterministic inputs:
+        #   lint_header         -> a COMMITTED fixture so exe + py see byte-identical
+        #                          input. The fixture carries a `.h.fixture` extension
+        #                          (UHT must NOT parse its reflection macros); lint_header
+        #                          reads via LoadFileToStringArray, which is extension-
+        #                          agnostic. LintOrphanUproperty.h.fixture has NO UCLASS
+        #                          macro, so rules (c)/(d) (the only base-name-sensitive
+        #                          ones) and the invalid-specifier rule never fire -> the
+        #                          `.h.fixture` extension is irrelevant to its output, and
+        #                          exe == py deterministically. It triggers rule (e) so the
+        #                          "Clean" sentinel line is never byte-compared.
+        #   generate_class_stub -> a stable engine UCLASS parent (AActor); the .h/.cpp
+        #                          text is a pure DB read (offline-served, Decision 5).
+        #                          class "AMyParityActor" -> UE file base "MyParityActor"
+        #                          (the A/U UCLASS prefix is stripped from FILE names),
+        #                          so both tools emit "MyParityActor.generated.h" / .h
+        #                          and the "// === MyParityActor.h ===" banner -- byte-equal.
+        ("source.lint_header", "source", "lint_header",
+         ["Source/MonolithSource/Private/Tests/Fixtures/CppErgoCorpus/Source/CppErgoTestMod/LintOrphanUproperty.h.fixture"], "text"),
+        ("source.generate_class_stub", "source", "generate_class_stub",
+         ["AActor", "AMyParityActor", "MonolithSource"], "text"),
     ]
     return actions
 

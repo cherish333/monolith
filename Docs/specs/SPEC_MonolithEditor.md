@@ -31,7 +31,27 @@
 |--------|-------------|
 | `trigger_build` | Live Coding compile. `wait` param for synchronous. Windows-only. Auto-enables Live Coding |
 | `live_compile` | Trigger Live Coding hot-reload compile. Alternative to trigger_build |
-| `get_build_errors` | Build errors/warnings from log capture, scoped to a time window and bucketed into `compile_errors` (LogLiveCoding/LogCompile/LogLinker) vs `other_errors`. **Window params** (precedence high→low): `since_marker` (errors after the latest log line containing this token — UE_LOG a marker right before compiling; reports `marker_found`), `since_iso` (absolute ISO-8601 cutoff), `since_seconds` / `since` (legacy alias; last N seconds), else last compile. `clear_baseline` (default false) stamps a fresh `now` baseline and returns immediately — the "I just kicked off a build, ignore prior noise" reset. `exclude_categories` (default `[LogPython, LogMonolith]`) bucketed under `other_errors` and kept OUT of the headline `error_count` (never hidden). `category` / `compile_only` narrow the query. Max 500 entries |
+| `get_build_errors` | Build errors/warnings from log capture, scoped to a time window and bucketed into `compile_errors` (LogLiveCoding/LogCompile/LogLinker) vs `other_errors`. **Window params** (precedence high→low): `since_marker` (errors after the latest log line containing this token — UE_LOG a marker right before compiling; reports `marker_found`), `since_iso` (absolute ISO-8601 cutoff), `since_seconds` / `since` (legacy alias; last N seconds), else last compile. `clear_baseline` (default false) stamps a fresh `now` baseline and returns immediately — the "I just kicked off a build, ignore prior noise" reset. `exclude_categories` (default `[LogPython, LogMonolith]`) bucketed under `other_errors` and kept OUT of the headline `error_count` (never hidden). `category` / `compile_only` narrow the query. Max 500 entries. **`fix_hints[]` (Phase 3, item 8 — ADDITIVE):** see Fix Hints below |
+
+### `get_build_errors` Fix Hints (Phase 3, item 8 — ADDITIVE)
+
+`get_build_errors` appends a deterministic error→fix-hint pattern table. The output is **purely additive** — every pre-existing field (`error_count`, `errors[]`, `compile_errors[]`, `other_errors[]`, `warnings[]`, `since`, `since_source`, `excluded_categories[]`, and each error object's `message` / `category` / `verbosity`) is **byte-identical** to the pre-Phase-3 response. Two additions:
+
+- **Top-level `fix_hints[]`** — one object per matched error: `{ error_index, pattern, hint }`.
+- **Per-error `fix_hint`** — a string stamped onto each matched error object in `errors[]` (the ONLY new field on those objects).
+
+Pattern table:
+
+| `pattern` | Matches | Hint |
+|-----------|---------|------|
+| `LNK2019_Z_Construct` | `LNK2019` on a `Z_Construct_*` symbol | Resolves the referenced UClass's owning module via the **borrowed** source DB and names the module to add to Build.cs (generic hint when the DB is unavailable). |
+| `LNK2019_DeveloperSettings` | `LNK2019` referencing `UDeveloperSettings`/`DeveloperSettings` | "Lives in the 'DeveloperSettings' module, not 'Engine'." |
+| `C4996_deprecation` | `C4996` | Recovers the deprecated identifier, attaches its `symbol_deprecations` message (`GetDeprecationsBatch`); generic hint otherwise. |
+| `generated_h_not_last` | message contains `generated.h` + `last` | "The `*.generated.h` include must be the LAST `#include`." |
+
+**Source DB borrow:** the hint builder borrows `FMonolithSourceDatabase::GetRawHandle()` under `FScopeLock(GetLock())` on the game thread (the same one-way Editor→Source borrow the RI adapter uses); the prepared statement is finalized before the lock releases, never a second handle on `EngineSource.db`. It degrades gracefully (generic hint) when the DB is not yet indexed.
+
+**No offline parity:** `fix_hints` is **NOT offline-served** — `get_build_errors` reads the in-process log capture ring buffer, which the offline `monolith_query.exe` / `monolith_offline.py` cannot reach. (Items 7 and 9 in the `source` namespace ARE offline-served; item 8 is live-only.)
 | `get_build_status` | Live Coding availability, started, enabled, compiling status |
 | `get_build_summary` | Total error/warning counts + compile status |
 | `search_build_output` | Search build log by `pattern`. Default limit 100 |
