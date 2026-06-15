@@ -497,8 +497,11 @@ $LeakSentinels = @(
     "GameplayBehaviorsModule", "MassEntity", "MassSpawner", "MassGameplayEditor", "ZoneGraph",
     "StateTreeModule", "StateTreeEditorModule", "GameplayStateTreeModule", "PropertyBindingUtils",
     "SmartObjectsModule", "SmartObjectsEditorModule",
-    # MonolithGAS -- GBA (Blueprint Attributes); GameplayAbilities is a hard dep, also gated in MonolithAI
-    "BlueprintAttributes", "GameplayAbilities",
+    # MonolithGAS -- GBA (Blueprint Attributes). NOTE: GameplayAbilities is deliberately NOT a
+    # sentinel -- it is a hard dep in Monolith.uplugin (Enabled, no Optional), so the engine
+    # auto-enables it and guarantees its DLL is present; MonolithGAS/MonolithIndex hard-link it
+    # safely (removed from sentinels in v0.14.7, see the rationale block above).
+    "BlueprintAttributes",
     # MonolithIndex / MonolithAudio -- MetaSound (engine DLLs are 'Metasound', lowercase s)
     "MetasoundEngine", "MetasoundFrontend", "MetasoundEditor",
     # MonolithAnimation -- Chooser
@@ -528,7 +531,9 @@ $OptionalModuleUnion = @(
     "StateTreeModule", "StateTreeEditorModule",                     # MonolithAI
     "GameplayStateTreeModule", "PropertyBindingUtils",             # MonolithAI
     "SmartObjectsModule", "SmartObjectsEditorModule",              # MonolithAI
-    "GameplayAbilities",                                            # MonolithAI (gated) / MonolithGAS (hard)
+    # GameplayAbilities is optional-gated in MonolithAI but a HARD dep in Monolith.uplugin and
+    # hard-linked unconditionally (and safely) in MonolithGAS/MonolithIndex -- so it is NOT a
+    # sentinel and is excluded from this drift union (it is not an unsafe optional dep).
     "BlueprintAttributes",                                          # MonolithGAS
     "MetasoundEngine", "MetasoundFrontend", "MetasoundEditor",      # MonolithIndex / MonolithAudio
     "Chooser",                                                      # MonolithAnimation
