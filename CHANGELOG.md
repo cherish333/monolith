@@ -8,9 +8,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- **`derive_foot_sync_markers` (`animation`).** Auto-derives left/right foot-plant sync markers on an `AnimSequence` from data already in the clip — no manual eyeballing — via a 5-signal availability cascade (first signal that yields plants wins, with `source` + `confidence` reported): existing authored markers, then footstep notifies (foot side from the owning track name, with class-suffix and alternate-by-time fallbacks), then `contact_l`/`contact_r` float curves (mid-threshold rising edge + hysteresis re-arm + stride-period debounce), then a `Phase` sawtooth curve (key extrema, with a 0..1-ramp heuristic fallback), then component-space foot-bone speed minima (a native port of the engine `FootstepAnimEventsModifier` FootBoneSpeed technique, so no per-project modifier-config Blueprint is needed). Project-agnostic: marker names (`left_marker_name`/`right_marker_name`, default `L_Foot`/`R_Foot`), `track_index`, foot bone names (`foot_bones`, else common-name auto-resolve against the skeleton), notify-track patterns, `phase_invert`, and all detection `thresholds` (`contact_mid`, `contact_low`, `speed_threshold`, `sample_rate`, `debounce_fraction`, `ground_threshold`) are overridable. `method` (`auto`/`existing`/`notifies`/`contact`/`phase`/`footspeed`) forces a single signal and errors cleanly if it is unavailable; `clear_existing` (default true) makes re-runs idempotent; `dry_run` reports the derived `left`/`right` times without mutating the asset. Static poses/aim-offsets return an empty result with a `static pose, no plants` note rather than an error.
+### Fixed
+
+## [0.20.1] - 2026-06-15
 
 ### Fixed
+
+- **MonolithAI failed to load on stock UE 5.7.4 (Epic Launcher) with `GetLastError 126`.** The v0.20.0 release binary hard-linked the optional `MassSpawner` (MassEntity / MassGameplay) and `ZoneGraph` plugin DLLs, which aren't enabled in a stock engine build, so on a clean install the plugin could not load. The release binary is now correctly gated and MonolithAI loads without those experimental plugins. (#71, reported by @aggitti)
+
+### Added
+
+- **`derive_foot_sync_markers` (`animation`).** Auto-derives left/right foot-plant sync markers on an `AnimSequence` from data already in the clip — no manual eyeballing — via a 5-signal availability cascade (first signal that yields plants wins, with `source` + `confidence` reported): existing authored markers, then footstep notifies (foot side from the owning track name, with class-suffix and alternate-by-time fallbacks), then `contact_l`/`contact_r` float curves (mid-threshold rising edge + hysteresis re-arm + stride-period debounce), then a `Phase` sawtooth curve (key extrema, with a 0..1-ramp heuristic fallback), then component-space foot-bone speed minima (a native port of the engine `FootstepAnimEventsModifier` FootBoneSpeed technique, so no per-project modifier-config Blueprint is needed). Project-agnostic: marker names (`left_marker_name`/`right_marker_name`, default `L_Foot`/`R_Foot`), `track_index`, foot bone names (`foot_bones`, else common-name auto-resolve against the skeleton), notify-track patterns, `phase_invert`, and all detection `thresholds` (`contact_mid`, `contact_low`, `speed_threshold`, `sample_rate`, `debounce_fraction`, `ground_threshold`) are overridable. `method` (`auto`/`existing`/`notifies`/`contact`/`phase`/`footspeed`) forces a single signal and errors cleanly if it is unavailable; `clear_existing` (default true) makes re-runs idempotent; `dry_run` reports the derived `left`/`right` times without mutating the asset. Static poses/aim-offsets return an empty result with a `static pose, no plants` note rather than an error.
+
+### Internal
+
+- Hardened the release import-leak smoke check: the `dumpbin` import scan is now mandatory (a release can no longer ship if it cannot run), the optional-plugin sentinel list was completed and corrected, and a drift assertion ties the list to the Build.cs gates -- so this hard-link leak class cannot ship again.
 
 ## [0.20.0] - 2026-06-14
 
