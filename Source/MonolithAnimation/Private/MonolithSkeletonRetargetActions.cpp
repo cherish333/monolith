@@ -1,12 +1,18 @@
 #include "MonolithSkeletonRetargetActions.h"
 #include "MonolithAssetUtils.h"
 #include "MonolithParamSchema.h"
+#include "Reflection/MonolithReflectionReader.h"
 
 #include "Animation/Skeleton.h"
 #include "ReferenceSkeleton.h"
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 #include "Editor.h" // GEditor->BeginTransaction / EndTransaction
+
+// IK Rig (T2-1)
+#include "Rig/IKRigDefinition.h"                 // UIKRigDefinition
+#include "RigEditor/IKRigController.h"           // UIKRigController (IKRigEditor module)
+#include "Rig/Solvers/IKRigSolverBase.h"         // FIKRigSolverBase, FIKRigBoneSettingsBase
 
 // ---------------------------------------------------------------------------
 // Mode string <-> namespaced enum (parse/echo by NAME — never by raw int).
@@ -85,6 +91,55 @@ namespace
 		}
 		return EBoneTranslationRetargetingMode::Skeleton;
 	}
+
+	// -----------------------------------------------------------------------
+	// T2-1 helpers — IK Rig per-solver per-bone settings (reflective).
+	//
+	// The concrete bone-settings struct is solver-specific. We get the live
+	// struct memory + its concrete UScriptStruct from the solver, then walk
+	// the struct's FProperty schema to read/write fields by name. This mirrors
+	// the engine's own access path (IKRigEditorController.cpp:972-1016).
+	// -----------------------------------------------------------------------
+
+	// The base FIKRigBoneSettingsBase carries a single bookkeeping field, `Bone`
+	// (IKRigSolverBase.h:52), which is identity metadata, not a user-editable
+	// setting. We never let the caller overwrite it and we omit it from echoes.
+	bool IsBaseBookkeepingField(const FProperty* Prop)
+	{
+		return Prop && Prop->GetFName() == FName(TEXT("Bone"));
+	}
+
+	// Reflectively serialise every non-bookkeeping field of a concrete bone-
+	// settings struct into a flat JSON object keyed by property name.
+	TSharedPtr<FJsonObject> BoneSettingsToJson(
+		const UScriptStruct* ConcreteType, const void* StructMemory, const UObject* Owner)
+	{
+		TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+		if (!ConcreteType || !StructMemory)
+		{
+			return Out;
+		}
+
+		for (TFieldIterator<FProperty> It(ConcreteType); It; ++It)
+		{
+			FProperty* Prop = *It;
+			if (!Prop || IsBaseBookkeepingField(Prop))
+			{
+				continue;
+			}
+			const void* ValuePtr = Prop->ContainerPtrToValuePtr<void>(StructMemory);
+			Out->SetField(Prop->GetName(),
+				FMonolithReflectionReader::PropertyToJsonValue(Prop, ValuePtr, Owner));
+		}
+		return Out;
+	}
+
+	// Solver-type label for echoes. GetNiceName() is WITH_EDITOR-only on the
+	// solver; fall back to the concrete UStruct name when unavailable.
+	FString SolverDisplayName(const UScriptStruct* SolverType)
+	{
+		return SolverType ? SolverType->GetName() : FString(TEXT("(unknown)"));
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -122,6 +177,44 @@ void FMonolithSkeletonRetargetActions::RegisterActions(FMonolithToolRegistry& Re
 			.RequiredAssetPath(TEXT("skeleton_path"), TEXT("Skeleton asset path"))
 			.Optional(TEXT("bones"), TEXT("array"),
 				TEXT("Optional list of bone names to read. Omit to read all bones."))
+			.Build());
+
+	// --- T2-1: IK-Rig per-solver per-bone settings ---
+
+	Registry.RegisterAction(TEXT("animation"), TEXT("set_ik_rig_bone_settings"),
+		TEXT("Set per-solver, per-bone settings on an IK Rig (UE 5.6+ struct-solver model). Per-bone "
+			 "settings are SOLVER-SCOPED and the concrete fields are solver-specific (e.g. FullBodyIK "
+			 "exposes RotationStiffness / per-axis limits). Provide 'ik_rig_path', 'bone_name', and a "
+			 "'settings' object of {field: value} pairs written reflectively onto the concrete bone-"
+			 "settings struct (scalars/enums via ImportText: numbers as numbers, enums/strings as the "
+			 "display name, structs as ImportText e.g. \"(X=1.0,Y=2.0,Z=3.0)\"). By default the settings "
+			 "are applied to EVERY solver in the stack that accepts the bone; pass 'solver_index' to "
+			 "target one solver only. The bone-setting entry is created automatically if absent "
+			 "(AddBoneSetting). Echoes the fields applied per solver."),
+		FMonolithActionHandler::CreateStatic(&HandleSetIkRigBoneSettings),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("ik_rig_path"), TEXT("IK Rig (UIKRigDefinition) asset path"))
+			.Required(TEXT("bone_name"), TEXT("string"), TEXT("Bone to set settings on"))
+			.Required(TEXT("settings"), TEXT("object"),
+				TEXT("{field: value} map written reflectively onto the concrete bone-settings struct. "
+					 "Fields are solver-specific — use get_ik_rig_bone_settings to discover the available fields."))
+			.Optional(TEXT("solver_index"), TEXT("integer"),
+				TEXT("Apply to this solver only (0-based). Omit to apply to every solver that accepts the bone."))
+			.Build());
+
+	Registry.RegisterAction(TEXT("animation"), TEXT("get_ik_rig_bone_settings"),
+		TEXT("Read per-solver, per-bone settings from an IK Rig (UE 5.6+ struct-solver model). Returns, "
+			 "for each solver in the stack, the bone's concrete settings struct serialised to JSON "
+			 "(fields are solver-specific). Pass 'bone_name' to read one bone; omit it to enumerate every "
+			 "bone that has settings in any solver. Pass 'solver_index' to restrict to one solver. "
+			 "Read-only — no transaction."),
+		FMonolithActionHandler::CreateStatic(&HandleGetIkRigBoneSettings),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("ik_rig_path"), TEXT("IK Rig (UIKRigDefinition) asset path"))
+			.Optional(TEXT("bone_name"), TEXT("string"),
+				TEXT("Bone to read. Omit to enumerate every bone that has settings in any solver."))
+			.Optional(TEXT("solver_index"), TEXT("integer"),
+				TEXT("Read this solver only (0-based). Omit to read across all solvers."))
 			.Build());
 }
 
@@ -337,5 +430,375 @@ FMonolithActionResult FMonolithSkeletonRetargetActions::HandleGetBoneTranslation
 		}
 		Root->SetArrayField(TEXT("not_found"), NotFoundArr);
 	}
+	return FMonolithActionResult::Success(Root);
+}
+
+// ---------------------------------------------------------------------------
+// T2-1: set_ik_rig_bone_settings
+//
+// Per-solver, per-bone settings on a UIKRigDefinition (UE 5.6+ struct solvers).
+// The concrete bone-settings struct is solver-specific; fields are written
+// reflectively. Access path matches the engine's FIKRigEditorController:
+//   GetController -> GetSolverAtIndex(idx) -> FIKRigSolverBase*
+//     -> UsesCustomBoneSettings() guard -> GetBoneSettingsType() (concrete UScriptStruct)
+//     -> AddBoneSetting (create if absent) -> GetBoneSettings(bone) (live memory)
+// Writes via FProperty::ImportText_Direct (the set_cdo_property scalar path).
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithSkeletonRetargetActions::HandleSetIkRigBoneSettings(
+	const TSharedPtr<FJsonObject>& Params)
+{
+	const FString IkRigPath = Params->GetStringField(TEXT("ik_rig_path"));
+
+	UIKRigDefinition* IkRig = FMonolithAssetUtils::LoadAssetByPath<UIKRigDefinition>(IkRigPath);
+	if (!IkRig)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("IK Rig not found: %s"), *IkRigPath));
+	}
+
+	FString BoneNameStr;
+	if (!Params->TryGetStringField(TEXT("bone_name"), BoneNameStr) || BoneNameStr.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("'bone_name' is required and must be non-empty."));
+	}
+	const FName BoneName(*BoneNameStr);
+
+	const TSharedPtr<FJsonObject>* SettingsObjPtr = nullptr;
+	if (!Params->TryGetObjectField(TEXT("settings"), SettingsObjPtr) || !SettingsObjPtr->IsValid())
+	{
+		return FMonolithActionResult::Error(TEXT("'settings' is required and must be an object of {field: value} pairs."));
+	}
+	const TSharedPtr<FJsonObject>& SettingsObj = *SettingsObjPtr;
+	if (SettingsObj->Values.Num() == 0)
+	{
+		return FMonolithActionResult::Error(TEXT("'settings' must contain at least one field to set."));
+	}
+
+	UIKRigController* Controller = UIKRigController::GetController(IkRig);
+	if (!Controller)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Could not get IK Rig controller for: %s"), *IkRigPath));
+	}
+
+	const int32 NumSolvers = Controller->GetNumSolvers();
+	if (NumSolvers == 0)
+	{
+		return FMonolithActionResult::Error(
+			TEXT("IK Rig has no solvers. Add a solver (e.g. Full Body IK) before setting per-bone settings."));
+	}
+
+	// Resolve the target solver set: a specific index, or all solvers that
+	// accept the bone (UsesCustomBoneSettings + CanAddBoneSetting).
+	bool bHasSolverIndex = false;
+	int32 RequestedSolverIndex = INDEX_NONE;
+	if (Params->HasTypedField<EJson::Number>(TEXT("solver_index")))
+	{
+		bHasSolverIndex = true;
+		RequestedSolverIndex = static_cast<int32>(Params->GetNumberField(TEXT("solver_index")));
+		if (RequestedSolverIndex < 0 || RequestedSolverIndex >= NumSolvers)
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("solver_index %d out of range [0, %d)."), RequestedSolverIndex, NumSolvers));
+		}
+	}
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("Set IK Rig Bone Settings")));
+	IkRig->Modify();
+
+	TArray<TSharedPtr<FJsonValue>> SolverResults;
+	int32 SolversTouched = 0;
+
+	for (int32 SolverIndex = 0; SolverIndex < NumSolvers; ++SolverIndex)
+	{
+		if (bHasSolverIndex && SolverIndex != RequestedSolverIndex)
+		{
+			continue;
+		}
+
+		FIKRigSolverBase* Solver = Controller->GetSolverAtIndex(SolverIndex);
+		if (!Solver)
+		{
+			continue;
+		}
+
+		// Solvers that don't support per-bone settings are skipped silently when
+		// targeting "all", but reported explicitly when a specific index was asked.
+		if (!Solver->UsesCustomBoneSettings())
+		{
+			if (bHasSolverIndex)
+			{
+				GEditor->EndTransaction();
+				return FMonolithActionResult::Error(FString::Printf(
+					TEXT("Solver %d does not support per-bone settings."), SolverIndex));
+			}
+			continue;
+		}
+
+		// Guard bone eligibility for this solver (CanAddBoneSetting reflects
+		// whether the bone is reachable by this solver). Only enforced for the
+		// explicit-index path; the all-solvers path simply skips ineligible solvers.
+		FText CanAddErr;
+		const bool bAlreadyHasSetting = Solver->HasSettingsOnBone(BoneName);
+		if (!bAlreadyHasSetting && !Controller->CanAddBoneSetting(BoneName, SolverIndex, &CanAddErr))
+		{
+			if (bHasSolverIndex)
+			{
+				GEditor->EndTransaction();
+				return FMonolithActionResult::Error(FString::Printf(
+					TEXT("Bone '%s' cannot take settings in solver %d: %s"),
+					*BoneNameStr, SolverIndex, *CanAddErr.ToString()));
+			}
+			continue;
+		}
+
+		// Create the bone-setting entry if it doesn't exist yet.
+		if (!bAlreadyHasSetting)
+		{
+			Controller->AddBoneSetting(BoneName, SolverIndex);
+		}
+
+		const UScriptStruct* ConcreteType = Solver->GetBoneSettingsType();
+		FIKRigBoneSettingsBase* Settings = Solver->GetBoneSettings(BoneName);
+		if (!ConcreteType || !Settings)
+		{
+			if (bHasSolverIndex)
+			{
+				GEditor->EndTransaction();
+				return FMonolithActionResult::Error(FString::Printf(
+					TEXT("Failed to resolve bone-settings struct for bone '%s' in solver %d."),
+					*BoneNameStr, SolverIndex));
+			}
+			continue;
+		}
+
+		// Walk the requested fields, writing each reflectively onto the live
+		// concrete struct. Per-field outcomes are echoed.
+		TArray<TSharedPtr<FJsonValue>> AppliedFields;
+		TArray<TSharedPtr<FJsonValue>> FailedFields;
+
+		for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : SettingsObj->Values)
+		{
+			const FString& FieldName = Pair.Key;
+			const TSharedPtr<FJsonValue>& FieldVal = Pair.Value;
+
+			// Case-insensitive property lookup (exact then fallback).
+			FProperty* Prop = ConcreteType->FindPropertyByName(FName(*FieldName));
+			if (!Prop)
+			{
+				for (TFieldIterator<FProperty> It(ConcreteType); It; ++It)
+				{
+					if (It->GetName().Equals(FieldName, ESearchCase::IgnoreCase))
+					{
+						Prop = *It;
+						break;
+					}
+				}
+			}
+
+			auto AddFailure = [&](const FString& Reason)
+			{
+				TSharedPtr<FJsonObject> F = MakeShared<FJsonObject>();
+				F->SetStringField(TEXT("field"), FieldName);
+				F->SetStringField(TEXT("reason"), Reason);
+				FailedFields.Add(MakeShared<FJsonValueObject>(F));
+			};
+
+			if (!Prop)
+			{
+				AddFailure(FString::Printf(TEXT("Unknown field on %s"), *ConcreteType->GetName()));
+				continue;
+			}
+			if (IsBaseBookkeepingField(Prop))
+			{
+				AddFailure(TEXT("'Bone' is identity metadata and cannot be set"));
+				continue;
+			}
+
+			// Stringify the JSON value the same way set_cdo_property does for the
+			// scalar ImportText path (numbers -> sanitized float, bools -> true/false,
+			// everything else -> raw string, which carries ImportText struct/enum forms).
+			FString ValStr;
+			if (FieldVal->Type == EJson::Number)
+			{
+				ValStr = FString::SanitizeFloat(FieldVal->AsNumber());
+			}
+			else if (FieldVal->Type == EJson::Boolean)
+			{
+				ValStr = FieldVal->AsBool() ? TEXT("true") : TEXT("false");
+			}
+			else
+			{
+				ValStr = FieldVal->AsString();
+			}
+
+			void* ValuePtr = Prop->ContainerPtrToValuePtr<void>(Settings);
+			const TCHAR* ImportResult = Prop->ImportText_Direct(*ValStr, ValuePtr, IkRig, PPF_None);
+			if (!ImportResult)
+			{
+				AddFailure(FString::Printf(
+					TEXT("ImportText rejected value '%s' (use display name for enums, "
+						 "ImportText form e.g. \"(X=1.0,Y=2.0,Z=3.0)\" for structs)"), *ValStr));
+				continue;
+			}
+
+			// Read back the accepted value for the echo (reflective round-trip).
+			TSharedPtr<FJsonObject> AppliedObj = MakeShared<FJsonObject>();
+			AppliedObj->SetStringField(TEXT("field"), Prop->GetName());
+			AppliedObj->SetField(TEXT("value"),
+				FMonolithReflectionReader::PropertyToJsonValue(Prop, ValuePtr, IkRig));
+			AppliedFields.Add(MakeShared<FJsonValueObject>(AppliedObj));
+		}
+
+		TSharedPtr<FJsonObject> SolverObj = MakeShared<FJsonObject>();
+		SolverObj->SetNumberField(TEXT("solver_index"), SolverIndex);
+		SolverObj->SetStringField(TEXT("solver_type"), SolverDisplayName(ConcreteType));
+		SolverObj->SetStringField(TEXT("bone_settings_struct"), ConcreteType->GetName());
+		SolverObj->SetArrayField(TEXT("applied"), AppliedFields);
+		if (FailedFields.Num() > 0)
+		{
+			SolverObj->SetArrayField(TEXT("failed"), FailedFields);
+		}
+		SolverResults.Add(MakeShared<FJsonValueObject>(SolverObj));
+		++SolversTouched;
+	}
+
+	GEditor->EndTransaction();
+
+	if (SolversTouched == 0)
+	{
+		// Nothing was applied — undo any (empty) transaction state by not dirtying.
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("No solver in the IK Rig accepts per-bone settings for bone '%s'. "
+				 "Check the bone is reachable by a solver (e.g. Full Body IK)."), *BoneNameStr));
+	}
+
+	IkRig->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("ik_rig"), IkRigPath);
+	Root->SetStringField(TEXT("bone_name"), BoneNameStr);
+	Root->SetNumberField(TEXT("solver_count"), NumSolvers);
+	Root->SetNumberField(TEXT("solvers_touched"), SolversTouched);
+	Root->SetArrayField(TEXT("solvers"), SolverResults);
+	return FMonolithActionResult::Success(Root);
+}
+
+// ---------------------------------------------------------------------------
+// T2-1: get_ik_rig_bone_settings (read-only — no transaction)
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithSkeletonRetargetActions::HandleGetIkRigBoneSettings(
+	const TSharedPtr<FJsonObject>& Params)
+{
+	const FString IkRigPath = Params->GetStringField(TEXT("ik_rig_path"));
+
+	UIKRigDefinition* IkRig = FMonolithAssetUtils::LoadAssetByPath<UIKRigDefinition>(IkRigPath);
+	if (!IkRig)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("IK Rig not found: %s"), *IkRigPath));
+	}
+
+	UIKRigController* Controller = UIKRigController::GetController(IkRig);
+	if (!Controller)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Could not get IK Rig controller for: %s"), *IkRigPath));
+	}
+
+	const int32 NumSolvers = Controller->GetNumSolvers();
+
+	// Optional filters.
+	FString BoneFilterStr;
+	const bool bHasBoneFilter =
+		Params->TryGetStringField(TEXT("bone_name"), BoneFilterStr) && !BoneFilterStr.IsEmpty();
+	const FName BoneFilter = bHasBoneFilter ? FName(*BoneFilterStr) : NAME_None;
+
+	bool bHasSolverIndex = false;
+	int32 RequestedSolverIndex = INDEX_NONE;
+	if (Params->HasTypedField<EJson::Number>(TEXT("solver_index")))
+	{
+		bHasSolverIndex = true;
+		RequestedSolverIndex = static_cast<int32>(Params->GetNumberField(TEXT("solver_index")));
+		if (RequestedSolverIndex < 0 || RequestedSolverIndex >= NumSolvers)
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("solver_index %d out of range [0, %d)."), RequestedSolverIndex, NumSolvers));
+		}
+	}
+
+	TArray<TSharedPtr<FJsonValue>> SolverResults;
+
+	for (int32 SolverIndex = 0; SolverIndex < NumSolvers; ++SolverIndex)
+	{
+		if (bHasSolverIndex && SolverIndex != RequestedSolverIndex)
+		{
+			continue;
+		}
+
+		FIKRigSolverBase* Solver = Controller->GetSolverAtIndex(SolverIndex);
+		if (!Solver || !Solver->UsesCustomBoneSettings())
+		{
+			continue;
+		}
+
+		const UScriptStruct* ConcreteType = Solver->GetBoneSettingsType();
+		if (!ConcreteType)
+		{
+			continue;
+		}
+
+		// Which bones to report for this solver.
+		TArray<FName> BonesToRead;
+		if (bHasBoneFilter)
+		{
+			if (Solver->HasSettingsOnBone(BoneFilter))
+			{
+				BonesToRead.Add(BoneFilter);
+			}
+		}
+		else
+		{
+			TSet<FName> WithSettings;
+			Solver->GetBonesWithSettings(WithSettings);
+			BonesToRead = WithSettings.Array();
+		}
+
+		TArray<TSharedPtr<FJsonValue>> BoneEntries;
+		for (const FName& Bone : BonesToRead)
+		{
+			FIKRigBoneSettingsBase* Settings = Solver->GetBoneSettings(Bone);
+			if (!Settings)
+			{
+				continue;
+			}
+			TSharedPtr<FJsonObject> BoneObj = MakeShared<FJsonObject>();
+			BoneObj->SetStringField(TEXT("bone"), Bone.ToString());
+			BoneObj->SetObjectField(TEXT("settings"),
+				BoneSettingsToJson(ConcreteType, Settings, IkRig));
+			BoneEntries.Add(MakeShared<FJsonValueObject>(BoneObj));
+		}
+
+		// Skip solvers with nothing to report when a bone filter found no match.
+		if (bHasBoneFilter && BoneEntries.Num() == 0)
+		{
+			continue;
+		}
+
+		TSharedPtr<FJsonObject> SolverObj = MakeShared<FJsonObject>();
+		SolverObj->SetNumberField(TEXT("solver_index"), SolverIndex);
+		SolverObj->SetStringField(TEXT("bone_settings_struct"), ConcreteType->GetName());
+		SolverObj->SetArrayField(TEXT("bones"), BoneEntries);
+		SolverResults.Add(MakeShared<FJsonValueObject>(SolverObj));
+	}
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("ik_rig"), IkRigPath);
+	Root->SetNumberField(TEXT("solver_count"), NumSolvers);
+	if (bHasBoneFilter)
+	{
+		Root->SetStringField(TEXT("bone_name"), BoneFilterStr);
+	}
+	Root->SetArrayField(TEXT("solvers"), SolverResults);
 	return FMonolithActionResult::Success(Root);
 }

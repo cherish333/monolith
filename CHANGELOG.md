@@ -8,6 +8,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Retarget pose + op-stack tuning (`animation`) — 8 new actions.** Author the IK Retargeter retarget pose and the per-chain / root / foot-lock op settings, plus per-bone `USkeleton` translation-retargeting, so a retarget can be dialed in rather than left at op-stack defaults.
+  - `align_retarget_pose` — auto-align an IK Retargeter's source or target retarget pose via AutoAlign + SnapBoneToGround.
+  - `get_retarget_pose` / `set_retarget_pose` — read/edit a retarget pose. `set_retarget_pose` `mode`: `from_reference` (reset to the rig reference pose) or `bone_deltas` (apply per-bone rotation/translation offsets); a `from_animation` mode is deferred.
+  - `get_retarget_chain_settings` / `set_retarget_chain_settings` — read/write a retarget chain's FK and IK op-stack settings (rotation/translation modes, IK blend, etc.), written reflectively.
+  - `set_retarget_root_settings` — set the Pelvis Motion op settings: vertical scale, floor constraint, and whether root motion affects the IK goals.
+  - `enable_foot_ground_lock` — configure the Speed Planting op's foot ground-lock on named IK chains.
+  - `set_bone_translation_retargeting` / `get_bone_translation_retargeting` — read/write per-bone `USkeleton` translation-retargeting modes (`Animation` / `Skeleton` / `AnimationScaled` / `AnimationRelative` / `OrientAndScale`); the setter also accepts a `biped_locomotion` preset.
+
+- **Locomotion authoring (`animation`) — 3 new actions.**
+  - `get_root_motion_speed` — report a sequence's authored root-motion ground speed in cm/s, with an explicit "unknowable" signal for root-locked or no-root-motion clips instead of a misleading zero.
+  - `bake_distance_curve` — bake a `Distance` curve onto a sequence via the engine `DistanceCurveModifier` (removes any existing same-named curve first, then persists the baked curve into the asset's modifier stack).
+  - `bind_threadsafe_update_function` — wire a Blueprint-library static call into an AnimBP's `BlueprintThreadSafeUpdateAnimation` graph (v1a: known-signature binding).
+
+- **IK Rig bone settings (`animation`) — 2 new actions.** `set_ik_rig_bone_settings` / `get_ik_rig_bone_settings` — write/read a bone's per-solver IK Rig bone settings, addressed reflectively so solver-specific fields are reachable.
+
+- **Bone transform inspection (`animation`).** `get_animated_bone_transform` — the FK-composed transform of a bone at a given frame or time, in component space or world space.
+
+### Changed
+
+- **`get_retargeter_info` (`animation`)** now emits an `ops[]` array — per retarget op its type plus reflected settings — alongside the existing chain mappings.
+- **`apply_anim_modifier` (`animation`)** now accepts a `properties` object (a reflective field set written onto the modifier before it runs) and a `persist` flag (register the modifier into the asset's `AnimationModifiers` stack so it survives reimport, rather than a one-shot run).
+- **`get_blend_space_info` (`animation`)** now reports each sample's authored root-motion speed plus the `triangulation_baked` and `interpolate_using_grid` flags.
+- **`get_anim_node_pin_bindings` (`animation`)** now also emits wire-linked input pins (`type:"Link"` entries carrying the source node/pin driving the input), so property-access bindings and graph wires on a node are both visible in one read.
+- **`derive_foot_sync_markers` (`animation`)** gains a `from_bones` mode that derives foot plants from per-frame foot-bone height plus planar-speed minima, for clips with no markers/notifies/curves but a usable foot-bone track.
+- **`get_curve_keys` (`animation`)** now reports `monotonic` and `sign` flags on the returned curve.
+- **`set_anim_node_function_binding` (`animation`)** now calls `RequestRefreshExtensions` so the recompile regenerates the anim-subsystem set for the changed binding — without it the changed binding left a null `NodeRelevancy` subsystem at runtime.
+
 ### Fixed
 
 ## [0.20.2] - 2026-06-15
