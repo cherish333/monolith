@@ -1,5 +1,6 @@
 #include "MonolithAnimationActions.h"
 #include "MonolithAssetUtils.h"
+#include "MonolithJsonUtils.h"
 #include "MonolithParamSchema.h"
 #include "MonolithPropertyAccessReader.h"
 #include "MonolithAnimNodeBindingReader.h" // Gap 2 (function bindings) + Gap 12 (pin bindings) read helpers
@@ -4610,10 +4611,11 @@ FMonolithActionResult FMonolithAnimationActions::HandleApplyAnimModifier(const T
 		int32 Applied = 0;
 		for (const auto& Pair : Props->Values)
 		{
-			FProperty* Prop = Mod->GetClass()->FindPropertyByName(FName(*Pair.Key));
+			const FString PairKeyStr = MonolithKeyToString(Pair.Key);
+			FProperty* Prop = Mod->GetClass()->FindPropertyByName(FName(*PairKeyStr));
 			if (!Prop || !Pair.Value.IsValid())
 			{
-				OutUnresolved.Add(MakeShared<FJsonValueString>(Pair.Key));
+				OutUnresolved.Add(MakeShared<FJsonValueString>(PairKeyStr));
 				continue;
 			}
 			void* ValuePtr = Prop->ContainerPtrToValuePtr<void>(Mod);
@@ -4681,7 +4683,7 @@ FMonolithActionResult FMonolithAnimationActions::HandleApplyAnimModifier(const T
 			}
 
 			if (bSet) ++Applied;
-			else OutUnresolved.Add(MakeShared<FJsonValueString>(Pair.Key));
+			else OutUnresolved.Add(MakeShared<FJsonValueString>(PairKeyStr));
 		}
 		return Applied;
 	};
@@ -9485,9 +9487,10 @@ FMonolithActionResult FMonolithAnimationActions::HandleBatchExecute(const TShare
 		TSharedRef<FJsonObject> SubParams = MakeShared<FJsonObject>();
 		for (auto& Pair : Op->Values)
 		{
-			if (Pair.Key != TEXT("op"))
+			const FString OpFieldKey = MonolithKeyToString(Pair.Key);
+			if (OpFieldKey != TEXT("op"))
 			{
-				SubParams->SetField(Pair.Key, Pair.Value);
+				SubParams->SetField(OpFieldKey, Pair.Value);
 			}
 		}
 
@@ -10375,7 +10378,7 @@ FMonolithActionResult FMonolithAnimationActions::HandleSetNotifyProperties(const
 
 	for (auto& Pair : (*PropsPtr)->Values)
 	{
-		const FString& PropName = Pair.Key;
+		const FString PropName = MonolithKeyToString(Pair.Key);
 		FString ValueStr = Pair.Value->AsString();
 
 		TSharedPtr<FJsonObject> PropResult = MakeShared<FJsonObject>();

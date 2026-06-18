@@ -821,16 +821,17 @@ void FMonolithReflectionWalker::WriteMap(FMapProperty* MapProp, void* ValuePtr, 
 		MapProp->KeyProp->InitializeValue(KeyTemp);
 		MapProp->ValueProp->InitializeValue(ValTemp);
 
+		const FString PairKeyStr = MonolithKeyToString(Pair.Key);
 		FBulkFillFieldWrite KeyWrite;
 		KeyWrite.Path = FString::Printf(TEXT("%s{key#%d}"), *PathPrefix, Index);
 		{
 			FStringOutputDevice ErrText;
-			const TCHAR* Result = MapProp->KeyProp->ImportText_Direct(*Pair.Key, KeyTemp, Owner, PPF_None, &ErrText);
-			KeyWrite.ProposedValue = Pair.Key;
+			const TCHAR* Result = MapProp->KeyProp->ImportText_Direct(*PairKeyStr, KeyTemp, Owner, PPF_None, &ErrText);
+			KeyWrite.ProposedValue = PairKeyStr;
 			KeyWrite.bOk = (Result != nullptr);
 			if (!KeyWrite.bOk)
 			{
-				KeyWrite.Reason = FString::Printf(TEXT("map key '%s' rejected: %s"), *Pair.Key, *ErrText);
+				KeyWrite.Reason = FString::Printf(TEXT("map key '%s' rejected: %s"), *PairKeyStr, *ErrText);
 				++LocalErrors;
 			}
 		}
@@ -941,13 +942,14 @@ void FMonolithReflectionWalker::WriteStruct(FStructProperty* StructProp, void* V
 		int32 LocalErrors = 0;
 		for (const auto& Pair : (*NestedObj)->Values)
 		{
+			const FString PairKeyStr = MonolithKeyToString(Pair.Key);
 			FBulkFillFieldWrite W;
-			W.Path = FString::Printf(TEXT("%s.%s"), *PathPrefix, *Pair.Key);
-			FProperty* InnerProp = FindPropertyForwarding(StructProp->Struct, Pair.Key);
+			W.Path = FString::Printf(TEXT("%s.%s"), *PathPrefix, *PairKeyStr);
+			FProperty* InnerProp = FindPropertyForwarding(StructProp->Struct, PairKeyStr);
 			if (!InnerProp)
 			{
 				W.bOk = false;
-				W.Reason = FString::Printf(TEXT("unknown field '%s' on %s"), *Pair.Key, *StructProp->Struct->GetName());
+				W.Reason = FString::Printf(TEXT("unknown field '%s' on %s"), *PairKeyStr, *StructProp->Struct->GetName());
 				OutReport.FieldWrites.Add(W);
 				++LocalErrors;
 				continue;
@@ -1000,18 +1002,19 @@ FDryRunReport FMonolithReflectionWalker::WriteTree(
 
 	for (const auto& Pair : Tree->Values)
 	{
+		const FString PairKeyStr = MonolithKeyToString(Pair.Key);
 		FBulkFillFieldWrite W;
-		W.Path = Pair.Key;
-		FProperty* Prop = FindPropertyForwarding(TopStruct, Pair.Key);
+		W.Path = PairKeyStr;
+		FProperty* Prop = FindPropertyForwarding(TopStruct, PairKeyStr);
 		if (!Prop)
 		{
 			W.bOk = false;
-			W.Reason = FString::Printf(TEXT("unknown field '%s' on %s"), *Pair.Key, *TopStruct->GetName());
+			W.Reason = FString::Printf(TEXT("unknown field '%s' on %s"), *PairKeyStr, *TopStruct->GetName());
 			Report.FieldWrites.Add(W);
 			continue;
 		}
 		void* ValuePtr = Prop->ContainerPtrToValuePtr<void>(Container);
-		DispatchByPropertyType(Prop, ValuePtr, Pair.Value, OwnerForCradle, Spec, Report, Pair.Key, W);
+		DispatchByPropertyType(Prop, ValuePtr, Pair.Value, OwnerForCradle, Spec, Report, PairKeyStr, W);
 		Report.FieldWrites.Add(W);
 	}
 
@@ -1048,13 +1051,14 @@ FDryRunReport FMonolithReflectionWalker::InspectTree(
 
 	for (const auto& Pair : Tree->Values)
 	{
+		const FString PairKeyStr = MonolithKeyToString(Pair.Key);
 		FBulkFillFieldWrite W;
-		W.Path = Pair.Key;
-		FProperty* Prop = FindPropertyForwarding(TopStruct, Pair.Key);
+		W.Path = PairKeyStr;
+		FProperty* Prop = FindPropertyForwarding(TopStruct, PairKeyStr);
 		if (!Prop)
 		{
 			W.bOk = false;
-			W.Reason = FString::Printf(TEXT("unknown field '%s' on %s"), *Pair.Key, *TopStruct->GetName());
+			W.Reason = FString::Printf(TEXT("unknown field '%s' on %s"), *PairKeyStr, *TopStruct->GetName());
 			Report.FieldWrites.Add(W);
 			continue;
 		}
@@ -1063,7 +1067,7 @@ FDryRunReport FMonolithReflectionWalker::InspectTree(
 		// against the scratch; destroy. The real container is never touched.
 		void* Scratch = FMemory::Malloc(Prop->GetSize(), Prop->GetMinAlignment());
 		Prop->InitializeValue(Scratch);
-		DispatchByPropertyType(Prop, Scratch, Pair.Value, nullptr, Spec, Report, Pair.Key, W);
+		DispatchByPropertyType(Prop, Scratch, Pair.Value, nullptr, Spec, Report, PairKeyStr, W);
 		Prop->DestroyValue(Scratch);
 		FMemory::Free(Scratch);
 

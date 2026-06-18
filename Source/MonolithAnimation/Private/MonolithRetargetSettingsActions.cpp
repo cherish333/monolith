@@ -895,6 +895,18 @@ FMonolithActionResult FMonolithRetargetSettingsActions::HandleEnableFootGroundLo
 			"No Speed Planting op in the retargeter op stack. Add a Speed Planting op (or seed extended default ops) first."));
 	}
 
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 8
+	// FIKRetargetSpeedPlantingOpSettings cannot be value-constructed outside the IKRig module on
+	// UE 5.8: its PostLoad(FIKRigObjectVersion::Type) override ships WITHOUT IKRIG_API
+	// (Engine .../IKRig/.../RetargetOps/SpeedPlantingOp.h:109), so a locally-emitted vtable
+	// references an unexported symbol (LNK2001). UIKRetargetSpeedPlantingController::GetSettings()
+	// returns BY VALUE, forcing that construction. Unavailable on 5.8 pending an Epic export fix.
+	// See Docs/assessment/build-breaks-5.8.md (RC7).
+	return FMonolithActionResult::Error(TEXT(
+		"enable_foot_ground_lock is unavailable on UE 5.8: the engine ships "
+		"FIKRetargetSpeedPlantingOpSettings::PostLoad without IKRIG_API export, so its settings "
+		"struct cannot be constructed outside the IKRig module. Pending an Epic engine fix."));
+#else
 	const FScopedTransaction Transaction(FText::FromString(TEXT("Enable Foot Ground Lock")));
 	Controller->GetAsset()->Modify();
 
@@ -938,8 +950,12 @@ FMonolithActionResult FMonolithRetargetSettingsActions::HandleEnableFootGroundLo
 	if (Params->TryGetNumberField(TEXT("speed_threshold"), SpeedThreshold)) { Settings.SpeedThreshold = SpeedThreshold; }
 	double Stiffness = 0.0;
 	if (Params->TryGetNumberField(TEXT("stiffness"), Stiffness)) { Settings.Stiffness = Stiffness; }
+#if !(ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 8)
+	// FIKRetargetSpeedPlantingOpSettings::CriticalDamping was removed in UE 5.8
+	// (speed-planting reworked to a spring model: SpringStrength / ArrivalSpeedGain).
 	double CriticalDamping = 0.0;
 	if (Params->TryGetNumberField(TEXT("critical_damping"), CriticalDamping)) { Settings.CriticalDamping = CriticalDamping; }
+#endif
 
 	SpeedController->SetSettings(Settings);
 
@@ -965,9 +981,12 @@ FMonolithActionResult FMonolithRetargetSettingsActions::HandleEnableFootGroundLo
 	}
 	Root->SetNumberField(TEXT("speed_threshold"), Settings.SpeedThreshold);
 	Root->SetNumberField(TEXT("stiffness"), Settings.Stiffness);
+#if !(ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 8)
 	Root->SetNumberField(TEXT("critical_damping"), Settings.CriticalDamping);
+#endif
 	if (bSnapped) { Root->SetStringField(TEXT("snapped_to_ground_bone"), SnapBone); }
 	return FMonolithActionResult::Success(Root);
+#endif // 5.8 foot-ground-lock gate
 }
 
 // ===========================================================================

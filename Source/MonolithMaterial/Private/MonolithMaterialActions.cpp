@@ -29,6 +29,7 @@
 #include "MaterialEditingLibrary.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "Editor.h"
+#include "MonolithJsonUtils.h"
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 #include "Serialization/JsonSerializer.h"
@@ -8056,7 +8057,7 @@ FMonolithActionResult FMonolithMaterialActions::CreatePbrMaterialFromDisk(const 
 
 	for (const auto& MapEntry : MapsObj->Values)
 	{
-		FString MapType = MapEntry.Key.ToLower();
+		FString MapType = MonolithKeyToString(MapEntry.Key).ToLower();
 		FString DiskPath = MapEntry.Value->AsString();
 
 		if (DiskPath.IsEmpty())

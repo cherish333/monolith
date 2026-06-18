@@ -21,7 +21,7 @@ bool FMonolithParamSchema::ApplyAliases(
 
 	for (const auto& Pair : Schema->Values)
 	{
-		const FString& Canonical = Pair.Key;
+		const FString Canonical = MonolithKeyToString(Pair.Key);
 
 		const TSharedPtr<FJsonObject>* ParamDef = nullptr;
 		if (!Pair.Value->TryGetObject(ParamDef) || !ParamDef)
@@ -86,7 +86,7 @@ TArray<FString> FMonolithParamSchema::FindUnknownKeys(
 	TSet<FString> Allowed;
 	for (const auto& Pair : Schema->Values)
 	{
-		Allowed.Add(Pair.Key);
+		Allowed.Add(MonolithKeyToString(Pair.Key));
 
 		const TSharedPtr<FJsonObject>* ParamDef = nullptr;
 		if (!Pair.Value->TryGetObject(ParamDef) || !ParamDef)
@@ -126,9 +126,10 @@ TArray<FString> FMonolithParamSchema::FindUnknownKeys(
 
 	for (const auto& Pair : Params->Values)
 	{
-		if (!Allowed.Contains(Pair.Key))
+		const FString PairKeyStr = MonolithKeyToString(Pair.Key);
+		if (!Allowed.Contains(PairKeyStr))
 		{
-			Unknown.Add(Pair.Key);
+			Unknown.Add(PairKeyStr);
 		}
 	}
 
@@ -327,27 +328,28 @@ FMonolithActionResult FMonolithToolRegistry::ExecuteAction(
 		TArray<FString> Missing;
 		for (const auto& Pair : ActionInfo.ParamSchema->Values)
 		{
-			if (Pair.Key == TEXT("asset_path")) continue;
+			const FString PairKeyStr = MonolithKeyToString(Pair.Key);
+			if (PairKeyStr == TEXT("asset_path")) continue;
 
 			const TSharedPtr<FJsonObject>* ParamDef = nullptr;
 			if (Pair.Value->TryGetObject(ParamDef) && ParamDef)
 			{
 				bool bRequired = false;
 				(*ParamDef)->TryGetBoolField(TEXT("required"), bRequired);
-				if (bRequired && !EffectiveParams->HasField(Pair.Key))
+				if (bRequired && !EffectiveParams->HasField(PairKeyStr))
 				{
 					// Legacy wbp_path / asset_path aliasing: accept asset_path as substitute for wbp_path
 					// (only fires for schemas not migrated to K2 aliases).
-					if (Pair.Key == TEXT("wbp_path") && EffectiveParams->HasField(TEXT("asset_path")))
+					if (PairKeyStr == TEXT("wbp_path") && EffectiveParams->HasField(TEXT("asset_path")))
 						continue;
-					Missing.Add(Pair.Key);
+					Missing.Add(PairKeyStr);
 				}
 			}
 		}
 		if (Missing.Num() > 0)
 		{
 			TArray<FString> Provided;
-			for (const auto& P : EffectiveParams->Values) Provided.Add(P.Key);
+			for (const auto& P : EffectiveParams->Values) Provided.Add(MonolithKeyToString(P.Key));
 			return FMonolithActionResult::Error(
 				FString::Printf(TEXT("Missing required param(s): [%s]. Provided keys: [%s] — inspect the action's parameter schema via monolith_discover(\"<namespace>\") and supply all required fields."),
 					*FString::Join(Missing, TEXT(", ")),
@@ -391,7 +393,7 @@ FMonolithActionResult FMonolithToolRegistry::ExecuteAction(
 				continue;
 			}
 
-			const FString& ParamName = SchemaPair.Key;
+			const FString ParamName = MonolithKeyToString(SchemaPair.Key);
 			FString Value;
 			if (!EffectiveParams->TryGetStringField(ParamName, Value))
 			{
