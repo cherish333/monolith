@@ -233,7 +233,9 @@ void UMonolithUpdateSubsystem::CheckForUpdate()
 							{
 								(*AssetObj)->TryGetStringField(TEXT("browser_download_url"), FirstZipUrl);
 							}
-							if (MatchingZipUrl.IsEmpty() && Name.Contains(EngineTag, ESearchCase::IgnoreCase))
+							// Bounded-token match: the tag must be immediately followed by
+							// ".zip" so "UE5.7" never matches "...UE5.70.zip"/"...UE5.17.zip".
+							if (MatchingZipUrl.IsEmpty() && Name.Contains(EngineTag + TEXT(".zip"), ESearchCase::IgnoreCase))
 							{
 								(*AssetObj)->TryGetStringField(TEXT("browser_download_url"), MatchingZipUrl);
 							}
@@ -303,8 +305,12 @@ void UMonolithUpdateSubsystem::CheckForUpdate()
 					if (bChoseEngineTaggedAsset)
 					{
 						const FString TaggedPrefix = FString::Printf(TEXT("Monolith-SHA256-%s:"), *EngineTag);
+						// Escape the literal '.' in the tag (e.g. "UE5.7" -> "UE5\.7")
+						// so the regex matches a literal dot, not any char.
+						FString EngineTagRegex = EngineTag;
+						EngineTagRegex.ReplaceInline(TEXT("."), TEXT("\\."));
 						const FRegexPattern TaggedHashPattern(
-							FString::Printf(TEXT("Monolith-SHA256-%s:\\s*([0-9a-fA-F]{64})(?![0-9a-fA-F])"), *EngineTag));
+							FString::Printf(TEXT("Monolith-SHA256-%s:\\s*([0-9a-fA-F]{64})(?![0-9a-fA-F])"), *EngineTagRegex));
 						FRegexMatcher Matcher(TaggedHashPattern, ReleaseNotes);
 						if (Matcher.FindNext())
 						{
