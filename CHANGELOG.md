@@ -6,7 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.20.3] - 2026-06-20
+
 ### Added
+
+- **UE 5.7 + 5.8 cross-engine releases.** Monolith now ships one flat per-engine zip per supported Unreal version: `Monolith-vX.Y.Z-UE5.7.zip` and `Monolith-vX.Y.Z-UE5.8.zip`. Download the zip matching your engine -- the plugin loads with no compiler, and the same source builds and runs on both 5.7 and 5.8.
+- **Engine-aware auto-updater.** The updater detects the running engine (compile-time `ENGINE_MINOR_VERSION`) and fetches the matching release asset, verified by a per-engine `Monolith-SHA256-UE5.x:` marker; it fails closed if no build exists for your engine. Updating from a pre-cross-engine release falls back to the legacy single-zip path.
 
 - **Terse-by-default `monolith_discover(namespace)`.** The per-namespace branch now returns each action's name + a one-line description only — the full per-action `params` JSON-Schema is no longer emitted by default. Fetch a single action's schema with `describe_query action_schema` (~54 tokens), or pass `detail=true` (alias `verbose=true`) to inline every action's schema (reproduces the pre-change response shape byte-for-byte). New optional params: `filter` (case-insensitive substring on action name OR full description) and opt-in `offset`/`limit` pagination (`limit=0` = the complete list; no action is hidden by default). Terse responses carry top-level `total` (always), `next_offset` (only when a positive `limit` leaves more), and `schema_hint` (points callers at `describe_query action_schema` / `detail=true`). The one-line description is trimmed to its first sentence, else hard-capped at 150 chars on a word boundary with a trailing `"..."`; the full description is preserved in `detail` mode and via `describe_query action_schema`. The full `discover()` (no namespace) response is unchanged. Measured per-namespace token reduction (terse vs `detail`, same-server baseline):
 
