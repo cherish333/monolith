@@ -2682,6 +2682,26 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleResolveNode(const TSh
 			OwnerClass, DelegateProp, bSelfContext);
 		if (!Resolved.bSuccess) return Resolved;
 
+		// Delegate-node pins are not built from DelegateProp directly: AllocateDefaultPins
+		// RE-resolves the member reference against the node's owning Blueprint class
+		// (UK2Node::GetBlueprintClassFromNode). Against the dummy Actor TempBP the
+		// self-context lookup finds no such delegate, so the node silently allocates
+		// only its base pins (execute/then/self) — every signature parameter is dropped
+		// and self types as plain Actor. Point the transient BP at the real owner so
+		// the dry-run resolves the same signature a real add_node would; prefer the
+		// owner's skeleton class so just-edited signature params are visible before
+		// a full compile, matching in-graph node behavior.
+		TempBP->ParentClass = OwnerClass;
+		TempBP->GeneratedClass = OwnerClass;
+		TempBP->SkeletonGeneratedClass = OwnerClass;
+		if (UBlueprint* OwnerBP = Cast<UBlueprint>(OwnerClass->ClassGeneratedBy))
+		{
+			if (OwnerBP->SkeletonGeneratedClass)
+			{
+				TempBP->SkeletonGeneratedClass = OwnerBP->SkeletonGeneratedClass;
+			}
+		}
+
 		if (NodeType == TEXT("AddDelegate"))
 		{
 			UK2Node_AddDelegate* N = NewObject<UK2Node_AddDelegate>(TempGraph);
