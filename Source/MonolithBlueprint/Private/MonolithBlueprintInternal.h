@@ -603,8 +603,17 @@ namespace MonolithBlueprintInternal
 		return nullptr;
 	}
 
-	// Find a node by its GetName() across all graphs or a specific graph
-	inline UEdGraphNode* FindNodeById(UBlueprint* BP, const FString& GraphName, const FString& NodeId)
+	// Find a node by its GetName() across all graphs or a specific graph.
+	//
+	// When GraphName is empty the search spans every graph. A node ID (GetName())
+	// is only unique WITHIN a graph, so the same ID can legitimately exist in more
+	// than one graph. If OutMatchGraphs is provided it is filled with the name of
+	// every graph containing a match — the caller can then detect a cross-graph ID
+	// collision (OutMatchGraphs.Num() > 1) and ask for a disambiguating graph_name.
+	// The FIRST match is always returned (back-compat for callers that don't pass
+	// OutMatchGraphs); with OutMatchGraphs set the scan continues so all matches
+	// are recorded.
+	inline UEdGraphNode* FindNodeById(UBlueprint* BP, const FString& GraphName, const FString& NodeId, TArray<FString>* OutMatchGraphs = nullptr)
 	{
 		auto SearchGraph = [&](UEdGraph* Graph) -> UEdGraphNode*
 		{
@@ -619,22 +628,42 @@ namespace MonolithBlueprintInternal
 		if (!GraphName.IsEmpty())
 		{
 			UEdGraph* Graph = FindGraphByName(BP, GraphName);
-			return Graph ? SearchGraph(Graph) : nullptr;
+			UEdGraphNode* Found = Graph ? SearchGraph(Graph) : nullptr;
+			if (Found && OutMatchGraphs)
+			{
+				OutMatchGraphs->Add(Graph->GetName());
+			}
+			return Found;
 		}
 
-		auto SearchGraphs = [&](const TArray<TObjectPtr<UEdGraph>>& Graphs) -> UEdGraphNode*
+		// graph_name omitted → walk every graph array (same set as before:
+		// Ubergraph, Function, Macro). Without OutMatchGraphs, stop at the first
+		// match; with it, collect all matches for collision detection.
+		UEdGraphNode* First = nullptr;
+		const TArray<TObjectPtr<UEdGraph>>* AllArrays[] = { &BP->UbergraphPages, &BP->FunctionGraphs, &BP->MacroGraphs };
+		for (const TArray<TObjectPtr<UEdGraph>>* Arr : AllArrays)
 		{
-			for (const auto& G : Graphs)
+			for (const TObjectPtr<UEdGraph>& G : *Arr)
 			{
-				if (UEdGraphNode* N = SearchGraph(G)) return N;
+				if (!G) continue;
+				if (UEdGraphNode* N = SearchGraph(G))
+				{
+					if (!First)
+					{
+						First = N;
+					}
+					if (OutMatchGraphs)
+					{
+						OutMatchGraphs->Add(G->GetName());
+					}
+					else
+					{
+						return First;
+					}
+				}
 			}
-			return nullptr;
-		};
-
-		if (UEdGraphNode* N = SearchGraphs(BP->UbergraphPages)) return N;
-		if (UEdGraphNode* N = SearchGraphs(BP->FunctionGraphs)) return N;
-		if (UEdGraphNode* N = SearchGraphs(BP->MacroGraphs)) return N;
-		return nullptr;
+		}
+		return First;
 	}
 
 	// Build a comma-separated list of non-hidden pin names on a node (for error messages)
@@ -818,22 +847,40 @@ namespace MonolithBlueprintInternal
 		else if (TypeStr.StartsWith(TEXT("map:")))
 		{
 			ContainerType = EPinContainerType::Map;
-			// map:KeyType:ValueType — split on second colon
-			int32 SecondColon;
-			if (BaseType.Mid(4).FindChar(TEXT(':'), SecondColon))
+			// map:KeyType:ValueType. The key type may itself be a compound
+			// colon-bearing token (enum:Name, struct:Name, object:Name, class:Name,
+			// softobject:Name, softclass:Name), so a naive split on the first colon
+			// after "map:" is WRONG — it slices "enum:ESlateVisibility" into key
+			// "enum" (unrecognized -> PC_Boolean default -> "key type of Boolean
+			// cannot be hashed") and mangles the value. Detect a known key prefix and
+			// consume "<prefix>:<name>" as the whole key; otherwise the key is a
+			// simple token ending at the first colon. The remainder is the value.
+			const FString AfterMap = TypeStr.Mid(4);
+			static const TCHAR* const KeyTypePrefixes[] = {
+				TEXT("softobject:"), TEXT("softclass:"), TEXT("object:"),
+				TEXT("class:"), TEXT("struct:"), TEXT("enum:")
+			};
+			int32 KeyPrefixLen = 0;
+			for (const TCHAR* Prefix : KeyTypePrefixes)
 			{
-				BaseType = TypeStr.Mid(4, SecondColon);
-				FString ValueType = TypeStr.Mid(4 + SecondColon + 1);
+				if (AfterMap.StartsWith(Prefix)) { KeyPrefixLen = FCString::Strlen(Prefix); break; }
+			}
+			int32 SepColon = INDEX_NONE;
+			if (AfterMap.RightChop(KeyPrefixLen).FindChar(TEXT(':'), SepColon))
+			{
+				SepColon += KeyPrefixLen; // colon index within AfterMap that splits key/value
+				BaseType = AfterMap.Left(SepColon);
+				const FString ValueType = AfterMap.Mid(SepColon + 1);
 				PinType.PinValueType = FEdGraphTerminalType();
 				// Parse value type recursively for the terminal type
-				FEdGraphPinType ValPinType = ParsePinTypeFromString(ValueType);
+				const FEdGraphPinType ValPinType = ParsePinTypeFromString(ValueType);
 				PinType.PinValueType.TerminalCategory = ValPinType.PinCategory;
 				PinType.PinValueType.TerminalSubCategory = ValPinType.PinSubCategory;
 				PinType.PinValueType.TerminalSubCategoryObject = ValPinType.PinSubCategoryObject;
 			}
 			else
 			{
-				BaseType = TypeStr.Mid(4);
+				BaseType = AfterMap;
 			}
 		}
 
