@@ -1779,6 +1779,67 @@ namespace
 		return true;
 	}
 
+	// Stale-resident-target-world guard for load_level. If a World asset for the TARGET
+	// package is already resident in memory but is not the current editor world (e.g. it
+	// was loaded by a scripting call such as duplicate_asset/load_asset, which pins it
+	// with RF_Standalone and may root it via the Python bridge's FPyReferenceCollector),
+	// Map_Load's purge cannot GC it and the engine hard-asserts "World Memory Leaks"
+	// (EditorServer.cpp) — killing the whole editor. Best-effort release the standalone
+	// pin + GC; if the copy is still rooted, REFUSE instead of crashing.
+	bool EnsureNoStaleResidentTargetWorld(const FString& TargetPath, FString& OutError)
+	{
+		const FString TargetPackageName = FPackageName::ObjectPathToPackageName(TargetPath);
+
+		auto FindStaleTargetWorld = [&TargetPackageName]() -> UWorld*
+		{
+			UWorld* CurrentWorld = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+			for (TObjectIterator<UWorld> It; It; ++It)
+			{
+				UWorld* World = *It;
+				if (!IsValid(World) || World == CurrentWorld)
+				{
+					continue;
+				}
+				UPackage* Package = World->GetPackage();
+				if (Package && !Package->HasAnyPackageFlags(PKG_PlayInEditor) &&
+					Package->GetName() == TargetPackageName)
+				{
+					return World;
+				}
+			}
+			return nullptr;
+		};
+
+		UWorld* Stale = FindStaleTargetWorld();
+		if (!Stale)
+		{
+			return true;
+		}
+
+		// An interactively-loaded asset is pinned by RF_Standalone; drop it and let GC
+		// take the copy if nothing else roots it.
+		Stale->ClearFlags(RF_Standalone);
+		if (UPackage* Package = Stale->GetPackage())
+		{
+			Package->ClearFlags(RF_Standalone);
+		}
+		CollectGarbage(GARBAGE_COLLECTION_KEEPFLAGS);
+
+		if (!FindStaleTargetWorld())
+		{
+			return true;
+		}
+
+		OutError = FString::Printf(
+			TEXT("Refusing load_level: a stale in-memory copy of '%s' is resident and still rooted ")
+			TEXT("after a GC pass (commonly a scripting reference — e.g. a Python variable holding the ")
+			TEXT("world from duplicate_asset/load_asset). Loading now would trip the engine's fatal ")
+			TEXT("'World Memory Leaks' assert and crash the editor. Release the reference (del the ")
+			TEXT("Python variable + gc.collect()) or restart the editor, then retry."),
+			*TargetPackageName);
+		return false;
+	}
+
 	// Dirty-current-map guard for load_level. ULevelEditorSubsystem::LoadLevel runs
 	// with GIsRunningUnattendedScript=true (LevelEditorSubsystem.cpp), so the usual
 	// "save changes?" prompt never appears — a dirty current map is DISCARDED SILENTLY.
@@ -4456,6 +4517,14 @@ FMonolithActionResult FMonolithEditorActions::HandleLoadLevel(const TSharedPtr<F
 	if (!EnsureNoResidentPieWorldBeforeMapLoad(PieGuardError))
 	{
 		return FMonolithActionResult::Error(PieGuardError);
+	}
+
+	// Second world-leak class: a stale rooted in-memory copy of the TARGET world (from a
+	// scripting load) survives the purge and fatals the editor. Refuse instead.
+	FString StaleWorldError;
+	if (!EnsureNoStaleResidentTargetWorld(Path, StaleWorldError))
+	{
+		return FMonolithActionResult::Error(StaleWorldError);
 	}
 
 	const bool bLoaded = LevelEd->LoadLevel(Path);
