@@ -1,6 +1,7 @@
 #include "MonolithSkeletonRetargetActions.h"
 #include "MonolithAssetUtils.h"
 #include "MonolithParamSchema.h"
+#include "MonolithJsonUtils.h" // MonolithKeyToString (5.7/5.8 JSON key shim)
 #include "Reflection/MonolithReflectionReader.h"
 
 #include "Animation/Skeleton.h"
@@ -577,9 +578,9 @@ FMonolithActionResult FMonolithSkeletonRetargetActions::HandleSetIkRigBoneSettin
 		TArray<TSharedPtr<FJsonValue>> AppliedFields;
 		TArray<TSharedPtr<FJsonValue>> FailedFields;
 
-		for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : SettingsObj->Values)
+		for (const auto& Pair : SettingsObj->Values)
 		{
-			const FString& FieldName = Pair.Key;
+			const FString FieldName = MonolithKeyToString(Pair.Key);
 			const TSharedPtr<FJsonValue>& FieldVal = Pair.Value;
 
 			// Case-insensitive property lookup (exact then fallback).
