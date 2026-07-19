@@ -6,8 +6,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-07-19
+
+### Added
+
+Small ergonomics upgrades to the `ui` and `blueprint` action packs, driven by requests on the Ideas board (Discussion #74, thanks @k-s-s). No new actions — existing actions gained aliases, defaults, and smarter resolution.
+
+- **`ui` `add_widget`** — `parent` is now accepted as an alias for `parent_name`, so you can target a non-root panel directly.
+- **`ui` `set_widget_property`** — common `UWidget` properties (`Visibility`, `RenderOpacity`, `ToolTipText`, `bIsEnabled`, and `RenderTransform.Angle` / `.Scale` / `.Translation`) are now allowlisted by default, so setting them no longer needs `raw_mode=true`.
+- **`ui` `set_brush`** — `property_name` is now optional and auto-resolves the brush property from the widget type (Image → `Brush`, Border → `Background`); `color` is accepted as an alias for `tint_color`.
+- **`ui` `set_slot_property`** — grid-slot support: `row`, `column`, `row_span`, and `column_span` now work on `UUniformGridSlot` and `UGridSlot`.
+- **`blueprint` `describe_cdo_schema`** — now emits the correct **positional** `TMap` ImportText hint (the old hint implied a keyed form the importer rejects), including the struct literal for struct-valued maps.
+- **`blueprint` `add_variable` / `set_variable_type`** — map type strings now accept prefixed key **and** value types (e.g. `map:enum:ESlateVisibility:struct:LinearColor`), so enum-keyed and struct-valued maps are authorable; previously a compound key/value type after `map:` was split on the wrong colon and silently fell back to a `bool` key/value.
+- **`blueprint` `connect_pins`** — cross-graph node-ID disambiguation: when the same node ID exists in multiple graphs, the error now points you at `graph_name` instead of connecting the wrong node.
+- **`blueprint` `add_node` / `resolve_node` (`K2Node_SwitchEnum`)** — resolves user-defined `UENUM`s by short name, `/Script` path, or unloaded `UserDefinedEnum` asset; adds `enum` / `enum_path` aliases and accepts the `k2node_switchenum` node-class alias.
+- **`blueprint` `add_node` / `resolve_node` (`K2Node_CallFunction`)** — resolves Blueprint-defined functions (both `self` and external Blueprints), not just native/engine functions.
+
+> **Note (issue #82, deferred MCP context loading):** already delivered in v0.20.3 by terse-by-default `monolith_discover`, `describe_query` on-demand schemas, and host-side tool deferral — no new work needed. Thanks @aggitti for validating the direction.
+
 ### Fixed
 
+- **BlueprintAssist bridge broke against BA 4.9.0+.** `MonolithBABridge` referenced `RequestFormatAll` and `GetNumberOfPendingNodesToCache`, which changed in BlueprintAssist 4.9.0, causing a C2039 for users on the newer BA. Fixed with `__has_include` version detection so both pre-4.9 and 4.9.0+ compile. PR #78 — thanks @tc-imba (parallel fix from @mewliks in #76).
+- **GeometryScripting delay-load DLLs now gated to Win64.** The delay-load entries weren't platform-gated, which broke `BuildEnvironment.Unique` and the macOS source link. PR #77 — thanks @itismyfield.
+- **UE 5.8 source builds (CL 55116800).** `FJsonObject` keys became `FSharedString` in 5.8; two `MonolithAnimation` call sites now route through a `MonolithKeyToString` shim so the same source compiles on both 5.7 and 5.8. Issue #80 — thanks @Baba-Ramsi (also reported by @dulanw in #79).
+- **Linux / clang source builds.** Nested `/*` inside doc comments tripped `-Werror,-Wcomment` at four `MonolithReflectionIntel` sites. Fixed. Issue #83 — thanks @daschatten-tb.
+- **Indexer no longer strips `RF_Standalone` from live assets (data-loss guard).** The source indexer could clear `RF_Standalone` on assets that were already loaded and referenced, risking a save that dropped data (guard flag `0x10000002`). Added a load-time residency gate across seven `TryUnloadPackage` sites plus the landscape `CleanupWorld` branch, so the indexer only unloads packages it actually brought in. Issue #81 — thanks @Alexbeav.
 - **Optional-plugin detection no longer false-positives on plugins sharing a name prefix** (e.g. `BlueprintRetarget` was wrongly detected as BlueprintAssist, hard-linking an absent module and breaking the user's build). Tightened the disk-presence globs in MonolithBABridge/MonolithGAS/MonolithLogicDriver/MonolithComboGraph from truncated prefixes (`Blueprin*`, `Gameplaya*`, `LogicDri*`, `ComboGra*`) to full plugin names (`BlueprintAssist*`, `GameplayAbilities*`, `LogicDriver*`, `ComboGraph*`); the trailing `*` still matches versioned install folders. Reported by @k-s-s (#66).
 
 ## [0.20.3] - 2026-06-20
