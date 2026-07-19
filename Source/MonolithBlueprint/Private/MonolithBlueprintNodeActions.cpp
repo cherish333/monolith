@@ -98,6 +98,11 @@ static const TMap<FString, FNodeAlias>& GetNodeAliases()
 		// SpawnActorFromClass aliases
 		Aliases.Add(TEXT("spawn_actor"),    {TEXT("SpawnActorFromClass"), {}});
 		Aliases.Add(TEXT("spawn"),          {TEXT("SpawnActorFromClass"), {}});
+		// Bare "SpawnActor" must NOT reach the generic fallback: it resolves to the LEGACY
+		// UK2Node_SpawnActor, whose GetNodeTitle() null-derefs on an unconfigured node
+		// (BlueprintPin->DefaultObject->GetName() with no null check, K2Node_SpawnActor.cpp:284)
+		// — an editor-killing EXCEPTION_ACCESS_VIOLATION at 0x18.
+		Aliases.Add(TEXT("spawnactor"),     {TEXT("SpawnActorFromClass"), {}});
 
 		// DynamicCast aliases
 		Aliases.Add(TEXT("cast"),           {TEXT("DynamicCast"), {}});
@@ -1488,7 +1493,7 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddNode(const TShared
 
 	FBlueprintEditorUtils::MarkBlueprintAsModified(BP);
 
-	TSharedPtr<FJsonObject> Root = MonolithBlueprintInternal::SerializeNode(NewNode);
+	TSharedPtr<FJsonObject> Root = MonolithBlueprintInternal::SerializeNode(NewNode, bGenericFallback);
 	Root->SetStringField(TEXT("asset_path"), AssetPath);
 	Root->SetStringField(TEXT("graph"), Graph->GetName());
 	if (bGenericFallback)
@@ -2432,6 +2437,7 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleResolveNode(const TSh
 	}
 
 	TArray<FString> Warnings;
+	bool bGenericFallback = false;
 
 	// Create a transient Blueprint + graph so AllocateDefaultPins() can find an
 	// owning Blueprint via the outer chain.  Without this, nodes like
@@ -2726,6 +2732,7 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleResolveNode(const TSh
 			UK2Node* GenericNode = NewObject<UK2Node>(TempGraph, NodeClass);
 			GenericNode->AllocateDefaultPins();
 			Node = GenericNode;
+			bGenericFallback = true;
 			Warnings.Add(TEXT("Resolved via generic K2Node fallback — pins may differ in actual Blueprint context"));
 		}
 		else
@@ -2790,7 +2797,12 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleResolveNode(const TSh
 	{
 		Root->SetStringField(TEXT("resolved_function_class"), ResolvedClass);
 	}
-	Root->SetStringField(TEXT("node_title"), Node->GetNodeTitle(ENodeTitleType::FullTitle).ToString());
+	// Generic-fallback nodes are unconfigured; some legacy node classes crash in
+	// GetNodeTitle() on unconfigured state (UK2Node_SpawnActor null-derefs its
+	// Blueprint pin's DefaultObject). Report the class name for those instead.
+	Root->SetStringField(TEXT("node_title"), bGenericFallback
+		? Node->GetClass()->GetName()
+		: Node->GetNodeTitle(ENodeTitleType::FullTitle).ToString());
 	Root->SetArrayField(TEXT("pins"), PinsArr);
 	Root->SetNumberField(TEXT("pin_count"), PinsArr.Num());
 

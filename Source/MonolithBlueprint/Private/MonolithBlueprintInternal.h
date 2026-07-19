@@ -404,13 +404,17 @@ namespace MonolithBlueprintInternal
 		return Resolved;
 	}
 
-	inline TSharedPtr<FJsonObject> SerializeNode(UEdGraphNode* Node)
+	// bSafeTitle: report the class name instead of calling GetNodeTitle(). Use for
+	// generic-fallback nodes — some legacy node classes crash in GetNodeTitle() on
+	// unconfigured state (UK2Node_SpawnActor null-derefs its Blueprint pin's DefaultObject).
+	inline TSharedPtr<FJsonObject> SerializeNode(UEdGraphNode* Node, bool bSafeTitle = false)
 	{
 		TSharedPtr<FJsonObject> NObj = MakeShared<FJsonObject>();
 		NObj->SetStringField(TEXT("id"), Node->GetName());
 		NObj->SetStringField(TEXT("class"), Node->GetClass()->GetName());
-		NObj->SetStringField(TEXT("title"),
-			Node->GetNodeTitle(ENodeTitleType::FullTitle).ToString());
+		NObj->SetStringField(TEXT("title"), bSafeTitle
+			? Node->GetClass()->GetName()
+			: Node->GetNodeTitle(ENodeTitleType::FullTitle).ToString());
 
 		TArray<TSharedPtr<FJsonValue>> PosArr;
 		PosArr.Add(MakeShared<FJsonValueNumber>(Node->NodePosX));
