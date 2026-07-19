@@ -81,6 +81,12 @@
 #include "Engine/Engine.h"
 #include "GameFramework/PlayerController.h"
 
+// load_level dirty-current-map guard: walk the current world's levels (persistent +
+// streaming) and their loaded external object packages (OFPA actors / folders /
+// data layers) for unsaved changes before discarding the world.
+#include "Engine/Level.h"
+#include "Engine/LevelStreaming.h"
+
 // PIE pre-flight compile gate + list_errored_blueprints: iterate loaded UBlueprints
 // and test the same {BS_Error, bDisplayCompilePIEWarning} pair the engine's
 // ResolveDirtyBlueprints uses (PlayLevel.cpp) to decide whether to raise the blocking
@@ -821,10 +827,11 @@ void FMonolithEditorActions::RegisterActions(FMonolithLogCapture* LogCapture)
 			.Build());
 
 	Registry.RegisterAction(TEXT("editor"), TEXT("load_level"),
-		TEXT("Close the current persistent level (without saving) and load the specified level by /Game/... asset path. Wraps ULevelEditorSubsystem::LoadLevel. If a PIE world is still resident this REFUSES while a smoke session is running, else drives PIE teardown to completion + forces a GC before loading (prevents the 'World Memory Leaks' assert)."),
+		TEXT("Close the current persistent level and load the specified level by /Game/... asset path. Wraps ULevelEditorSubsystem::LoadLevel. Fail-closed guards: (1) if the current level (or its external actor/data-layer packages) has unsaved changes this REFUSES with the dirty package list — LoadLevel runs unattended and would discard them silently — unless dirty_policy:\"discard\" is passed; (2) if a PIE world is still resident this REFUSES while a smoke session is running, else drives PIE teardown to completion + forces a GC before loading (prevents the 'World Memory Leaks' assert)."),
 		FMonolithActionHandler::CreateStatic(&HandleLoadLevel),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("path"), TEXT("Asset path of the level to load (e.g. /Game/Maps/L_Backyard). Must exist."))
+			.Optional(TEXT("dirty_policy"), TEXT("string"), TEXT("What to do when the current level has unsaved changes: refuse (default — error with the dirty package list) or discard (proceed, explicitly losing them; they are echoed in discarded_dirty_packages)."), TEXT("refuse"))
 			.Build());
 
 	InitLiveCodingDelegate();
@@ -1770,6 +1777,60 @@ namespace
 		// before LoadLevel so EditorDestroyWorld's leak check sees a clean slate.
 		CollectGarbage(GARBAGE_COLLECTION_KEEPFLAGS);
 		return true;
+	}
+
+	// Dirty-current-map guard for load_level. ULevelEditorSubsystem::LoadLevel runs
+	// with GIsRunningUnattendedScript=true (LevelEditorSubsystem.cpp), so the usual
+	// "save changes?" prompt never appears — a dirty current map is DISCARDED SILENTLY.
+	// Collect every dirty package that would be lost: the world package itself, each
+	// loaded streaming-level package, and each level's loaded external object packages
+	// (One-File-Per-Actor actors, folders, data-layer instances).
+	void CollectDirtyCurrentWorldPackages(TArray<FString>& OutDirtyPackages)
+	{
+		OutDirtyPackages.Reset();
+		if (!GEditor)
+		{
+			return;
+		}
+		UWorld* World = GEditor->GetEditorWorldContext().World();
+		if (!World)
+		{
+			return;
+		}
+
+		TArray<UPackage*> Candidates;
+		Candidates.Add(World->GetPackage());
+
+		TArray<ULevel*> Levels;
+		Levels.Add(World->PersistentLevel);
+		for (ULevelStreaming* Streaming : World->GetStreamingLevels())
+		{
+			if (Streaming)
+			{
+				if (ULevel* Loaded = Streaming->GetLoadedLevel())
+				{
+					Levels.Add(Loaded);
+				}
+			}
+		}
+
+		for (ULevel* Level : Levels)
+		{
+			if (!Level)
+			{
+				continue;
+			}
+			Candidates.Add(Level->GetPackage());
+			Candidates.Append(Level->GetLoadedExternalObjectPackages());
+		}
+
+		for (UPackage* Package : Candidates)
+		{
+			if (Package && Package->IsDirty())
+			{
+				OutDirtyPackages.AddUnique(Package->GetName());
+			}
+		}
 	}
 }
 
@@ -4365,6 +4426,30 @@ FMonolithActionResult FMonolithEditorActions::HandleLoadLevel(const TSharedPtr<F
 		return FMonolithActionResult::Error(TEXT("ULevelEditorSubsystem is unavailable."));
 	}
 
+	FString DirtyPolicy;
+	Params->TryGetStringField(TEXT("dirty_policy"), DirtyPolicy);
+	if (!DirtyPolicy.IsEmpty() && DirtyPolicy != TEXT("refuse") && DirtyPolicy != TEXT("discard"))
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Invalid dirty_policy '%s' — expected 'refuse' (default) or 'discard'."), *DirtyPolicy));
+	}
+
+	// Dirty-current-map guard (fail-closed): LoadLevel discards the current world
+	// WITHOUT a save prompt (it runs unattended), so unsaved changes to the current
+	// map or its external actor packages would be lost silently. Refuse unless the
+	// caller explicitly passes dirty_policy:"discard". Checked before the PIE guard
+	// so a refusal has no side effects (no PIE teardown).
+	TArray<FString> DirtyWorldPackages;
+	CollectDirtyCurrentWorldPackages(DirtyWorldPackages);
+	if (DirtyWorldPackages.Num() > 0 && DirtyPolicy != TEXT("discard"))
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Refusing load_level: the current level has unsaved changes that would be discarded ")
+			TEXT("silently (LoadLevel runs unattended — no save prompt). Dirty packages: [%s]. ")
+			TEXT("Save them (save_packages) or pass dirty_policy:\"discard\" to lose them explicitly."),
+			*FString::Join(DirtyWorldPackages, TEXT(", "))));
+	}
+
 	// #6 world-leak guard: never LoadLevel while a PIE world is still resident — the
 	// deferred EndPlayMap teardown would assert "World Memory Leaks" in EditorDestroyWorld.
 	FString PieGuardError;
@@ -4379,6 +4464,15 @@ FMonolithActionResult FMonolithEditorActions::HandleLoadLevel(const TSharedPtr<F
 	Result->SetBoolField(TEXT("ok"), bLoaded);
 	Result->SetBoolField(TEXT("loaded"), bLoaded);
 	Result->SetStringField(TEXT("path"), Path);
+	if (DirtyWorldPackages.Num() > 0)
+	{
+		TArray<TSharedPtr<FJsonValue>> Discarded;
+		for (const FString& PackageName : DirtyWorldPackages)
+		{
+			Discarded.Add(MakeShared<FJsonValueString>(PackageName));
+		}
+		Result->SetArrayField(TEXT("discarded_dirty_packages"), Discarded);
+	}
 	Result->SetStringField(TEXT("message"),
 		bLoaded
 			? FString::Printf(TEXT("Loaded level '%s'."), *Path)
