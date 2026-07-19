@@ -3,6 +3,7 @@
 #include "MonolithHttpServer.h"
 #include "MonolithSettings.h"
 #include "MonolithJsonUtils.h"
+#include "MonolithSha256.h"
 #include "HttpModule.h"
 #include "Interfaces/IHttpRequest.h"
 #include "Interfaces/IHttpResponse.h"
@@ -613,15 +614,11 @@ void UMonolithUpdateSubsystem::OnDownloadComplete(const FString& Version, bool b
 	// on the filesystem.
 	if (!PendingExpectedSha256.IsEmpty())
 	{
+		// NOT FPlatformMisc::GetSHA256Signature: it has no Windows implementation and
+		// the generic fallback checkf-asserts (GenericPlatformMisc.cpp), killing the
+		// editor from an Install click. MonolithSha256 is portable and cannot fail.
 		FSHA256Signature Signature;
-		if (!FPlatformMisc::GetSHA256Signature(Data.GetData(), static_cast<uint32>(Data.Num()), Signature))
-		{
-			UE_LOG(LogMonolith, Error,
-				TEXT("FPlatformMisc::GetSHA256Signature failed (no platform impl?). Aborting auto-update."));
-			PendingExpectedSha256.Empty();
-			bUpdateInProgress = false;
-			return;
-		}
+		MonolithSha256::Compute(Data.GetData(), static_cast<uint64>(Data.Num()), Signature);
 		// FSHA256Signature::ToString() returns lowercase hex; ToLower() is defensive.
 		const FString ActualSha256 = Signature.ToString().ToLower();
 		const FString ExpectedLower = PendingExpectedSha256.ToLower();
