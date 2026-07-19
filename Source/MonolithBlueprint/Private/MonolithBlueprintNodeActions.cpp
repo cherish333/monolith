@@ -4200,9 +4200,13 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddTimelineTrack(cons
 	Template->Modify();
 
 	FString CreatedType;
+	FTTTrackId NewTrackId;
 
 	if (TrackTypeStr.Equals(TEXT("float"), ESearchCase::IgnoreCase))
 	{
+		NewTrackId.TrackType = FTTTrackBase::TT_FloatInterp;
+		NewTrackId.TrackIndex = Template->FloatTracks.Num();
+
 		FTTFloatTrack NewTrack;
 		NewTrack.SetTrackName(TrackName, Template);
 		NewTrack.CurveFloat = NewObject<UCurveFloat>(OwnerClass, NAME_None, RF_Public);
@@ -4211,6 +4215,9 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddTimelineTrack(cons
 	}
 	else if (TrackTypeStr.Equals(TEXT("vector"), ESearchCase::IgnoreCase))
 	{
+		NewTrackId.TrackType = FTTTrackBase::TT_VectorInterp;
+		NewTrackId.TrackIndex = Template->VectorTracks.Num();
+
 		FTTVectorTrack NewTrack;
 		NewTrack.SetTrackName(TrackName, Template);
 		NewTrack.CurveVector = NewObject<UCurveVector>(OwnerClass, NAME_None, RF_Public);
@@ -4219,6 +4226,9 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddTimelineTrack(cons
 	}
 	else if (TrackTypeStr.Equals(TEXT("event"), ESearchCase::IgnoreCase))
 	{
+		NewTrackId.TrackType = FTTTrackBase::TT_Event;
+		NewTrackId.TrackIndex = Template->EventTracks.Num();
+
 		FTTEventTrack NewTrack;
 		NewTrack.SetTrackName(TrackName, Template);
 		NewTrack.CurveKeys = NewObject<UCurveFloat>(OwnerClass, NAME_None, RF_Public);
@@ -4228,6 +4238,9 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddTimelineTrack(cons
 	}
 	else if (TrackTypeStr.Equals(TEXT("color"), ESearchCase::IgnoreCase))
 	{
+		NewTrackId.TrackType = FTTTrackBase::TT_LinearColorInterp;
+		NewTrackId.TrackIndex = Template->LinearColorTracks.Num();
+
 		FTTLinearColorTrack NewTrack;
 		NewTrack.SetTrackName(TrackName, Template);
 		NewTrack.CurveLinearColor = NewObject<UCurveLinearColor>(OwnerClass, NAME_None, RF_Public);
@@ -4240,12 +4253,40 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddTimelineTrack(cons
 			TEXT("Unknown track_type '%s'. Must be: float, vector, event, or color"), *TrackTypeStr));
 	}
 
-	FBlueprintEditorUtils::MarkBlueprintAsModified(BP);
+	// K2Node_Timeline::AllocateDefaultPins creates track pins from the template's
+	// DISPLAY track list (GetNumDisplayTracks/GetDisplayTrackId), not the raw track
+	// arrays — a track that is never registered there produces no pin, ever.
+	// Mirrors STimelineEditor::CreateNewTrack.
+	Template->AddDisplayTrack(NewTrackId);
+
+	// The K2Node_Timeline in the event graph only surfaces the new track's output pin
+	// after ReconstructNode() — pins regenerate from the template's track arrays in
+	// AllocateDefaultPins. Without this the track data exists but the pin never appears,
+	// and connect_pins to it fails.
+	int32 NodesReconstructed = 0;
+	TArray<UEdGraph*> AllGraphs;
+	BP->GetAllGraphs(AllGraphs);
+	for (UEdGraph* G : AllGraphs)
+	{
+		if (!G) continue;
+		for (UEdGraphNode* GNode : G->Nodes)
+		{
+			UK2Node_Timeline* TLNode = Cast<UK2Node_Timeline>(GNode);
+			if (TLNode && TLNode->TimelineName.ToString() == TimelineName)
+			{
+				TLNode->ReconstructNode();
+				++NodesReconstructed;
+			}
+		}
+	}
+
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(BP);
 
 	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetStringField(TEXT("timeline_name"), TimelineName);
 	Root->SetStringField(TEXT("track_name"), TrackNameStr);
 	Root->SetStringField(TEXT("track_type"), CreatedType);
+	Root->SetNumberField(TEXT("nodes_reconstructed"), NodesReconstructed);
 	return FMonolithActionResult::Success(Root);
 }
 
