@@ -617,6 +617,7 @@ void FMonolithBlueprintNodeActions::RegisterActions(FMonolithToolRegistry& Regis
 			.Required(TEXT("operations"),          TEXT("array"),   TEXT("Array of operation objects: { op, ...params }"))
 			.Optional(TEXT("compile_on_complete"), TEXT("boolean"), TEXT("Compile the Blueprint after all operations complete (default: false)"))
 			.Optional(TEXT("stop_on_error"),       TEXT("boolean"), TEXT("Stop processing on first failed operation (default: false)"))
+			.Optional(TEXT("graph_name"),          TEXT("string"),  TEXT("Default graph for all operations; an op's own graph_name overrides it (default: the EventGraph)"))
 			.Build());
 
 	// ---- Wave 4 ----
@@ -2251,6 +2252,13 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleBatchExecute(const TS
 	bool bCompileOnComplete = false;
 	Params->TryGetBoolField(TEXT("compile_on_complete"), bCompileOnComplete);
 
+	// A top-level graph_name applies to every op that doesn't specify its own.
+	// Previously it was silently dropped (unknown-param warning) while every graph op
+	// ran against the default EventGraph — which has severed function bodies whose
+	// author believed the ops were targeting the named function graph.
+	FString TopLevelGraphName;
+	Params->TryGetStringField(TEXT("graph_name"), TopLevelGraphName);
+
 	GEditor->BeginTransaction(NSLOCTEXT("Monolith", "BPBatchExec", "BP Batch Execute"));
 
 	TArray<TSharedPtr<FJsonValue>> Results;
@@ -2297,6 +2305,10 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleBatchExecute(const TS
 		for (auto& Pair : Op->Values)
 		{
 			SubParams->SetField(Pair.Key, Pair.Value);
+		}
+		if (!TopLevelGraphName.IsEmpty() && !SubParams->HasField(TEXT("graph_name")))
+		{
+			SubParams->SetStringField(TEXT("graph_name"), TopLevelGraphName);
 		}
 
 		FMonolithActionResult SubResult = FMonolithActionResult::Error(FString::Printf(TEXT("Unknown op: %s"), *OpName));
