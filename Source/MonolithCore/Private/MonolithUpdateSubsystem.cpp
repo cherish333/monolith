@@ -198,7 +198,7 @@ void UMonolithUpdateSubsystem::CheckForUpdate()
 				// compiled for exactly one UE version, so ENGINE_MINOR_VERSION is the
 				// correct compile-time selector — no runtime detection needed.
 				// Per-engine assets are named Monolith-v<X.Y.Z>-UE5.<minor>.zip and the
-				// release body carries a matching Monolith-SHA256-UE5.<minor>: marker.
+				// release body carries a matching Monolith-SHA256-v2-UE5.<minor>: marker.
 				const FString EngineTag = FString::Printf(TEXT("UE5.%d"), ENGINE_MINOR_VERSION);
 
 				// Find the zip asset URL.
