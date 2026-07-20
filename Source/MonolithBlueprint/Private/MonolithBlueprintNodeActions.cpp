@@ -2096,10 +2096,19 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleDisconnectPins(const 
 	FString TargetNodeId = Params->GetStringField(TEXT("target_node"));
 	FString TargetPinName = Params->GetStringField(TEXT("target_pin"));
 
+	// Schema-mediated breaks, matching the editor's interactive path. The raw
+	// pin-level calls (BreakAllPinLinks / BreakLinkTo) notify only the FAR
+	// side's nodes (or nobody), so this node never heard the disconnect and
+	// type-dependent wildcard pins (e.g. UK2Node_CallArrayFunction, macro
+	// instances) stayed stuck on the old resolved type instead of reverting
+	// to wildcard. UEdGraphSchema::BreakPinLinks / BreakSinglePinLink fire
+	// PinConnectionListChanged on BOTH owning nodes.
+	const UEdGraphSchema* Schema = Node->GetGraph()->GetSchema();
+
 	if (TargetNodeId.IsEmpty())
 	{
 		// Break all connections on this pin
-		Pin->BreakAllPinLinks(true);
+		Schema->BreakPinLinks(*Pin, /*bSendsNodeNotification=*/true);
 	}
 	else
 	{
@@ -2122,7 +2131,7 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleDisconnectPins(const 
 				TEXT("Target pin '%s' not found on node '%s'. Available pins: %s"), *TargetPinName, *TargetNodeId, *TgtAvailPins2));
 		}
 
-		Pin->BreakLinkTo(TargetPin);
+		Schema->BreakSinglePinLink(Pin, TargetPin);
 	}
 
 	FBlueprintEditorUtils::MarkBlueprintAsModified(BP);
