@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.21.1] - 2026-07-20
+
 ### Fixed
 
 - **CRITICAL — auto-updater no longer crashes the editor on Install (Windows).** The integrity check added in v0.14.7 (Issue #38) called `FPlatformMisc::GetSHA256Signature`, which has **no Windows implementation** — the engine's generic fallback is a fatal `checkf` assert, so clicking **Install** on the update notification killed the editor whenever the target release's notes carried a SHA256 marker (#90, #94). The updater now uses a self-contained, portable FIPS 180-4 SHA-256 (`MonolithSha256::Compute`, verified against NIST test vectors), so the integrity check works on every platform. Thanks **@Alexbeav** for the root-cause report (#90) and the fix (#91), and **@SilkroadLabs** for the parallel report (#94).
