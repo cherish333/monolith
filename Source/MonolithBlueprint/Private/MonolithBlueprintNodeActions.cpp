@@ -12,6 +12,10 @@
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "Kismet2/KismetEditorUtilities.h"
 #include "K2Node_CallFunction.h"
+#include "K2Node_CallArrayFunction.h"
+#include "K2Node_CallDataTableFunction.h"
+#include "K2Node_CallMaterialParameterCollectionFunction.h"
+#include "K2Node_CommutativeAssociativeBinaryOperator.h"
 #include "K2Node_CustomEvent.h"
 #include "K2Node_VariableGet.h"
 #include "K2Node_VariableSet.h"
@@ -309,9 +313,12 @@ static UEnum* ResolveSwitchEnumType(const FString& EnumType)
 // another BP (never SkeletonGeneratedClass, which is transient). Native C++
 // functions keep SetFromFunction. Does NOT AllocateDefaultPins — the caller does,
 // so add_node and the dry-run each control node placement. Returns true on
-// success; on failure fills OutError and returns false.
+// success; on failure fills OutError and returns false. On success,
+// OutResolvedFunction (if non-null) receives the resolved UFunction so callers
+// can pick the palette-correct node class from its metadata.
 static bool ResolveCallFunctionReference(UK2Node_CallFunction* CallNode, UBlueprint* SelfBP,
-	const FString& FuncName, const FString& TargetClassName, FString& OutError)
+	const FString& FuncName, const FString& TargetClassName, FString& OutError,
+	UFunction** OutResolvedFunction = nullptr)
 {
 	if (!CallNode)
 	{
@@ -405,6 +412,7 @@ static bool ResolveCallFunctionReference(UK2Node_CallFunction* CallNode, UBluepr
 				return false;
 			}
 			const FName ResolvedName = BpFunc->GetFName();
+			if (OutResolvedFunction) *OutResolvedFunction = BpFunc;
 
 			if (SelfBP && TargetBP == SelfBP)
 			{
@@ -436,6 +444,7 @@ static bool ResolveCallFunctionReference(UK2Node_CallFunction* CallNode, UBluepr
 					*FuncName, *TargetClassName);
 				return false;
 			}
+			if (OutResolvedFunction) *OutResolvedFunction = Func;
 			CallNode->SetFromFunction(Func);
 			return true;
 		}
@@ -459,6 +468,10 @@ static bool ResolveCallFunctionReference(UK2Node_CallFunction* CallNode, UBluepr
 	const bool bIsOwnBpFunction = SelfFunc &&
 		(SelfFunc->GetOwnerClass() == SkelClass || SelfFunc->GetOwnerClass() == GenClass);
 
+	if (SelfFunc && OutResolvedFunction)
+	{
+		*OutResolvedFunction = SelfFunc;
+	}
 	if (bIsOwnBpFunction)
 	{
 		CallNode->FunctionReference.SetSelfMember(SelfFunc->GetFName());
@@ -481,8 +494,46 @@ static bool ResolveCallFunctionReference(UK2Node_CallFunction* CallNode, UBluepr
 			TEXT("Function '%s' not found in any loaded class (also tried K2_ prefix)"), *FuncName);
 		return false;
 	}
+	if (OutResolvedFunction) *OutResolvedFunction = Func;
 	CallNode->SetFromFunction(Func);
 	return true;
+}
+
+// Mirror UBlueprintFunctionNodeSpawner::Create's node-class choice so tool-created
+// call nodes get the same specialized UK2Node_CallFunction subclass the editor's
+// palette spawns. This is what makes wildcard array pins resolve on connect:
+// KismetArrayLibrary functions carry the ArrayParm metadata and the propagation
+// logic lives in UK2Node_CallArrayFunction::NotifyPinConnectionListChanged — a
+// base UK2Node_CallFunction node has no propagation machinery at all, so its
+// wildcard TargetArray/NewItem pins can never resolve, no matter how they are
+// wired. (The type-promotion branch — UK2Node_PromotableOperator — is
+// intentionally not mirrored: FTypePromotion is module-private, and a plain
+// CallFunction node remains correct for explicitly-typed operator functions.)
+static UClass* ChooseCallFunctionNodeClass(const UFunction* Function)
+{
+	if (!Function)
+	{
+		return UK2Node_CallFunction::StaticClass();
+	}
+
+	const bool bIsPure = Function->HasAllFunctionFlags(FUNC_BlueprintPure);
+	if (bIsPure && Function->HasMetaData(FBlueprintMetadata::MD_CommutativeAssociativeBinaryOperator))
+	{
+		return UK2Node_CommutativeAssociativeBinaryOperator::StaticClass();
+	}
+	if (Function->HasMetaData(FBlueprintMetadata::MD_MaterialParameterCollectionFunction))
+	{
+		return UK2Node_CallMaterialParameterCollectionFunction::StaticClass();
+	}
+	if (Function->HasMetaData(FBlueprintMetadata::MD_DataTablePin))
+	{
+		return UK2Node_CallDataTableFunction::StaticClass();
+	}
+	if (Function->HasMetaData(FBlueprintMetadata::MD_ArrayParam))
+	{
+		return UK2Node_CallArrayFunction::StaticClass();
+	}
+	return UK2Node_CallFunction::StaticClass();
 }
 
 // ============================================================
@@ -863,9 +914,27 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddNode(const TShared
 		// class stored); other BPs via SetExternalMember on the authoritative
 		// GeneratedClass (never the transient skeleton).
 		FString RefError;
-		if (!ResolveCallFunctionReference(CallNode, BP, FuncName, TargetClassName, RefError))
+		UFunction* ResolvedFunction = nullptr;
+		if (!ResolveCallFunctionReference(CallNode, BP, FuncName, TargetClassName, RefError, &ResolvedFunction))
 		{
 			return FMonolithActionResult::Error(RefError);
+		}
+
+		// Palette parity: functions whose metadata demands a specialized subclass
+		// (array-parm, data-table, material-collection, commutative binary op) are
+		// re-created on that class — the base node lacks its pin machinery (e.g.
+		// wildcard array-pin propagation). The provisional base node was never
+		// added to the graph and is simply dropped. Re-resolving onto the new node
+		// (rather than copying FunctionReference) preserves SetFromFunction's side
+		// effects such as purity flags.
+		UClass* NodeClass = ChooseCallFunctionNodeClass(ResolvedFunction);
+		if (NodeClass != UK2Node_CallFunction::StaticClass())
+		{
+			UK2Node_CallFunction* SpecializedNode = NewObject<UK2Node_CallFunction>(Graph, NodeClass);
+			if (ResolveCallFunctionReference(SpecializedNode, BP, FuncName, TargetClassName, RefError))
+			{
+				CallNode = SpecializedNode;
+			}
 		}
 
 		CallNode->NodePosX = PosX;
@@ -2494,9 +2563,21 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleResolveNode(const TSh
 		// Same resolver add_node uses — self (SetSelfMember) / external-BP
 		// (GeneratedClass) / native — so the preview matches the real write.
 		FString RefError;
-		if (!ResolveCallFunctionReference(CallNode, ContextBP, FuncName, TargetClassName, RefError))
+		UFunction* ResolvedFunction = nullptr;
+		if (!ResolveCallFunctionReference(CallNode, ContextBP, FuncName, TargetClassName, RefError, &ResolvedFunction))
 		{
 			return FMonolithActionResult::Error(RefError);
+		}
+		// Palette parity with add_node: preview on the same specialized subclass
+		// the real write will use (see ChooseCallFunctionNodeClass).
+		UClass* NodeClass = ChooseCallFunctionNodeClass(ResolvedFunction);
+		if (NodeClass != UK2Node_CallFunction::StaticClass())
+		{
+			UK2Node_CallFunction* SpecializedNode = NewObject<UK2Node_CallFunction>(TempGraph, NodeClass);
+			if (ResolveCallFunctionReference(SpecializedNode, ContextBP, FuncName, TargetClassName, RefError))
+			{
+				CallNode = SpecializedNode;
+			}
 		}
 		CallNode->AllocateDefaultPins();
 		Node = CallNode;
