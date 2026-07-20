@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **CRITICAL — auto-updater no longer crashes the editor on Install (Windows).** The integrity check added in v0.14.7 (Issue #38) called `FPlatformMisc::GetSHA256Signature`, which has **no Windows implementation** — the engine's generic fallback is a fatal `checkf` assert, so clicking **Install** on the update notification killed the editor whenever the target release's notes carried a SHA256 marker (#90, #94). The updater now uses a self-contained, portable FIPS 180-4 SHA-256 (`MonolithSha256::Compute`, verified against NIST test vectors), so the integrity check works on every platform. Thanks **@Alexbeav** for the root-cause report (#90) and the fix (#91), and **@SilkroadLabs** for the parallel report (#94).
+- **SHA256 release-note markers migrated to a "v2" generation** (`Monolith-SHA256-v2-UE5.7:` / `-v2-UE5.8:` / `Monolith-SHA256-v2:`). Updaters shipped in v0.14.7–v0.21.0 hard-crash on the *old* marker names (see above) — the v2 names are invisible to them, so pre-fix updaters fail safe (fail-closed abort or unverified install) instead of asserting, while fixed updaters verify normally. Release tooling (`make_release.ps1`) emits only the v2 names from now on; the old names must never appear in a release body again.
+- **`blueprint` `add_event_dispatcher`** now creates the multicast delegate **member variable** (mirroring the Blueprint editor's own flow), so `CallDelegate` / `AddDelegate` / `RemoveDelegate` can actually bind the dispatcher; `remove_event_dispatcher` removes the variable alongside the signature graph. Thanks **@Alexbeav** (#84).
+- **`blueprint` `add_node` / `resolve_node`** no longer crash the editor on `node_type: "SpawnActor"` — the bare name now aliases to `SpawnActorFromClass` instead of instantiating the legacy `UK2Node_SpawnActor` (whose `GetNodeTitle()` null-derefs unconfigured), and generic-fallback nodes report a safe title. Thanks **@Alexbeav** (#85).
+- **`blueprint` `add_timeline_track`** registers the new track in the timeline template's display-track list and reconstructs the owning `K2Node_Timeline`, so the track's output pin actually appears and is connectable. Thanks **@Alexbeav** (#86).
+- **`blueprint` `batch_execute`** honors a top-level `graph_name` as the default graph for all operations (per-op values still win) instead of silently running every op against the EventGraph. Thanks **@Alexbeav** (#87).
+- **`blueprint` `resolve_node`** dry-runs of delegate nodes (`CallDelegate` / `AddDelegate` / `RemoveDelegate` / `ClearDelegate`) now resolve the real delegate signature pins instead of reporting only base pins. Thanks **@Alexbeav** (#92).
+- **String-encoded array/object params are now recovered centrally** in the tool registry: MCP clients that serialize complex argument values to JSON strings (Claude Code among them) no longer hit "array is required" errors on actions like `delete_assets`, `save_packages`, `set_function_params`, `set_event_dispatcher_params`. Thanks **@Alexbeav** (#93).
+
+### Added
+
+- **`editor` `load_level` fail-closed guards**: refuses (with the dirty package list) when the current map has unsaved changes that the unattended `LoadLevel` would silently discard — override with `dirty_policy:"discard"`; and refuses (instead of tripping the fatal "World Memory Leaks" assert) when a stale rooted in-memory copy of the target world is resident. Thanks **@Alexbeav** (#89).
+- **Paired `MODAL_OPEN` / `MODAL_CLOSE` log telemetry** around blocking Slate modals, with window identity and slow-task flag on UE 5.8+ — log consumers can now distinguish a healthy open→close from a modal still blocking the game thread (and starving the in-process MCP server). Thanks **@Alexbeav** (#88).
+
 ## [0.21.0] - 2026-07-19
 
 ### Added
