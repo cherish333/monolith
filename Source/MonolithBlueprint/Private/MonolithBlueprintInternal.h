@@ -158,7 +158,16 @@ namespace MonolithBlueprintInternal
 		if (PinType.PinCategory == UEdGraphSchema_K2::PC_Text)
 			return TEXT("text");
 		if (PinType.PinCategory == UEdGraphSchema_K2::PC_Byte)
+		{
+			// Enum-typed pins ARE byte-category pins with the UEnum as the
+			// subcategory object (schema convention) — report them as enums so
+			// round-tripping through add_variable's "enum:<Name>" form works.
+			if (Cast<UEnum>(PinType.PinSubCategoryObject.Get()))
+			{
+				return TEXT("enum:") + PinType.PinSubCategoryObject->GetName();
+			}
 			return TEXT("byte");
+		}
 
 		if (PinType.PinCategory == UEdGraphSchema_K2::PC_Object ||
 			PinType.PinCategory == UEdGraphSchema_K2::PC_Class ||
@@ -951,9 +960,20 @@ namespace MonolithBlueprintInternal
 		}
 		else if (BaseType.StartsWith(TEXT("enum:")))
 		{
-			PinType.PinCategory = UEdGraphSchema_K2::PC_Enum;
+			// Enum data pins are PC_Byte + the UEnum as PinSubCategoryObject — the
+			// schema's own convention (UEdGraphSchema_K2 rewrites PC_Enum to PC_Byte
+			// when it builds pin types, and every enum check tests
+			// PC_Byte && Cast<UEnum>(SubCategoryObject)). A PC_Enum-categorized
+			// variable compiles to a non-enum property, so Get/Set nodes on it
+			// materialized plain INT pins that refuse real enum connections.
 			FString EnumName = BaseType.Mid(5);
 			UEnum* FoundEnum = FindFirstObject<UEnum>(*EnumName, EFindFirstObjectOptions::NativeFirst);
+			if (!FoundEnum && EnumName.Contains(TEXT("/")))
+			{
+				// Unloaded UserDefinedEnum asset referenced by object path.
+				FoundEnum = LoadObject<UEnum>(nullptr, *EnumName);
+			}
+			PinType.PinCategory = UEdGraphSchema_K2::PC_Byte;
 			if (FoundEnum) PinType.PinSubCategoryObject = FoundEnum;
 		}
 		else if (BaseType.StartsWith(TEXT("softobject:")))
