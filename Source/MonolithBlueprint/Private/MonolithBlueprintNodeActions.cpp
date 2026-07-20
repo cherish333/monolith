@@ -485,6 +485,29 @@ static bool ResolveCallFunctionReference(UK2Node_CallFunction* CallNode, UBluepr
 	return true;
 }
 
+// Bind a variable node's member reference. Local variables live on the function
+// entry node, not the class — a SetSelfMember bind for a local name resolves to
+// nothing and the node materializes with NO data pin. Mirror the editor's
+// binding (EdGraphSchema_K2.cpp: SetLocalMember(name, top-level graph name,
+// guid)) when the containing graph declares a matching local; locals shadow
+// same-named member variables, matching function-scope resolution.
+static void BindVariableNodeReference(UK2Node_Variable* VarNode, UBlueprint* BP,
+	UEdGraph* Graph, const FString& VarName)
+{
+	const FName VarFName(*VarName);
+	if (UEdGraph* TopGraph = FBlueprintEditorUtils::GetTopLevelGraph(Graph))
+	{
+		const FGuid LocalVarGuid =
+			FBlueprintEditorUtils::FindLocalVariableGuidByName(BP, TopGraph, VarFName);
+		if (LocalVarGuid.IsValid())
+		{
+			VarNode->VariableReference.SetLocalMember(VarFName, TopGraph->GetName(), LocalVarGuid);
+			return;
+		}
+	}
+	VarNode->VariableReference.SetSelfMember(VarFName);
+}
+
 // ============================================================
 //  MonolithBlueprintInternal helpers
 // ============================================================
@@ -887,7 +910,7 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddNode(const TShared
 		}
 
 		UK2Node_VariableGet* VarNode = NewObject<UK2Node_VariableGet>(Graph);
-		VarNode->VariableReference.SetSelfMember(FName(*VarName));
+		BindVariableNodeReference(VarNode, BP, Graph, VarName);
 		VarNode->NodePosX = PosX;
 		VarNode->NodePosY = PosY;
 		Graph->AddNode(VarNode, true, false);
@@ -904,7 +927,7 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddNode(const TShared
 		}
 
 		UK2Node_VariableSet* VarNode = NewObject<UK2Node_VariableSet>(Graph);
-		VarNode->VariableReference.SetSelfMember(FName(*VarName));
+		BindVariableNodeReference(VarNode, BP, Graph, VarName);
 		VarNode->NodePosX = PosX;
 		VarNode->NodePosY = PosY;
 		Graph->AddNode(VarNode, true, false);
