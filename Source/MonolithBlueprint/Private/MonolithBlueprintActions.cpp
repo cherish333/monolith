@@ -260,9 +260,15 @@ FMonolithActionResult FMonolithBlueprintActions::HandleListGraphs(const TSharedP
 			GObj->SetStringField(TEXT("name"), G->GetName());
 			GObj->SetStringField(TEXT("type"), TEXT("subgraph"));
 			GObj->SetNumberField(TEXT("node_count"), G->Nodes.Num());
-			if (const UEdGraph* ParentGraph = Cast<UEdGraph>(G->GetOuter()))
+			// Walk the full outer chain: a composite's BoundGraph is outered to
+			// the K2Node_Composite NODE, not the parent graph directly.
+			for (const UObject* Outer = G->GetOuter(); Outer; Outer = Outer->GetOuter())
 			{
-				GObj->SetStringField(TEXT("parent_graph"), ParentGraph->GetName());
+				if (const UEdGraph* ParentGraph = Cast<UEdGraph>(Outer))
+				{
+					GObj->SetStringField(TEXT("parent_graph"), ParentGraph->GetName());
+					break;
+				}
 			}
 			GraphsArr.Add(MakeShared<FJsonValueObject>(GObj));
 		}
@@ -294,28 +300,19 @@ FMonolithActionResult FMonolithBlueprintActions::HandleGetGraphData(const TShare
 	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetStringField(TEXT("graph_name"), Graph->GetName());
 
-	FString GraphType = TEXT("unknown");
-	if (BP->UbergraphPages.Contains(Graph)) GraphType = TEXT("event_graph");
-	else if (BP->FunctionGraphs.Contains(Graph)) GraphType = TEXT("function");
-	else if (BP->MacroGraphs.Contains(Graph)) GraphType = TEXT("macro");
-	else if (BP->DelegateSignatureGraphs.Contains(Graph)) GraphType = TEXT("delegate_signature");
-	else
-	{
-		// Interface-implementation function graphs live on a separate array (Gap 7).
-		for (const FBPInterfaceDescription& Iface : BP->ImplementedInterfaces)
-		{
-			if (Iface.Graphs.Contains(Graph))
-			{
-				GraphType = TEXT("interface");
-				if (Iface.Interface)
-				{
-					Root->SetStringField(TEXT("interface"), Iface.Interface->GetName());
-				}
-				break;
-			}
-		}
-	}
+	FString InterfaceName;
+	FString ParentGraph;
+	const FString GraphType = MonolithBlueprintInternal::ClassifyGraphType(
+		BP, Graph, InterfaceName, &ParentGraph);
 	Root->SetStringField(TEXT("graph_type"), GraphType);
+	if (!InterfaceName.IsEmpty())
+	{
+		Root->SetStringField(TEXT("interface"), InterfaceName);
+	}
+	if (!ParentGraph.IsEmpty())
+	{
+		Root->SetStringField(TEXT("parent_graph"), ParentGraph);
+	}
 
 	TArray<TSharedPtr<FJsonValue>> NodesArr;
 	for (UEdGraphNode* Node : Graph->Nodes)
