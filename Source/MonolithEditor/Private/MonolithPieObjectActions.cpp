@@ -1,6 +1,7 @@
 #include "MonolithPieObjectActions.h"
 #include "MonolithParamSchema.h"
 #include "MonolithStructFieldResolver.h"
+#include "MonolithJsonUtils.h"
 
 #include "Editor.h"
 #include "Engine/Engine.h"
@@ -395,7 +396,7 @@ namespace
 		}
 		for (const auto& FieldIt : Json->Values)
 		{
-			const TPair<FString, TSharedPtr<FJsonValue>> Field(FString(FieldIt.Key.ToView()), FieldIt.Value);
+			const TPair<FString, TSharedPtr<FJsonValue>> Field(MonolithKeyToString(FieldIt.Key), FieldIt.Value);
 			// Resolve the friendly field name within THIS struct to its internal property.
 			// (The shared MonolithStructField resolver needs a UObject container; a bare
 			// struct value has none, so fields are resolved inline against the UScriptStruct.)
