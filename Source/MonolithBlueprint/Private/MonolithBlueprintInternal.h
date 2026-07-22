@@ -136,7 +136,54 @@ namespace MonolithBlueprintInternal
 		{
 			if (UEdGraph* G = SearchArray(Iface.Graphs)) return G;
 		}
+
+		// Nested graphs (collapsed-graph composites, macro-instance internals) are
+		// not in any top-level array — resolve them via the recursive enumeration
+		// so get_graph_data can read inside a composite by name.
+		TArray<UEdGraph*> AllGraphs;
+		BP->GetAllGraphs(AllGraphs);
+		for (UEdGraph* G : AllGraphs)
+		{
+			if (G && G->GetName() == GraphName) return G;
+		}
 		return nullptr;
+	}
+
+	// Classify a graph against the Blueprint's top-level arrays. Nested graphs
+	// (collapsed-graph composites, macro-instance internals) that are in no
+	// top-level array classify as "subgraph" with OutParentGraph (if provided)
+	// set to the nearest enclosing graph's name.
+	inline FString ClassifyGraphType(const UBlueprint* BP, UEdGraph* Graph,
+		FString& OutInterfaceName, FString* OutParentGraph = nullptr)
+	{
+		OutInterfaceName.Reset();
+		if (BP->UbergraphPages.Contains(Graph))          return TEXT("event_graph");
+		if (BP->FunctionGraphs.Contains(Graph))          return TEXT("function");
+		if (BP->MacroGraphs.Contains(Graph))             return TEXT("macro");
+		if (BP->DelegateSignatureGraphs.Contains(Graph)) return TEXT("delegate_signature");
+		for (const FBPInterfaceDescription& Iface : BP->ImplementedInterfaces)
+		{
+			if (Iface.Graphs.Contains(Graph))
+			{
+				if (Iface.Interface)
+				{
+					OutInterfaceName = Iface.Interface->GetName();
+				}
+				return TEXT("interface");
+			}
+		}
+		for (const UObject* Outer = Graph->GetOuter(); Outer; Outer = Outer->GetOuter())
+		{
+			if (const UEdGraph* ParentGraph = Cast<UEdGraph>(Outer))
+			{
+				if (OutParentGraph)
+				{
+					*OutParentGraph = ParentGraph->GetName();
+				}
+				return TEXT("subgraph");
+			}
+		}
+		return TEXT("unknown");
 	}
 
 	inline FString PinTypeToString(const FEdGraphPinType& PinType)
