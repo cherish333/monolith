@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.21.2] - 2026-07-22
+
+### Fixed
+
+- **`blueprint` wildcard array pins now resolve.** Tool-created `Array_*` nodes (`MakeArray`, `AddItem`, and friends) now spawn the palette-correct `UK2Node_CallFunction` subclass, so their wildcard pins take a concrete type from the connections you make; the schema-mediated disconnect path resets the wildcard pins back to their neutral state when you unhook them. Thanks **@Alexbeav** (#95).
+- **`blueprint` reference-audit blind spots closed.** `list_graphs`, `search_nodes`, `find_variable_references`, and `get_graph_data` now see inside collapsed-composite subgraphs, read input-pin default values, catch string-bound timer callers (`SetTimerByFunctionName` and friends), and account for inherited-scope variables. Nested graphs are classified through a shared helper so every audit action walks the same graph set. Thanks **@Alexbeav** (#96).
+- **`blueprint` local-variable data pins now materialize.** `VariableGet` / `VariableSet` nodes for local variables now bind via `SetLocalMember` when the target graph declares a matching local, so the node comes up with its data pin instead of a bare exec-only node. Thanks **@Alexbeav** (#97).
+- **`blueprint` enum member variables are now enum-typed.** `VariableGet` / `VariableSet` nodes for enum member variables now use the schema's byte + subobject convention, so their pins carry the enum type and connect to enum consumers (switches, comparisons) directly. Thanks **@Alexbeav** (#98).
+- **UE 5.8 / Linux source-build compatibility.** Build fixes for the 5.8 `FJsonObject` shared-string keys and the new `-Werror` sites, plus Reflection Intelligence support for the 5.8 UHT codegen format — replicated properties, RPCs, `OnRep` handlers, interfaces, and parent chains are all parsed again on 5.8. Thanks **@gregorygmwhite** (#99).
+- **MetaSound build error on UE 5.8.** Fixed the MetaSound-side 5.8 compile break, and hardened `FJsonObject` key iteration across versions more broadly — GAS, LogicDriver, and ComboGraph bulk-fill plus MetaSound now route key access through the `MonolithKeyToString` helper so the same source builds on 5.7 and 5.8. Reported by **@Matt-Makes** (#100).
+
+### Changed
+
+- **`blueprint` `find_variable_references` now defaults `include_inherited` to `true`** (was `false`). A deletion-safety audit should over-report rather than return a false zero for a variable declared on a parent class — with the old default, auditing a variable you inherited came back empty and made deletion look safe when it wasn't. Pass `include_inherited: false` for the strict own-class-only view. Thanks **@Alexbeav** (#96).
+
 ## [0.21.1] - 2026-07-20
 
 ### Fixed
