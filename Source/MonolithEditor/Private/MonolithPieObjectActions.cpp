@@ -393,8 +393,9 @@ namespace
 			OutError = TEXT("internal: null struct/value/json in struct marshal");
 			return false;
 		}
-		for (const TPair<FString, TSharedPtr<FJsonValue>>& Field : Json->Values)
+		for (const auto& FieldIt : Json->Values)
 		{
+			const TPair<FString, TSharedPtr<FJsonValue>> Field(FString(FieldIt.Key.ToView()), FieldIt.Value);
 			// Resolve the friendly field name within THIS struct to its internal property.
 			// (The shared MonolithStructField resolver needs a UObject container; a bare
 			// struct value has none, so fields are resolved inline against the UScriptStruct.)

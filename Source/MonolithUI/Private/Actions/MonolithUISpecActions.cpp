@@ -364,8 +364,9 @@ namespace MonolithUI::SpecActionsInternal
         // Styles map.
         if (SpecObj->TryGetObjectField(TEXT("styles"), Sub) && Sub)
         {
-            for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : (*Sub)->Values)
+            for (const auto& PairIt : (*Sub)->Values)
             {
+                const TPair<FString, TSharedPtr<FJsonValue>> Pair(FString(PairIt.Key.ToView()), PairIt.Value);
                 const TSharedPtr<FJsonObject>* StyleObj = nullptr;
                 if (Pair.Value.IsValid() && Pair.Value->TryGetObject(StyleObj) && StyleObj)
                 {
